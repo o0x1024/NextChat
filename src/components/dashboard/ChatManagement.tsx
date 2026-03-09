@@ -1,4 +1,11 @@
-import { type ChangeEvent, type FormEvent, useMemo, useState } from "react";
+import {
+  type ChangeEvent,
+  type FormEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import type { Language } from "../../store/preferencesStore";
 import type {
@@ -13,6 +20,12 @@ import type {
   ToolRun,
   WorkGroup,
 } from "../../types";
+import {
+  activeMentionDraft,
+  insertMention,
+  mentionCandidates,
+  validateMentions,
+} from "./mentions";
 import { formatTime, roleAccent, statusBadgeClass } from "./ui";
 
 interface ChatManagementProps {
@@ -49,6 +62,14 @@ function executionBadgeClass(message: ConversationMessage) {
   return "badge-ghost";
 }
 
+function compactTaskTitle(title: string) {
+  return title.length > 28 ? `${title.slice(0, 28)}...` : title;
+}
+
+type PanelTarget =
+  | { section: "tasks"; taskId?: string }
+  | { section: "approvals" };
+
 const emptyGroupForm: CreateWorkGroupInput = {
   name: "",
   goal: "",
@@ -82,9 +103,17 @@ export function ChatManagement({
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [runningPanelOpen, setRunningPanelOpen] = useState(false);
   const [composerValue, setComposerValue] = useState("");
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const [mentionError, setMentionError] = useState<string | null>(null);
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [memberModalOpen, setMemberModalOpen] = useState(false);
+  const [highlightedTaskId, setHighlightedTaskId] = useState<string | null>(null);
+  const [panelTarget, setPanelTarget] = useState<PanelTarget | null>(null);
   const [groupForm, setGroupForm] = useState<CreateWorkGroupInput>(emptyGroupForm);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const taskBoardRef = useRef<HTMLDivElement | null>(null);
+  const approvalsRef = useRef<HTMLDivElement | null>(null);
+  const taskCardRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
   const currentGroup = useMemo(
     () => workGroups.find((group) => group.id === selectedWorkGroupId) ?? workGroups[0],
@@ -104,6 +133,14 @@ export function ChatManagement({
     const memberIds = new Set(currentGroup.memberAgentIds);
     return agents.filter((agent) => memberIds.has(agent.id));
   }, [agents, currentGroup]);
+  const mentionDraft = useMemo(() => {
+    const caret = textareaRef.current?.selectionStart ?? composerValue.length;
+    return activeMentionDraft(composerValue, caret);
+  }, [composerValue, currentMembers]);
+  const mentionOptions = useMemo(
+    () => mentionCandidates(currentMembers, mentionDraft?.query ?? "").slice(0, 6),
+    [currentMembers, mentionDraft],
+  );
 
   const currentGroupTasks = useMemo(() => {
     if (!currentGroup) return [];
@@ -119,9 +156,17 @@ export function ChatManagement({
       ),
     [currentGroupTasks],
   );
+  const activeTaskIds = useMemo(
+    () => new Set(activeTasks.map((task) => task.id)),
+    [activeTasks],
+  );
 
   const currentTaskIds = useMemo(
     () => new Set(currentGroupTasks.map((task) => task.id)),
+    [currentGroupTasks],
+  );
+  const currentTaskTitles = useMemo(
+    () => new Map(currentGroupTasks.map((task) => [task.id, task.title])),
     [currentGroupTasks],
   );
 
@@ -147,8 +192,26 @@ export function ChatManagement({
   async function handleSend(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!currentGroup || !composerValue.trim()) return;
+    const validation = validateMentions(composerValue, currentMembers);
+    if (validation.invalidMentions.length > 0) {
+      setMentionError(
+        t("mentionUnknownAgents", {
+          names: validation.invalidMentions.map((item) => `@${item}`).join(", "),
+        }),
+      );
+      return;
+    }
+    if (validation.ambiguousMentions.length > 0) {
+      setMentionError(
+        t("mentionAmbiguousAgents", {
+          names: validation.ambiguousMentions.map((item) => `@${item}`).join(", "),
+        }),
+      );
+      return;
+    }
     await onSendMessage(currentGroup.id, composerValue.trim());
     setComposerValue("");
+    setMentionError(null);
   }
 
   async function handleCreateGroup(event: FormEvent<HTMLFormElement>) {
@@ -165,6 +228,98 @@ export function ChatManagement({
       return;
     }
     await onAddAgent(currentGroup.id, agent.id);
+  }
+
+  useEffect(() => {
+    setMentionIndex(0);
+  }, [mentionDraft?.start, mentionDraft?.query]);
+
+  useEffect(() => {
+    if (!runningPanelOpen || !panelTarget) {
+      return;
+    }
+
+    const target =
+      panelTarget.section === "approvals"
+        ? approvalsRef.current
+        : panelTarget.taskId
+          ? taskCardRefs.current[panelTarget.taskId]
+          : taskBoardRef.current;
+
+    if (!target) {
+      return;
+    }
+
+    target.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    const clearTimer = window.setTimeout(() => setPanelTarget(null), 500);
+    return () => window.clearTimeout(clearTimer);
+  }, [panelTarget, runningPanelOpen, activeTasks.length, currentApprovals.length]);
+
+  useEffect(() => {
+    if (!highlightedTaskId) {
+      return;
+    }
+
+    const clearTimer = window.setTimeout(() => setHighlightedTaskId(null), 1800);
+    return () => window.clearTimeout(clearTimer);
+  }, [highlightedTaskId]);
+
+  function applyMention(agent: AgentProfile) {
+    const textarea = textareaRef.current;
+    if (!textarea) {
+      return;
+    }
+
+    const caret = textarea.selectionStart ?? composerValue.length;
+    const existingDraft = activeMentionDraft(composerValue, caret);
+    const hasTrigger = composerValue.slice(Math.max(0, caret - 1), caret) === "@";
+    const sourceValue = hasTrigger
+      ? composerValue
+      : `${composerValue.slice(0, caret)}@${composerValue.slice(caret)}`;
+    const draft =
+      existingDraft ??
+      (hasTrigger
+        ? { start: caret - 1, end: caret, query: "" }
+        : { start: caret, end: caret + 1, query: "" });
+    const { nextValue, caret: nextCaret } = insertMention(sourceValue, draft, agent);
+    setComposerValue(nextValue);
+    setMentionError(null);
+    requestAnimationFrame(() => {
+      textarea.focus();
+      textarea.setSelectionRange(nextCaret, nextCaret);
+    });
+  }
+
+  function openMentionPicker() {
+    const textarea = textareaRef.current;
+    if (!textarea) {
+      return;
+    }
+    const caret = textarea.selectionStart ?? composerValue.length;
+    const hasTrigger = composerValue.slice(Math.max(0, caret - 1), caret) === "@";
+    if (!hasTrigger) {
+      const nextValue = `${composerValue.slice(0, caret)}@${composerValue.slice(caret)}`;
+      setComposerValue(nextValue);
+      requestAnimationFrame(() => {
+        textarea.focus();
+        const nextCaret = caret + 1;
+        textarea.setSelectionRange(nextCaret, nextCaret);
+      });
+    } else {
+      textarea.focus();
+    }
+    setMentionError(null);
+  }
+
+  function jumpToApprovals() {
+    setRunningPanelOpen(true);
+    setPanelTarget({ section: "approvals" });
+  }
+
+  function jumpToTaskBoard(taskId?: string) {
+    setRunningPanelOpen(true);
+    setPanelTarget({ section: "tasks", taskId });
+    setHighlightedTaskId(taskId ?? null);
   }
 
   return (
@@ -254,14 +409,16 @@ export function ChatManagement({
                 {currentMembers.map((agent) => {
                   const accent = roleAccent(agent.role);
                   return (
-                    <div
+                    <button
+                      type="button"
                       key={agent.id}
-                      className="badge badge-ghost shrink-0 gap-1.5 py-3"
+                      className="badge badge-ghost shrink-0 gap-1.5 py-3 transition-colors hover:border-primary hover:text-primary"
                       style={{ borderColor: `${accent}40`, color: accent }}
+                      onClick={() => applyMention(agent)}
                     >
                       <span className="text-[10px] font-bold">{agent.avatar}</span>
                       {agent.name}
-                    </div>
+                    </button>
                   );
                 })}
               </div>
@@ -279,6 +436,30 @@ export function ChatManagement({
                         <span className="font-medium">{message.senderName}</span>
                         {message.visibility === "backstage" && (
                           <span className="ml-1 badge badge-warning badge-xs">{t("backstage")}</span>
+                        )}
+                        {message.kind === "collaboration" && (
+                          <span className="ml-1 badge badge-info badge-xs">{t("collaboration")}</span>
+                        )}
+                        {message.taskCardId && currentTaskTitles.get(message.taskCardId) && (
+                          activeTaskIds.has(message.taskCardId) ? (
+                            <button
+                              type="button"
+                              className="ml-1 badge badge-ghost badge-xs transition-colors hover:border-primary hover:text-primary"
+                              title={t("openTask")}
+                              onClick={() => jumpToTaskBoard(message.taskCardId ?? undefined)}
+                            >
+                              {t("linkedTask")}{" "}
+                              {compactTaskTitle(currentTaskTitles.get(message.taskCardId) ?? "")}
+                            </button>
+                          ) : (
+                            <span
+                              className="ml-1 badge badge-ghost badge-xs"
+                              title={currentTaskTitles.get(message.taskCardId) ?? undefined}
+                            >
+                              {t("linkedTask")}{" "}
+                              {compactTaskTitle(currentTaskTitles.get(message.taskCardId) ?? "")}
+                            </span>
+                          )
                         )}
                         {message.executionMode && (
                           <span className={`ml-1 badge badge-xs ${executionBadgeClass(message)}`}>
@@ -319,41 +500,139 @@ export function ChatManagement({
                     }}
                   >
                     <textarea
+                      ref={textareaRef}
                       className="textarea textarea-ghost w-full min-h-[60px] resize-none focus:outline-none bg-transparent placeholder:opacity-30 text-sm leading-relaxed"
                       placeholder={t("taskPlaceholder")}
                       rows={2}
                       value={composerValue}
-                      onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
-                        setComposerValue(event.target.value)
-                      }
+                      onChange={(event: ChangeEvent<HTMLTextAreaElement>) => {
+                        setComposerValue(event.target.value);
+                        setMentionError(null);
+                      }}
                       onKeyDown={(event) => {
+                        if (mentionDraft && mentionOptions.length > 0) {
+                          if (event.key === "ArrowDown") {
+                            event.preventDefault();
+                            setMentionIndex((current) => (current + 1) % mentionOptions.length);
+                            return;
+                          }
+                          if (event.key === "ArrowUp") {
+                            event.preventDefault();
+                            setMentionIndex((current) =>
+                              current === 0 ? mentionOptions.length - 1 : current - 1,
+                            );
+                            return;
+                          }
+                          if (event.key === "Enter" || event.key === "Tab") {
+                            event.preventDefault();
+                            applyMention(mentionOptions[mentionIndex] ?? mentionOptions[0]);
+                            return;
+                          }
+                          if (event.key === "Escape") {
+                            event.preventDefault();
+                            setComposerValue((value) =>
+                              value.slice(0, mentionDraft.start) +
+                              value.slice(mentionDraft.start + 1),
+                            );
+                            return;
+                          }
+                        }
                         if (event.key === "Enter" && !event.shiftKey) {
                           event.preventDefault();
-                          if (composerValue.trim() && currentGroup) {
-                            void onSendMessage(currentGroup.id, composerValue.trim());
-                            setComposerValue("");
+                          if (composerValue.trim()) {
+                            void handleSend(event as unknown as FormEvent<HTMLFormElement>);
                           }
                         }
                       }}
                     />
+                    {mentionDraft ? (
+                      <div className="px-2">
+                        <div className="rounded-xl border border-base-content/10 bg-base-200/80 p-2">
+                          <div className="mb-2 flex items-center justify-between gap-2 px-1 text-[10px] font-bold uppercase tracking-widest text-base-content/40">
+                            <span>{t("mentionAgent")}</span>
+                            <span>{t("mentionPickerHint")}</span>
+                          </div>
+                          <div className="space-y-1">
+                            {mentionOptions.map((agent, index) => (
+                              <button
+                                key={agent.id}
+                                type="button"
+                                className={`flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm transition-colors ${
+                                  index === mentionIndex
+                                    ? "bg-primary text-primary-content"
+                                    : "hover:bg-base-300"
+                                }`}
+                                onMouseDown={(event) => {
+                                  event.preventDefault();
+                                  applyMention(agent);
+                                }}
+                              >
+                                <span className="flex items-center gap-2">
+                                  <span className="badge badge-ghost border-none bg-base-100/20 text-[10px]">
+                                    {agent.avatar}
+                                  </span>
+                                  <span>{agent.name}</span>
+                                </span>
+                                <span className="text-xs opacity-70">{agent.role}</span>
+                              </button>
+                            ))}
+                            {mentionOptions.length === 0 ? (
+                              <div className="rounded-lg px-3 py-2 text-sm text-base-content/60">
+                                {t("mentionNoMatches")}
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
+                    {mentionError ? (
+                      <div className="px-2 pt-2">
+                        <div className="alert alert-warning py-2 text-sm">{mentionError}</div>
+                      </div>
+                    ) : null}
 
-                    <div className="flex items-center justify-between px-2 pb-1 mt-2">
-                      {/* Left Icons Group */}
-                      <div className="flex items-center gap-3.5 text-base-content/40">
-                        <button type="button" className="hover:text-primary transition-colors" title="Attach"><i className="fas fa-paperclip text-xs" /></button>
-                        <div className="bg-primary/10 text-primary p-1 rounded flex items-center justify-center"><i className="fas fa-tools text-[10px]" /></div>
-                        <button type="button" className="hover:text-primary transition-colors"><i className="fas fa-cog text-xs" /></button>
-                        <button type="button" className="hover:text-primary transition-colors"><i className="fas fa-users text-xs" /></button>
-                        <button type="button" className="hover:text-primary transition-colors"><i className="fas fa-brain text-xs" /></button>
-                        <button type="button" className="hover:text-primary transition-colors"><i className="fas fa-at text-xs" /></button>
-                        <button type="button" className="hover:text-primary transition-colors"><i className="fas fa-bolt text-xs" /></button>
-                        <button type="button" className="hover:text-primary transition-colors"><i className="fas fa-table text-xs" /></button>
-                        <button type="button" className="hover:text-primary transition-colors"><i className="fas fa-database text-xs" /></button>
+                    <div className="mt-2 flex items-center justify-between gap-3 px-2 pb-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          className="btn btn-ghost btn-xs gap-1"
+                          title={t("mentionAgent")}
+                          onClick={openMentionPicker}
+                        >
+                          <i className="fas fa-at text-xs" />
+                          {t("mentionAgent")}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-ghost btn-xs gap-1"
+                          title={currentApprovals.length > 0 ? t("openApprovalsQueue") : t("noPendingApprovals")}
+                          onClick={jumpToApprovals}
+                          disabled={currentApprovals.length === 0}
+                        >
+                          <i className="fas fa-shield-halved text-xs" />
+                          {t("approvals")} ({currentApprovals.length})
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-ghost btn-xs gap-1"
+                          title={activeTasks.length > 0 ? t("openTaskBoard") : t("noActiveTasksInGroup")}
+                          onClick={() => jumpToTaskBoard()}
+                          disabled={activeTasks.length === 0}
+                        >
+                          <i className="fas fa-list-check text-xs" />
+                          {t("taskBoard")} ({activeTasks.length})
+                        </button>
+                        <span className="badge badge-ghost gap-1" title={t("toolsAutoSelectHint")}>
+                          <i className="fas fa-tools text-[10px]" />
+                          {t("toolsAutoSelect")}
+                        </span>
                       </div>
 
-                      {/* Right Group: Model & Send */}
                       <div className="flex items-center gap-4">
-                        <div className="flex items-center gap-1.5 text-[10px] font-bold text-base-content/40 cursor-pointer hover:text-primary transition-all">
+                        <div
+                          className="flex items-center gap-1.5 text-[10px] font-bold text-base-content/40"
+                          title={t("toolsAutoSelectHint")}
+                        >
                           {settings.globalConfig.defaultLLMModel} <i className="fas fa-chevron-down text-[8px]" />
                         </div>
                         <div className="text-base-content/30"><i className="fas fa-language text-xs" /></div>
@@ -400,7 +679,7 @@ export function ChatManagement({
                   </section>
 
                   <section className="card card-border bg-base-100">
-                    <div className="card-body gap-3">
+                    <div className="card-body gap-3" ref={taskBoardRef}>
                       <div className="flex items-center justify-between">
                         <h3 className="card-title text-base">{t("taskBoard")}</h3>
                         <span className="badge badge-primary">{activeTasks.length}</span>
@@ -411,7 +690,17 @@ export function ChatManagement({
                           const owner = agents.find((agent) => agent.id === lease?.ownerAgentId);
                           const bidCount = claimBids.filter((bid) => bid.taskCardId === task.id).length;
                           return (
-                            <div key={task.id} className="rounded-box bg-base-200 px-4 py-3">
+                            <div
+                              key={task.id}
+                              ref={(node) => {
+                                taskCardRefs.current[task.id] = node;
+                              }}
+                              className={`rounded-box px-4 py-3 transition-colors ${
+                                highlightedTaskId === task.id
+                                  ? "bg-primary/10 ring-1 ring-primary/30"
+                                  : "bg-base-200"
+                              }`}
+                            >
                               <div className="mb-2 flex items-start justify-between gap-3">
                                 <strong className="line-clamp-2 text-sm">{task.title}</strong>
                                 <span className={`badge shrink-0 ${statusBadgeClass(task.status)}`}>
@@ -428,6 +717,13 @@ export function ChatManagement({
                                 <span className="badge badge-ghost">
                                   {t("bidsCount", { count: bidCount })}
                                 </span>
+                                <button
+                                  type="button"
+                                  className="btn btn-ghost btn-xs"
+                                  onClick={() => jumpToTaskBoard(task.id)}
+                                >
+                                  {t("openTask")}
+                                </button>
                               </div>
                             </div>
                           );
@@ -443,7 +739,7 @@ export function ChatManagement({
                   </section>
 
                   <section className="card card-border bg-base-100">
-                    <div className="card-body gap-3">
+                    <div className="card-body gap-3" ref={approvalsRef}>
                       <div className="flex items-center justify-between">
                         <h3 className="card-title text-base">{t("approvals")}</h3>
                         <span className="badge badge-warning">{currentApprovals.length}</span>
@@ -476,6 +772,15 @@ export function ChatManagement({
                                 >
                                   {t("reject")}
                                 </button>
+                                {task ? (
+                                  <button
+                                    type="button"
+                                    className="btn btn-ghost btn-xs"
+                                    onClick={() => jumpToTaskBoard(task.id)}
+                                  >
+                                    {t("openTask")}
+                                  </button>
+                                ) : null}
                               </div>
                             </div>
                           );

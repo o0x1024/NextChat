@@ -1,0 +1,89 @@
+use anyhow::Result;
+use reqwest::Url;
+
+use super::ToolRuntime;
+use crate::core::domain::{AgentProfile, ToolManifest};
+use crate::core::permissions::{base_tool_authorization, ToolAuthorizationDecision};
+use crate::core::skill_policy::{
+    selected_skills_for_agent, tool_exposure_reason, ToolExposureReason,
+};
+
+impl ToolRuntime {
+    pub fn authorize_tool_call(
+        &self,
+        agent: &AgentProfile,
+        tool: &ToolManifest,
+        input: &str,
+    ) -> Result<ToolAuthorizationDecision> {
+        let selected_skills = selected_skills_for_agent(agent, &self.builtin_skills());
+        if matches!(
+            tool_exposure_reason(agent, tool, &selected_skills),
+            ToolExposureReason::BlockedBySkill
+        ) {
+            return Ok(ToolAuthorizationDecision::denied(format!(
+                "agent skills do not allow tool category '{}'",
+                tool.category
+            )));
+        }
+
+        let mut decision = base_tool_authorization(agent, tool);
+        if !decision.allowed {
+            return Ok(decision);
+        }
+
+        match tool.id.as_str() {
+            "file.readwrite" => {
+                let parsed = self.parse_file_input(input)?;
+                let create_parent = parsed.mode.as_deref() == Some("write");
+                let path = self.resolve_path(&parsed.path, create_parent)?;
+                let allowed_roots = &agent.permission_policy.allow_fs_roots;
+                if !allowed_roots.is_empty()
+                    && !allowed_roots
+                        .iter()
+                        .map(|root| self.resolve_permission_root(root))
+                        .any(|root| path.starts_with(root))
+                {
+                    decision = ToolAuthorizationDecision::denied(format!(
+                        "path '{}' is outside allowFsRoots",
+                        path.display()
+                    ));
+                }
+            }
+            "http.request" | "browser.automation" => {
+                let url = if tool.id == "http.request" {
+                    self.parse_http_input(input)?.url
+                } else {
+                    self.parse_browser_input(input)?.url
+                };
+                let allowed_domains = &agent.permission_policy.allow_network_domains;
+                if !allowed_domains.is_empty() {
+                    let host = Url::parse(&url)
+                        .ok()
+                        .and_then(|value| value.host_str().map(str::to_string))
+                        .unwrap_or_default();
+                    let host_allowed = allowed_domains.iter().any(|candidate| {
+                        let normalized = candidate
+                            .trim()
+                            .trim_start_matches("http://")
+                            .trim_start_matches("https://")
+                            .trim_start_matches('*')
+                            .trim_start_matches('.')
+                            .trim_end_matches('/')
+                            .to_lowercase();
+                        let host = host.to_lowercase();
+                        host == normalized || host.ends_with(&format!(".{normalized}"))
+                    });
+                    if !host_allowed {
+                        decision = ToolAuthorizationDecision::denied(format!(
+                            "domain '{}' is outside allowNetworkDomains",
+                            host
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        Ok(decision)
+    }
+}

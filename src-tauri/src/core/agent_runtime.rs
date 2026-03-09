@@ -16,6 +16,8 @@ pub struct AgentRuntime<TModel, TTool> {
     tool_handler: Arc<TTool>,
 }
 
+const MAX_SUGGESTED_SUBTASKS: usize = 3;
+
 impl<TModel, TTool> AgentRuntime<TModel, TTool> {
     pub fn new(model_adapter: Arc<TModel>, tool_handler: Arc<TTool>) -> Self {
         Self {
@@ -63,6 +65,22 @@ where
             .iter()
             .flat_map(|skill| skill.done_criteria.iter().cloned())
             .collect::<Vec<_>>();
+        let memory_summary = if context.memory_context.is_empty() {
+            "- None".to_string()
+        } else {
+            context
+                .memory_context
+                .iter()
+                .map(|item| {
+                    format!(
+                        "- [{}] {}",
+                        item.scope_id,
+                        item.content.lines().next().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
 
         let preamble = format!(
             "You are {}. Role: {}. Objective: {}. Skills: {}. Available tools: {}. Use tools when they materially improve accuracy. If a high-risk tool is not exposed, do not imply that it was used.",
@@ -73,7 +91,7 @@ where
             available_tool_summary
         );
         let prompt = format!(
-            "Work group goal: {}\nTask: {}\nConversation items:\n{}\nPlanning rules:\n{}\nDone criteria:\n{}\nReturn a concise progress summary. If you used tools, cite the concrete outcome instead of generic statements.",
+            "Work group goal: {}\nTask: {}\nConversation items:\n{}\nMemory context:\n{}\nPlanning rules:\n{}\nDone criteria:\n{}\nReturn a concise progress summary. If you need to delegate follow-up work, append one line per child task in the exact format `Delegate @AgentName: task details`. If you used tools, cite the concrete outcome instead of generic statements.",
             context.work_group.goal,
             context.task_card.normalized_goal,
             context
@@ -84,6 +102,7 @@ where
                 .map(|message| format!("{}: {}", message.sender_name, message.content))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            memory_summary,
             if planning_rules.is_empty() {
                 "- None".to_string()
             } else {
@@ -117,6 +136,8 @@ where
                             input: context.task_card.input_payload.clone(),
                             task_card_id: context.task_card.id.clone(),
                             agent_id: context.agent.id.clone(),
+                            agent: context.agent.clone(),
+                            approval_granted: true,
                         })
                         .await?
                         .output,
@@ -132,7 +153,12 @@ where
             Some(result.summary.clone())
         } else {
             self.model_adapter
-                .complete(&context.agent.model_policy, &context.settings, &preamble, &prompt)
+                .complete(
+                    &context.agent.model_policy,
+                    &context.settings,
+                    &preamble,
+                    &prompt,
+                )
                 .await?
         };
 
@@ -181,17 +207,23 @@ where
             ))
         };
         let used_real_model = model_summary.is_some();
-        let summary = model_summary.or(fallback_summary).unwrap_or_default();
+        let draft_summary = model_summary.or(fallback_summary).unwrap_or_default();
+        let explicit_subtasks = extract_delegation_directives(&context, &draft_summary);
+        let summary = cleaned_summary(&context, &draft_summary, !explicit_subtasks.is_empty());
         let execution_mode = if used_real_model {
             ExecutionMode::RealModel
         } else {
             ExecutionMode::Fallback
         };
 
-        let suggested_subtasks = build_suggested_subtasks(&context);
+        let suggested_subtasks = merge_subtasks(
+            explicit_subtasks,
+            build_suggested_subtasks(&context),
+            MAX_SUGGESTED_SUBTASKS,
+        );
 
         let backstage_notes = format!(
-            "Skills used: {}. Tools exposed: {}. Tools called: {}. Suggested collaborators: {}.",
+            "Skills used: {}. Tools exposed: {}. Memory injected: {}. Tools called: {}. Suggested collaborators: {}.",
             skill_summary,
             context
                 .available_tools
@@ -199,6 +231,16 @@ where
                 .map(|tool| tool.id.clone())
                 .collect::<Vec<_>>()
                 .join(", "),
+            if context.memory_context.is_empty() {
+                "None".to_string()
+            } else {
+                context
+                    .memory_context
+                    .iter()
+                    .map(|item| item.id.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
             if tool_event_summary.is_empty() {
                 context
                     .approved_tool
@@ -257,28 +299,99 @@ fn build_suggested_subtasks(context: &TaskExecutionContext) -> Vec<String> {
     if subtasks.is_empty()
         && (lowered.contains("parallel") || lowered.contains("并行") || lowered.contains("并且"))
     {
-        if let Some(agent) = context
-            .work_group_members
-            .iter()
-            .find(|candidate| candidate.id != context.agent.id)
-        {
-            subtasks.push(format!(
-                "@{} review '{}' in parallel and report only key findings.",
-                agent.name, context.task_card.title
-            ));
-        }
+        subtasks.extend(
+            context
+                .work_group_members
+                .iter()
+                .filter(|candidate| candidate.id != context.agent.id)
+                .take(2)
+                .map(|agent| {
+                    format!(
+                        "@{} review '{}' in parallel and report only key findings.",
+                        agent.name, context.task_card.title
+                    )
+                }),
+        );
     }
 
-    subtasks.truncate(2);
+    subtasks.truncate(MAX_SUGGESTED_SUBTASKS);
     subtasks
+}
+
+fn extract_delegation_directives(context: &TaskExecutionContext, summary: &str) -> Vec<String> {
+    if !context.agent.can_spawn_subtasks || context.task_card.parent_id.is_some() {
+        return Vec::new();
+    }
+
+    let directive_regex =
+        Regex::new(r"(?im)^\s*delegate\s+@([A-Za-z0-9_\-\u4e00-\u9fa5]+)\s*:\s*(.+?)\s*$")
+            .expect("delegation regex");
+
+    directive_regex
+        .captures_iter(summary)
+        .filter_map(|capture| {
+            let token = capture.get(1)?.as_str().to_lowercase();
+            let task = capture.get(2)?.as_str().trim();
+            let agent = context.work_group_members.iter().find(|candidate| {
+                candidate.id != context.agent.id
+                    && (candidate.name.to_lowercase() == token || candidate.id == token)
+            })?;
+            Some(format!("@{} {}", agent.name, task))
+        })
+        .collect()
+}
+
+fn cleaned_summary(
+    context: &TaskExecutionContext,
+    summary: &str,
+    stripped_directives: bool,
+) -> String {
+    let directive_regex =
+        Regex::new(r"(?im)^\s*delegate\s+@([A-Za-z0-9_\-\u4e00-\u9fa5]+)\s*:\s*(.+?)\s*$")
+            .expect("delegation regex");
+    let cleaned = directive_regex
+        .replace_all(summary, "")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if !cleaned.is_empty() {
+        cleaned
+    } else if stripped_directives {
+        format!(
+            "{} delegated follow-up work for '{}'.",
+            context.agent.name, context.task_card.title
+        )
+    } else {
+        summary.trim().to_string()
+    }
+}
+
+fn merge_subtasks(explicit: Vec<String>, heuristic: Vec<String>, limit: usize) -> Vec<String> {
+    let mut merged = Vec::new();
+    for item in explicit.into_iter().chain(heuristic.into_iter()) {
+        if merged
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(&item))
+        {
+            continue;
+        }
+        merged.push(item);
+        if merged.len() >= limit {
+            break;
+        }
+    }
+    merged
 }
 
 #[cfg(test)]
 mod tests {
-    use super::build_suggested_subtasks;
+    use super::{build_suggested_subtasks, cleaned_summary, extract_delegation_directives};
     use crate::core::domain::{
-        AgentProfile, MemoryPolicy, ModelPolicy, TaskCard, TaskExecutionContext, TaskStatus,
-        ToolManifest, WorkGroup, WorkGroupKind,
+        AgentPermissionPolicy, AgentProfile, MemoryPolicy, ModelPolicy, TaskCard,
+        TaskExecutionContext, TaskStatus, ToolManifest, WorkGroup, WorkGroupKind,
     };
 
     fn agent(id: &str, name: &str) -> AgentProfile {
@@ -294,6 +407,7 @@ mod tests {
             max_parallel_runs: 2,
             can_spawn_subtasks: true,
             memory_policy: MemoryPolicy::default(),
+            permission_policy: AgentPermissionPolicy::default(),
         }
     }
 
@@ -329,6 +443,7 @@ mod tests {
                 created_at: "now".into(),
             },
             conversation_window: vec![],
+            memory_context: vec![],
             available_tools: vec![ToolManifest {
                 id: "plan.summarize".into(),
                 name: "Plan".into(),
@@ -359,5 +474,28 @@ mod tests {
         let subtasks = build_suggested_subtasks(&context("Please handle this in parallel"));
         assert_eq!(subtasks.len(), 1);
         assert!(subtasks[0].contains("@Reviewer"));
+    }
+
+    #[test]
+    fn explicit_delegation_directives_are_extracted() {
+        let ctx = context("Coordinate release");
+        let directives = extract_delegation_directives(
+            &ctx,
+            "Status update\nDelegate @Reviewer: audit the release checklist\nDelegate @a2: verify user-facing copy",
+        );
+        assert_eq!(directives.len(), 2);
+        assert!(directives[0].contains("@Reviewer"));
+        assert!(directives[1].contains("@Reviewer"));
+    }
+
+    #[test]
+    fn delegation_directives_are_removed_from_summary() {
+        let ctx = context("Coordinate release");
+        let summary = cleaned_summary(
+            &ctx,
+            "Shipped draft.\nDelegate @Reviewer: audit the release checklist",
+            true,
+        );
+        assert_eq!(summary, "Shipped draft.");
     }
 }

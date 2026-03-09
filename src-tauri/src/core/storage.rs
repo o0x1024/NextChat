@@ -1,3 +1,6 @@
+mod bids;
+mod memory;
+
 use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result};
@@ -5,8 +8,8 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::core::domain::{
-    new_id, now, AgentProfile, AuditEvent, ClaimBid, ConversationMessage, DashboardState,
-    ExecutionMode, Lease, LeaseState, MemoryItem, MemoryPolicy, MemoryScope, MessageKind,
+    new_id, now, AgentPermissionPolicy, AgentProfile, AuditEvent, ConversationMessage,
+    DashboardState, ExecutionMode, Lease, LeaseState, MemoryPolicy, MemoryScope, MessageKind,
     ModelPolicy, SenderKind, SystemSettings, TaskCard, ToolRun, Visibility, WorkGroup,
     WorkGroupKind,
 };
@@ -48,7 +51,8 @@ impl Storage {
                   tool_ids TEXT NOT NULL,
                   max_parallel_runs INTEGER NOT NULL,
                   can_spawn_subtasks INTEGER NOT NULL,
-                  memory_policy TEXT NOT NULL
+                  memory_policy TEXT NOT NULL,
+                  permission_policy TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS work_groups (
@@ -100,6 +104,7 @@ impl Storage {
                   agent_id TEXT NOT NULL,
                   rationale TEXT NOT NULL,
                   capability_score REAL NOT NULL,
+                  score_breakdown TEXT NOT NULL,
                   expected_tools TEXT NOT NULL,
                   estimated_cost REAL NOT NULL,
                   created_at TEXT NOT NULL
@@ -162,6 +167,16 @@ impl Storage {
                 "#,
             )?;
             ensure_column(conn, "messages", "execution_mode", "TEXT")?;
+            ensure_column(conn, "agents", "permission_policy", "TEXT")?;
+            ensure_column(conn, "claim_bids", "score_breakdown", "TEXT")?;
+            conn.execute(
+                "UPDATE agents SET permission_policy = ?1 WHERE permission_policy IS NULL",
+                params![json(&AgentPermissionPolicy::default())?],
+            )?;
+            conn.execute(
+                "UPDATE claim_bids SET score_breakdown = ?1 WHERE score_breakdown IS NULL",
+                params![json(&crate::core::domain::ClaimScoreBreakdown::default())?],
+            )?;
             Ok(())
         })
     }
@@ -174,6 +189,7 @@ impl Storage {
             }
 
             let memory_policy = json(&MemoryPolicy::default())?;
+            let permission_policy = json(&AgentPermissionPolicy::default())?;
             let agent_specs = vec![
                 (
                     "Scout",
@@ -223,8 +239,8 @@ impl Storage {
                     r#"
                     INSERT INTO agents (
                       id, name, avatar, role, objective, model_policy, skill_ids, tool_ids,
-                      max_parallel_runs, can_spawn_subtasks, memory_policy
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                      max_parallel_runs, can_spawn_subtasks, memory_policy, permission_policy
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                     "#,
                     params![
                         id,
@@ -238,6 +254,7 @@ impl Storage {
                         2_i64,
                         1_i64,
                         memory_policy.clone(),
+                        permission_policy.clone(),
                     ],
                 )?;
             }
@@ -335,8 +352,8 @@ impl Storage {
                 r#"
                 INSERT OR REPLACE INTO agents (
                   id, name, avatar, role, objective, model_policy, skill_ids, tool_ids,
-                  max_parallel_runs, can_spawn_subtasks, memory_policy
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                  max_parallel_runs, can_spawn_subtasks, memory_policy, permission_policy
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                 "#,
                 params![
                     agent.id,
@@ -350,6 +367,7 @@ impl Storage {
                     agent.max_parallel_runs,
                     bool_to_i64(agent.can_spawn_subtasks),
                     json(&agent.memory_policy)?,
+                    json(&agent.permission_policy)?,
                 ],
             )?;
             Ok(())
@@ -491,11 +509,7 @@ impl Storage {
                     message.content,
                     json(&message.mentions)?,
                     message.task_card_id,
-                    message
-                        .execution_mode
-                        .as_ref()
-                        .map(json)
-                        .transpose()?,
+                    message.execution_mode.as_ref().map(json).transpose()?,
                     message.created_at,
                 ],
             )?;
@@ -590,37 +604,6 @@ impl Storage {
         self.insert_task_card(task_card)
     }
 
-    pub fn insert_claim_bid(&self, bid: &ClaimBid) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"
-                INSERT INTO claim_bids (
-                  id, task_card_id, agent_id, rationale, capability_score, expected_tools, estimated_cost, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                "#,
-                params![
-                    bid.id,
-                    bid.task_card_id,
-                    bid.agent_id,
-                    bid.rationale,
-                    bid.capability_score,
-                    json(&bid.expected_tools)?,
-                    bid.estimated_cost,
-                    bid.created_at,
-                ],
-            )?;
-            Ok(())
-        })
-    }
-
-    pub fn list_claim_bids(&self) -> Result<Vec<ClaimBid>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT * FROM claim_bids ORDER BY created_at ASC")?;
-            let rows = stmt.query_map([], map_claim_bid)?;
-            collect_rows(rows)
-        })
-    }
-
     pub fn insert_lease(&self, lease: &Lease) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
@@ -709,38 +692,6 @@ impl Storage {
                 conn.prepare("SELECT * FROM tool_runs ORDER BY COALESCE(started_at, '') ASC")?;
             let rows = stmt.query_map([], map_tool_run)?;
             collect_rows(rows)
-        })
-    }
-
-    pub fn list_memory_items(&self) -> Result<Vec<MemoryItem>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT * FROM memory_items ORDER BY created_at DESC")?;
-            let rows = stmt.query_map([], map_memory_item)?;
-            collect_rows(rows)
-        })
-    }
-
-    pub fn insert_memory_item(&self, item: &MemoryItem) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"
-                INSERT INTO memory_items (
-                  id, scope, scope_id, content, tags, embedding_ref, pinned, ttl, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                "#,
-                params![
-                    item.id,
-                    json(&item.scope)?,
-                    item.scope_id,
-                    item.content,
-                    json(&item.tags)?,
-                    item.embedding_ref,
-                    bool_to_i64(item.pinned),
-                    item.ttl,
-                    item.created_at,
-                ],
-            )?;
-            Ok(())
         })
     }
 
@@ -905,6 +856,11 @@ fn map_agent(row: &Row<'_>) -> rusqlite::Result<AgentProfile> {
         max_parallel_runs: row.get("max_parallel_runs")?,
         can_spawn_subtasks: row.get::<_, i64>("can_spawn_subtasks")? == 1,
         memory_policy: decode(row.get("memory_policy")?)?,
+        permission_policy: row
+            .get::<_, Option<String>>("permission_policy")?
+            .map(decode::<AgentPermissionPolicy>)
+            .transpose()?
+            .unwrap_or_default(),
     })
 }
 
@@ -960,19 +916,6 @@ fn map_task_card(row: &Row<'_>) -> rusqlite::Result<TaskCard> {
     })
 }
 
-fn map_claim_bid(row: &Row<'_>) -> rusqlite::Result<ClaimBid> {
-    Ok(ClaimBid {
-        id: row.get("id")?,
-        task_card_id: row.get("task_card_id")?,
-        agent_id: row.get("agent_id")?,
-        rationale: row.get("rationale")?,
-        capability_score: row.get("capability_score")?,
-        expected_tools: decode(row.get("expected_tools")?)?,
-        estimated_cost: row.get("estimated_cost")?,
-        created_at: row.get("created_at")?,
-    })
-}
-
 fn map_lease(row: &Row<'_>) -> rusqlite::Result<Lease> {
     Ok(Lease {
         id: row.get("id")?,
@@ -997,20 +940,6 @@ fn map_tool_run(row: &Row<'_>) -> rusqlite::Result<ToolRun> {
         started_at: row.get("started_at")?,
         finished_at: row.get("finished_at")?,
         result_ref: row.get("result_ref")?,
-    })
-}
-
-fn map_memory_item(row: &Row<'_>) -> rusqlite::Result<MemoryItem> {
-    Ok(MemoryItem {
-        id: row.get("id")?,
-        scope: decode(row.get("scope")?)?,
-        scope_id: row.get("scope_id")?,
-        content: row.get("content")?,
-        tags: decode(row.get("tags")?)?,
-        embedding_ref: row.get("embedding_ref")?,
-        pinned: row.get::<_, i64>("pinned")? == 1,
-        ttl: row.get("ttl")?,
-        created_at: row.get("created_at")?,
     })
 }
 

@@ -223,19 +223,16 @@
 
 当前代码状态到“用户实际可用的多 Agent MVP”之间的差距、优先级、完成标准，已拆分到独立文档：
 
-- [gap-analysis.md](/Users/a1024/code/NextChat/docs/gap-analysis.md)
-  - 补齐多 provider / model policy 的实际执行路径。
-- 协作与调度增强
-  - 完善 `@agent` 对 claim score 的影响。
-  - 让历史成功率、当前负载、最大并发数真正参与调度。
-  - 支持手动改派任务与重新发放 lease。
-- 管理能力补齐
-  - work group 成员支持移除，不仅能添加。
-  - agent 配置页补 memory policy、默认模型策略、工具锁定等配置。
-  - work group 页补默认摘要粒度、自动归档策略的实际行为。
-- Backstage / 审计体验
-  - 展示工具输入输出、子任务依赖、审批链、恢复事件。
-  - 让用户能从 message / task / tool run / audit / memory 之间互相跳转追溯。
+- [gap-analysis.md](/Users/like/code/NextChat/docs/gap-analysis.md)
+  - `GA-01 .. GA-11` 已全部完成。
+- 当前状态更适合描述为：
+  - 已打通的多 Agent 桌面协作 MVP
+  - 具备权限、skill、memory、审批、协作消息、调度解释性
+- 下一阶段建议聚焦：
+  - 打包与发布链路
+  - 崩溃恢复和异常压测
+  - 高并发性能验证
+  - Beta polish 与长任务体验
 
 ### P2：发布前收尾
 - 打包与发布流程

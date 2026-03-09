@@ -62,7 +62,7 @@ export const defaultProviders: AIProviderConfig[] = [
         enabled: false,
         rigProviderType: "DeepSeek",
         apiKey: "",
-        baseUrl: "https://api.deepseek.com/v1",
+        baseUrl: "https://api.deepseek.com",
         models: ["deepseek-chat", "deepseek-coder", "deepseek-reasoner"],
         defaultModel: "deepseek-chat",
         temperature: 0.7,

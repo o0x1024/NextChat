@@ -1,3 +1,9 @@
+mod collaboration;
+mod memory;
+mod runtime;
+#[cfg(test)]
+mod tests;
+
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -9,34 +15,15 @@ use crate::core::{
     agent_runtime::AgentRuntime,
     coordinator::Coordinator,
     domain::{
-        new_id, now, AgentExecutor, AgentProfile, AuditEvent, ClaimContext, ClaimScorer,
+        new_id, now, AIProviderConfig, AgentProfile, AuditEvent, ClaimContext, ClaimScorer,
         ConversationMessage, CreateAgentInput, CreateWorkGroupInput, DashboardState, Lease,
-        LeaseState, MemoryItem, MemoryPolicy, MemoryScope, MessageKind, ModelPolicy,
-        SendHumanMessageInput, SenderKind, SystemSettings, TaskCard, TaskExecutionContext,
-        TaskStatus, ToolRun, ToolRunState, UpdateAgentInput, Visibility, WorkGroup,
+        LeaseState, MessageKind, ModelPolicy, SendHumanMessageInput, SenderKind, SystemSettings,
+        TaskCard, TaskStatus, ToolRun, ToolRunState, UpdateAgentInput, Visibility, WorkGroup,
     },
-    llm_rig::RigModelAdapter,
+    llm_rig::{refresh_models, RigModelAdapter},
     storage::Storage,
     tool_runtime::ToolRuntime,
 };
-
-#[derive(Default)]
-struct RecoveryReport {
-    paused_tasks: usize,
-    review_tasks: usize,
-    resumed_approvals: usize,
-    requeued_tool_runs: usize,
-    cancelled_tool_runs: usize,
-    paused_leases: usize,
-    released_leases: usize,
-    reconciled_parents: usize,
-}
-
-struct TaskFailureReport {
-    task: Option<TaskCard>,
-    cancelled_tool_runs: Vec<ToolRun>,
-    audit_event: AuditEvent,
-}
 
 #[derive(Clone)]
 pub struct AppService {
@@ -61,7 +48,16 @@ impl AppService {
             tool_runtime,
             agent_runtime,
         };
+        let expired_memory = service.storage.cleanup_expired_memory_items()?;
         service.recover_runtime_state()?;
+        if expired_memory > 0 {
+            service.record_audit(
+                "memory.expired_cleanup",
+                "system",
+                "startup",
+                json!({ "deletedCount": expired_memory }),
+            )?;
+        }
         Ok(service)
     }
 
@@ -88,7 +84,8 @@ impl AppService {
             tool_ids: input.tool_ids,
             max_parallel_runs: input.max_parallel_runs,
             can_spawn_subtasks: input.can_spawn_subtasks,
-            memory_policy: MemoryPolicy::default(),
+            memory_policy: input.memory_policy,
+            permission_policy: input.permission_policy,
         };
         self.storage.insert_agent(&agent)?;
         self.record_audit(
@@ -116,7 +113,8 @@ impl AppService {
             tool_ids: input.tool_ids,
             max_parallel_runs: input.max_parallel_runs,
             can_spawn_subtasks: input.can_spawn_subtasks,
-            memory_policy: MemoryPolicy::default(),
+            memory_policy: input.memory_policy,
+            permission_policy: input.permission_policy,
         };
         self.storage.insert_agent(&agent)?;
         self.record_audit(
@@ -144,7 +142,9 @@ impl AppService {
                 )
         });
         if has_open_task {
-            return Err(anyhow!("cannot delete agent with unfinished assigned tasks"));
+            return Err(anyhow!(
+                "cannot delete agent with unfinished assigned tasks"
+            ));
         }
 
         self.storage.delete_agent(agent_id)?;
@@ -231,6 +231,141 @@ impl AppService {
         Ok(())
     }
 
+    pub async fn refresh_provider_models(
+        &self,
+        config: AIProviderConfig,
+    ) -> Result<AIProviderConfig> {
+        let mut settings = self.storage.get_settings()?;
+        let provider_index = settings
+            .providers
+            .iter()
+            .position(|provider| provider.id == config.id)
+            .ok_or_else(|| anyhow!("provider not found: {}", config.id))?;
+
+        let models = refresh_models(&config).await?;
+        let mut updated_provider = config;
+        updated_provider.models = models;
+        if !updated_provider
+            .models
+            .contains(&updated_provider.default_model)
+        {
+            updated_provider.default_model = updated_provider
+                .models
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow!("provider returned no models"))?;
+        }
+
+        settings.providers[provider_index] = updated_provider.clone();
+
+        if settings.global_config.default_llm_provider == updated_provider.id
+            && !updated_provider
+                .models
+                .contains(&settings.global_config.default_llm_model)
+        {
+            settings.global_config.default_llm_model = updated_provider.default_model.clone();
+        }
+
+        if settings.global_config.default_vlm_provider == updated_provider.id
+            && !updated_provider
+                .models
+                .contains(&settings.global_config.default_vlm_model)
+        {
+            settings.global_config.default_vlm_model = updated_provider.default_model.clone();
+        }
+
+        self.storage.update_settings(&settings)?;
+        self.record_audit(
+            "settings.provider_models_refreshed",
+            "provider",
+            &updated_provider.id,
+            json!({
+                "providerId": updated_provider.id.clone(),
+                "modelsCount": updated_provider.models.len(),
+                "defaultModel": updated_provider.default_model.clone(),
+            }),
+        )?;
+
+        Ok(updated_provider)
+    }
+
+    fn build_permission_denied_message(
+        &self,
+        work_group_id: &str,
+        task_id: &str,
+        agent: &AgentProfile,
+        tool: &crate::core::domain::ToolManifest,
+        reason: &str,
+    ) -> ConversationMessage {
+        ConversationMessage {
+            id: new_id(),
+            conversation_id: work_group_id.to_string(),
+            work_group_id: work_group_id.to_string(),
+            sender_kind: SenderKind::System,
+            sender_id: "coordinator".into(),
+            sender_name: "Coordinator".into(),
+            kind: MessageKind::Status,
+            visibility: Visibility::Main,
+            content: format!(
+                "Permission denied: {} cannot use {}. {}",
+                agent.name, tool.name, reason
+            ),
+            mentions: vec![agent.id.clone()],
+            task_card_id: Some(task_id.to_string()),
+            execution_mode: None,
+            created_at: now(),
+        }
+    }
+
+    fn handle_permission_denial<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        work_group_id: &str,
+        task: &mut TaskCard,
+        lease: Option<&mut Lease>,
+        agent: &AgentProfile,
+        tool: &crate::core::domain::ToolManifest,
+        reason: &str,
+    ) -> Result<()> {
+        task.status = TaskStatus::NeedsReview;
+        self.storage.update_task_card(task)?;
+        emit(app, "task:status-changed", task)?;
+
+        if let Some(lease) = lease {
+            lease.state = LeaseState::Released;
+            lease.released_at = Some(now());
+            lease.preempt_requested_at = None;
+            self.storage.update_lease(lease)?;
+        }
+
+        let message =
+            self.build_permission_denied_message(work_group_id, &task.id, agent, tool, reason);
+        self.storage.insert_message(&message)?;
+        emit(app, "chat:message-created", &message)?;
+        self.record_audit(
+            "tool_run.permission_denied",
+            "task_card",
+            &task.id,
+            json!({
+                "agentId": agent.id,
+                "toolId": tool.id,
+                "reason": reason,
+            }),
+        )?;
+        self.emit_collaboration_result(
+            app,
+            task,
+            agent,
+            TaskStatus::NeedsReview,
+            &format!("Permission denied before execution. {reason}"),
+            None,
+        )?;
+        if let Some(parent_id) = task.parent_id.clone() {
+            self.reconcile_parent_task(app, &parent_id)?;
+        }
+        Ok(())
+    }
+
     pub fn send_human_message<R: Runtime>(
         &self,
         app: AppHandle<R>,
@@ -264,9 +399,11 @@ impl AppService {
 
         self.preempt_active_leases(&app, &work_group.id)?;
 
-        let requested_tool = self
-            .tool_runtime
-            .select_tool_for_text(&input.content, &collect_allowed_tools(&members));
+        let scored_members = scored_candidates(&self.tool_runtime, &members);
+        let requested_tool = self.tool_runtime.select_tool_for_text(
+            &input.content,
+            &collect_allowed_tools(&self.tool_runtime, &members),
+        );
         let active_loads = self
             .storage
             .counts_for_agents(&work_group.member_agent_ids)?;
@@ -289,19 +426,42 @@ impl AppService {
         let mut claim_plan = self.coordinator.score(ClaimContext {
             task_card,
             work_group: work_group.clone(),
-            candidates: members.clone(),
+            candidates: scored_members,
             content: input.content.clone(),
             mentioned_agent_ids: human_message.mentions.clone(),
             active_loads,
             requested_tool: requested_tool.clone(),
         })?;
 
-        if requested_tool
-            .as_ref()
-            .map(|tool| tool.risk_level == crate::core::domain::ToolRiskLevel::High)
-            .unwrap_or(false)
-        {
-            claim_plan.task_card.status = TaskStatus::WaitingApproval;
+        let mut denied_request: Option<(AgentProfile, crate::core::domain::ToolManifest, String)> =
+            None;
+        let mut requested_tool_requires_approval = false;
+        if let (Some(tool), Some(lease)) = (requested_tool.clone(), claim_plan.lease.as_ref()) {
+            if let Some(agent) = members
+                .iter()
+                .find(|candidate| candidate.id == lease.owner_agent_id)
+                .cloned()
+            {
+                let decision = self.tool_runtime.authorize_tool_call(
+                    &agent,
+                    &tool,
+                    &claim_plan.task_card.input_payload,
+                )?;
+                if !decision.allowed {
+                    claim_plan.task_card.status = TaskStatus::NeedsReview;
+                    denied_request = Some((
+                        agent,
+                        tool,
+                        decision
+                            .reason
+                            .unwrap_or_else(|| "tool access rejected".to_string()),
+                    ));
+                    claim_plan.lease = None;
+                } else if decision.approval_required {
+                    claim_plan.task_card.status = TaskStatus::WaitingApproval;
+                    requested_tool_requires_approval = true;
+                }
+            }
         }
 
         self.storage.insert_task_card(&claim_plan.task_card)?;
@@ -334,19 +494,29 @@ impl AppService {
             )?;
         }
 
-        if let Some(tool) = requested_tool {
+        if let Some((agent, tool, reason)) = denied_request {
+            self.handle_permission_denial(
+                &app,
+                &work_group.id,
+                &mut claim_plan.task_card,
+                None,
+                &agent,
+                &tool,
+                &reason,
+            )?;
+        } else if let Some(tool) = requested_tool {
             if let Some(ref lease) = claim_plan.lease {
                 let tool_run = ToolRun {
                     id: new_id(),
                     tool_id: tool.id.clone(),
                     task_card_id: claim_plan.task_card.id.clone(),
                     agent_id: lease.owner_agent_id.clone(),
-                    state: if tool.risk_level == crate::core::domain::ToolRiskLevel::High {
+                    state: if requested_tool_requires_approval {
                         ToolRunState::PendingApproval
                     } else {
                         ToolRunState::Queued
                     },
-                    approval_required: tool.risk_level == crate::core::domain::ToolRiskLevel::High,
+                    approval_required: requested_tool_requires_approval,
                     started_at: None,
                     finished_at: None,
                     result_ref: None,
@@ -422,6 +592,18 @@ impl AppService {
                 &tool_run.id,
                 json!({ "taskCardId": tool_run.task_card_id }),
             )?;
+            let agent = self.storage.get_agent(&tool_run.agent_id)?;
+            self.emit_collaboration_result(
+                &app,
+                &task_card,
+                &agent,
+                TaskStatus::NeedsReview,
+                "Approval rejected before tool execution.",
+                None,
+            )?;
+            if let Some(parent_id) = task_card.parent_id.clone() {
+                self.reconcile_parent_task(&app, &parent_id)?;
+            }
         }
         Ok(tool_run)
     }
@@ -441,6 +623,20 @@ impl AppService {
         }
         self.record_audit("task.cancelled", "task_card", &task.id, json!({}))?;
         emit(&app, "task:status-changed", &task)?;
+        if let Some(agent_id) = task.assigned_agent_id.as_deref() {
+            let agent = self.storage.get_agent(agent_id)?;
+            self.emit_collaboration_result(
+                &app,
+                &task,
+                &agent,
+                TaskStatus::Cancelled,
+                "Task cancelled before completion.",
+                None,
+            )?;
+        }
+        if let Some(parent_id) = task.parent_id.clone() {
+            self.reconcile_parent_task(&app, &parent_id)?;
+        }
         Ok(task)
     }
 
@@ -480,750 +676,6 @@ impl AppService {
         Ok(task)
     }
 
-    fn preempt_active_leases<R: Runtime>(&self, app: &AppHandle<R>, work_group_id: &str) -> Result<()> {
-        let leases = self.storage.list_active_leases_for_group(work_group_id)?;
-        for mut lease in leases {
-            lease.state = LeaseState::PreemptRequested;
-            lease.preempt_requested_at = Some(now());
-            self.storage.update_lease(&lease)?;
-            emit(app, "lease:preempt-requested", &lease)?;
-            self.record_audit(
-                "lease.preempt_requested",
-                "lease",
-                &lease.id,
-                json!({ "taskCardId": lease.task_card_id }),
-            )?;
-        }
-        Ok(())
-    }
-
-    fn recover_runtime_state(&self) -> Result<()> {
-        let mut report = RecoveryReport::default();
-        let tool_runs = self.storage.list_tool_runs()?;
-
-        for mut tool_run in tool_runs {
-            match tool_run.state {
-                ToolRunState::Completed | ToolRunState::Cancelled => continue,
-                ToolRunState::PendingApproval => {
-                    let mut task = self.storage.get_task_card(&tool_run.task_card_id)?;
-                    if matches!(
-                        task.status,
-                        TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::NeedsReview
-                    ) {
-                        continue;
-                    }
-                    if task.status != TaskStatus::WaitingApproval {
-                        task.status = TaskStatus::WaitingApproval;
-                        self.storage.update_task_card(&task)?;
-                        report.resumed_approvals += 1;
-                    }
-                    if let Some(mut lease) = self.storage.get_lease_by_task(&task.id)? {
-                        if lease.state != LeaseState::Paused {
-                            lease.state = LeaseState::Paused;
-                            lease.preempt_requested_at = None;
-                            self.storage.update_lease(&lease)?;
-                            report.paused_leases += 1;
-                        }
-                    }
-                }
-                ToolRunState::Queued => {
-                    let mut task = self.storage.get_task_card(&tool_run.task_card_id)?;
-                    if matches!(
-                        task.status,
-                        TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::NeedsReview
-                    ) {
-                        tool_run.state = ToolRunState::Cancelled;
-                        tool_run.finished_at = Some(now());
-                        self.storage.insert_tool_run(&tool_run)?;
-                        report.cancelled_tool_runs += 1;
-                        continue;
-                    }
-                    if task.status != TaskStatus::Paused {
-                        task.status = TaskStatus::Paused;
-                        self.storage.update_task_card(&task)?;
-                        report.paused_tasks += 1;
-                    }
-                    if let Some(mut lease) = self.storage.get_lease_by_task(&task.id)? {
-                        if lease.state != LeaseState::Paused {
-                            lease.state = LeaseState::Paused;
-                            lease.preempt_requested_at = None;
-                            self.storage.update_lease(&lease)?;
-                            report.paused_leases += 1;
-                        }
-                    }
-                    report.requeued_tool_runs += 1;
-                }
-                ToolRunState::Running => {
-                    let mut task = self.storage.get_task_card(&tool_run.task_card_id)?;
-                    if tool_run.approval_required {
-                        tool_run.state = ToolRunState::Cancelled;
-                        tool_run.finished_at = Some(now());
-                        self.storage.insert_tool_run(&tool_run)?;
-                        report.cancelled_tool_runs += 1;
-
-                        if task.status != TaskStatus::NeedsReview {
-                            task.status = TaskStatus::NeedsReview;
-                            self.storage.update_task_card(&task)?;
-                            report.review_tasks += 1;
-                        }
-                    } else {
-                        tool_run.state = ToolRunState::Queued;
-                        tool_run.started_at = None;
-                        tool_run.finished_at = None;
-                        self.storage.insert_tool_run(&tool_run)?;
-                        report.requeued_tool_runs += 1;
-
-                        if task.status != TaskStatus::Paused {
-                            task.status = TaskStatus::Paused;
-                            self.storage.update_task_card(&task)?;
-                            report.paused_tasks += 1;
-                        }
-                    }
-
-                    if let Some(mut lease) = self.storage.get_lease_by_task(&task.id)? {
-                        if matches!(task.status, TaskStatus::NeedsReview) {
-                            if lease.state != LeaseState::Released {
-                                lease.state = LeaseState::Released;
-                                lease.released_at = Some(now());
-                                lease.preempt_requested_at = None;
-                                self.storage.update_lease(&lease)?;
-                                report.released_leases += 1;
-                            }
-                        } else if lease.state != LeaseState::Paused {
-                            lease.state = LeaseState::Paused;
-                            lease.preempt_requested_at = None;
-                            self.storage.update_lease(&lease)?;
-                            report.paused_leases += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        for mut lease in self.storage.list_leases()? {
-            if matches!(lease.state, LeaseState::Released | LeaseState::Paused) {
-                continue;
-            }
-            let task = self.storage.get_task_card(&lease.task_card_id)?;
-            if matches!(
-                task.status,
-                TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::NeedsReview
-            ) {
-                lease.state = LeaseState::Released;
-                lease.released_at = Some(lease.released_at.unwrap_or_else(now));
-                lease.preempt_requested_at = None;
-                self.storage.update_lease(&lease)?;
-                report.released_leases += 1;
-            } else {
-                lease.state = LeaseState::Paused;
-                lease.preempt_requested_at = None;
-                self.storage.update_lease(&lease)?;
-                report.paused_leases += 1;
-            }
-        }
-
-        for mut task in self.storage.list_task_cards(None)? {
-            if matches!(
-                task.status,
-                TaskStatus::Completed
-                    | TaskStatus::Cancelled
-                    | TaskStatus::NeedsReview
-                    | TaskStatus::WaitingApproval
-            ) {
-                continue;
-            }
-            if self.storage.get_lease_by_task(&task.id)?.is_none() {
-                task.status = TaskStatus::NeedsReview;
-                self.storage.update_task_card(&task)?;
-                report.review_tasks += 1;
-            }
-        }
-
-        let parent_ids: std::collections::HashSet<String> = self
-            .storage
-            .list_task_cards(None)?
-            .into_iter()
-            .filter_map(|task| task.parent_id)
-            .collect();
-        for parent_id in parent_ids {
-            if self.reconcile_parent_task_state(&parent_id)? {
-                report.reconciled_parents += 1;
-            }
-        }
-
-        if report.paused_tasks > 0
-            || report.review_tasks > 0
-            || report.resumed_approvals > 0
-            || report.requeued_tool_runs > 0
-            || report.cancelled_tool_runs > 0
-            || report.paused_leases > 0
-            || report.released_leases > 0
-            || report.reconciled_parents > 0
-        {
-            self.record_audit(
-                "runtime.recovered",
-                "system",
-                "startup",
-                json!({
-                    "pausedTasks": report.paused_tasks,
-                    "reviewTasks": report.review_tasks,
-                    "resumedApprovals": report.resumed_approvals,
-                    "requeuedToolRuns": report.requeued_tool_runs,
-                    "cancelledToolRuns": report.cancelled_tool_runs,
-                    "pausedLeases": report.paused_leases,
-                    "releasedLeases": report.released_leases,
-                    "reconciledParents": report.reconciled_parents,
-                }),
-            )?;
-        }
-
-        Ok(())
-    }
-
-    fn spawn_task_execution<R: Runtime>(
-        &self,
-        app: AppHandle<R>,
-        task_card_id: String,
-        tool_run_id: Option<String>,
-    ) {
-        let service = self.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(error) = service
-                .run_task(app.clone(), &task_card_id, tool_run_id.as_deref())
-                .await
-            {
-                if let Ok(report) = service.handle_task_execution_failure(&task_card_id, &error) {
-                    if let Some(task) = report.task {
-                        let _ = emit(&app, "task:status-changed", &task);
-                    }
-                    for tool_run in report.cancelled_tool_runs {
-                        let _ = emit(&app, "tool:run-completed", &tool_run);
-                    }
-                    let _ = emit(&app, "audit:event-created", &report.audit_event);
-                }
-            }
-        });
-    }
-
-    fn handle_task_execution_failure(
-        &self,
-        task_card_id: &str,
-        error: &anyhow::Error,
-    ) -> Result<TaskFailureReport> {
-        let mut task = self.storage.get_task_card(task_card_id).ok();
-        let mut cancelled_tool_runs = Vec::new();
-
-        if let Some(ref mut current_task) = task {
-            if !matches!(
-                current_task.status,
-                TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::NeedsReview
-            ) {
-                current_task.status = TaskStatus::NeedsReview;
-                self.storage.update_task_card(current_task)?;
-            }
-        }
-
-        if let Some(mut lease) = self.storage.get_lease_by_task(task_card_id)? {
-            if lease.state != LeaseState::Released {
-                lease.state = LeaseState::Released;
-                lease.released_at = Some(now());
-                lease.preempt_requested_at = None;
-                self.storage.update_lease(&lease)?;
-            }
-        }
-
-        for mut tool_run in self
-            .storage
-            .list_tool_runs()?
-            .into_iter()
-            .filter(|run| run.task_card_id == task_card_id)
-        {
-            if matches!(
-                tool_run.state,
-                ToolRunState::Completed | ToolRunState::Cancelled
-            ) {
-                continue;
-            }
-            tool_run.state = ToolRunState::Cancelled;
-            tool_run.finished_at = Some(now());
-            self.storage.insert_tool_run(&tool_run)?;
-            cancelled_tool_runs.push(tool_run);
-        }
-
-        let audit_event = AuditEvent {
-            id: new_id(),
-            event_type: "task.execution_error".into(),
-            entity_type: "task_card".into(),
-            entity_id: task_card_id.into(),
-            payload_json: json!({ "error": error.to_string() }).to_string(),
-            created_at: now(),
-        };
-        self.storage.insert_audit_event(&audit_event)?;
-
-        Ok(TaskFailureReport {
-            task,
-            cancelled_tool_runs,
-            audit_event,
-        })
-    }
-
-    async fn run_task<R: Runtime>(
-        &self,
-        app: AppHandle<R>,
-        task_card_id: &str,
-        tool_run_id: Option<&str>,
-    ) -> Result<()> {
-        let mut task = self.storage.get_task_card(task_card_id)?;
-        let mut lease = self
-            .storage
-            .get_lease_by_task(task_card_id)?
-            .ok_or_else(|| anyhow!("lease missing for task"))?;
-        if lease.state == LeaseState::Paused {
-            return Ok(());
-        }
-
-        task.status = TaskStatus::InProgress;
-        self.storage.update_task_card(&task)?;
-        emit(&app, "task:status-changed", &task)?;
-
-        let work_group = self.storage.get_work_group(&task.work_group_id)?;
-        let owner_id = lease.owner_agent_id.clone();
-        let agent = self.storage.get_agent(&owner_id)?;
-        let work_group_members = self
-            .storage
-            .list_agents()?
-            .into_iter()
-            .filter(|candidate| work_group.member_agent_ids.contains(&candidate.id))
-            .collect();
-        let messages = self.storage.list_messages_for_group(&work_group.id)?;
-        let approved_tool = if let Some(id) = tool_run_id {
-            let mut tool_run = self.storage.get_tool_run(id)?;
-            tool_run.state = ToolRunState::Running;
-            tool_run.started_at = Some(now());
-            self.storage.insert_tool_run(&tool_run)?;
-            emit(&app, "tool:run-started", &tool_run)?;
-            self.tool_runtime.tool_by_id(&tool_run.tool_id)
-        } else {
-            self.tool_runtime
-                .select_tool_for_text(&task.input_payload, &agent.tool_ids)
-                .filter(|tool| tool.risk_level != crate::core::domain::ToolRiskLevel::High)
-        };
-
-        if let Some(tool) = approved_tool.clone() {
-            let tool_call_message = ConversationMessage {
-                id: new_id(),
-                conversation_id: work_group.id.clone(),
-                work_group_id: work_group.id.clone(),
-                sender_kind: SenderKind::System,
-                sender_id: "coordinator".into(),
-                sender_name: "Coordinator".into(),
-                kind: MessageKind::ToolCall,
-                visibility: Visibility::Backstage,
-                content: format!("Executing tool '{}' for task '{}'.", tool.name, task.title),
-                mentions: vec![agent.id.clone()],
-                task_card_id: Some(task.id.clone()),
-                execution_mode: None,
-                created_at: now(),
-            };
-            self.storage.insert_message(&tool_call_message)?;
-            emit(&app, "chat:message-created", &tool_call_message)?;
-            self.record_audit(
-                "tool_run.started",
-                "task_card",
-                &task.id,
-                json!({ "toolId": tool.id, "agentId": agent.id }),
-            )?;
-        }
-
-        let available_skills = self
-            .tool_runtime
-            .builtin_skills()
-            .into_iter()
-            .filter(|skill| agent.skill_ids.contains(&skill.id))
-            .collect();
-        let available_tools = self
-            .tool_runtime
-            .builtin_tools()
-            .into_iter()
-            .filter(|tool| agent.tool_ids.contains(&tool.id))
-            .collect();
-
-        let execution = self
-            .agent_runtime
-            .execute_task(TaskExecutionContext {
-                agent: agent.clone(),
-                work_group: work_group.clone(),
-                work_group_members,
-                task_card: task.clone(),
-                conversation_window: messages,
-                available_tools,
-                available_skills,
-                approved_tool: approved_tool.clone(),
-                settings: self.storage.get_settings()?,
-            })
-            .await?;
-
-        if let Some(id) = tool_run_id {
-            let mut tool_run = self.storage.get_tool_run(id)?;
-            tool_run.state = ToolRunState::Completed;
-            tool_run.finished_at = Some(now());
-            tool_run.result_ref = execution.tool_output.clone();
-            self.storage.insert_tool_run(&tool_run)?;
-            emit(&app, "tool:run-completed", &tool_run)?;
-        }
-
-        if let Some(tool_output) = execution.tool_output.clone() {
-            let tool_result_message = ConversationMessage {
-                id: new_id(),
-                conversation_id: work_group.id.clone(),
-                work_group_id: work_group.id.clone(),
-                sender_kind: SenderKind::System,
-                sender_id: "coordinator".into(),
-                sender_name: "Coordinator".into(),
-                kind: MessageKind::ToolResult,
-                visibility: Visibility::Backstage,
-                content: tool_output.clone(),
-                mentions: vec![agent.id.clone()],
-                task_card_id: Some(task.id.clone()),
-                execution_mode: Some(execution.execution_mode.clone()),
-                created_at: now(),
-            };
-            self.storage.insert_message(&tool_result_message)?;
-            emit(&app, "chat:message-created", &tool_result_message)?;
-            self.record_audit(
-                "tool_run.completed",
-                "task_card",
-                &task.id,
-                json!({ "agentId": agent.id, "result": tool_output }),
-            )?;
-        }
-
-        let summary_message = ConversationMessage {
-            id: new_id(),
-            conversation_id: work_group.id.clone(),
-            work_group_id: work_group.id.clone(),
-            sender_kind: SenderKind::Agent,
-            sender_id: agent.id.clone(),
-            sender_name: agent.name.clone(),
-            kind: MessageKind::Summary,
-            visibility: Visibility::Main,
-            content: execution.summary.clone(),
-            mentions: vec![],
-            task_card_id: Some(task.id.clone()),
-            execution_mode: Some(execution.execution_mode.clone()),
-            created_at: now(),
-        };
-        self.storage.insert_message(&summary_message)?;
-        emit(&app, "chat:message-created", &summary_message)?;
-
-        let backstage_message = ConversationMessage {
-            id: new_id(),
-            conversation_id: work_group.id.clone(),
-            work_group_id: work_group.id.clone(),
-            sender_kind: SenderKind::Agent,
-            sender_id: agent.id.clone(),
-            sender_name: agent.name.clone(),
-            kind: MessageKind::Status,
-            visibility: Visibility::Backstage,
-            content: execution.backstage_notes.clone(),
-            mentions: vec![],
-            task_card_id: Some(task.id.clone()),
-            execution_mode: Some(execution.execution_mode.clone()),
-            created_at: now(),
-        };
-        self.storage.insert_message(&backstage_message)?;
-        emit(&app, "chat:message-created", &backstage_message)?;
-
-        self.storage.insert_memory_item(&MemoryItem {
-            id: new_id(),
-            scope: MemoryScope::Agent,
-            scope_id: agent.id.clone(),
-            content: execution.summary.clone(),
-            tags: vec!["summary".into(), "execution".into()],
-            embedding_ref: None,
-            pinned: false,
-            ttl: None,
-            created_at: now(),
-        })?;
-        emit(
-            &app,
-            "memory:updated",
-            &json!({ "agentId": agent.id, "taskCardId": task.id }),
-        )?;
-
-        let mut spawned_subtasks = Vec::new();
-        if !execution.suggested_subtasks.is_empty() {
-            for subtask in execution.suggested_subtasks.iter().take(1) {
-                if let Some(created_task) = self.spawn_subtask(&app, &task, &agent, subtask)? {
-                    spawned_subtasks.push(created_task);
-                }
-            }
-        }
-
-        if !spawned_subtasks.is_empty() {
-            task.status = TaskStatus::WaitingChildren;
-            self.storage.update_task_card(&task)?;
-            emit(&app, "task:status-changed", &task)?;
-            let waiting_message = ConversationMessage {
-                id: new_id(),
-                conversation_id: work_group.id.clone(),
-                work_group_id: work_group.id.clone(),
-                sender_kind: SenderKind::System,
-                sender_id: "coordinator".into(),
-                sender_name: "Coordinator".into(),
-                kind: MessageKind::Status,
-                visibility: Visibility::Main,
-                content: format!(
-                    "{} is waiting on {} child task(s) before completion.",
-                    task.title,
-                    spawned_subtasks.len()
-                ),
-                mentions: vec![agent.id.clone()],
-                task_card_id: Some(task.id.clone()),
-                execution_mode: None,
-                created_at: now(),
-            };
-            self.storage.insert_message(&waiting_message)?;
-            emit(&app, "chat:message-created", &waiting_message)?;
-            self.record_audit(
-                "task.waiting_children",
-                "task_card",
-                &task.id,
-                json!({ "children": spawned_subtasks.iter().map(|item| item.id.clone()).collect::<Vec<_>>() }),
-            )?;
-            return Ok(());
-        }
-
-        lease = self
-            .storage
-            .get_lease_by_task(&task.id)?
-            .ok_or_else(|| anyhow!("lease disappeared"))?;
-        if lease.state == LeaseState::PreemptRequested {
-            lease.state = LeaseState::Paused;
-            self.storage.update_lease(&lease)?;
-            task.status = TaskStatus::Paused;
-            self.storage.update_task_card(&task)?;
-            emit(&app, "task:status-changed", &task)?;
-            return Ok(());
-        }
-
-        lease.state = LeaseState::Released;
-        lease.released_at = Some(now());
-        self.storage.update_lease(&lease)?;
-
-        task.status = TaskStatus::Completed;
-        self.storage.update_task_card(&task)?;
-        emit(&app, "task:status-changed", &task)?;
-        self.record_audit(
-            "task.completed",
-            "task_card",
-            &task.id,
-            json!({ "ownerAgentId": agent.id }),
-        )?;
-        if let Some(parent_id) = task.parent_id.clone() {
-            self.reconcile_parent_task(&app, &parent_id)?;
-        }
-        Ok(())
-    }
-
-    fn spawn_subtask<R: Runtime>(
-        &self,
-        app: &AppHandle<R>,
-        parent_task: &TaskCard,
-        owner_agent: &AgentProfile,
-        content: &str,
-    ) -> Result<Option<TaskCard>> {
-        let work_group = self.storage.get_work_group(&parent_task.work_group_id)?;
-        let all_agents = self.storage.list_agents()?;
-        let members: Vec<AgentProfile> = all_agents
-            .into_iter()
-            .filter(|agent| {
-                work_group.member_agent_ids.contains(&agent.id) && agent.id != owner_agent.id
-            })
-            .collect();
-        if members.is_empty() {
-            return Ok(None);
-        }
-
-        let task_card = TaskCard {
-            id: new_id(),
-            parent_id: Some(parent_task.id.clone()),
-            source_message_id: parent_task.source_message_id.clone(),
-            title: Coordinator::build_task_title(content),
-            normalized_goal: content.to_string(),
-            input_payload: content.to_string(),
-            priority: 60,
-            status: TaskStatus::Bidding,
-            work_group_id: work_group.id.clone(),
-            created_by: owner_agent.id.clone(),
-            assigned_agent_id: None,
-            created_at: now(),
-        };
-        let active_loads = self
-            .storage
-            .counts_for_agents(&work_group.member_agent_ids)?;
-        let selected_tool = self
-            .tool_runtime
-            .select_tool_for_text(content, &collect_allowed_tools(&members));
-        let mentioned_agent_ids = Coordinator::extract_mentions(content, &members);
-        let claim_plan = self.coordinator.score(ClaimContext {
-            task_card,
-            work_group: work_group.clone(),
-            candidates: members.clone(),
-            content: content.to_string(),
-            mentioned_agent_ids,
-            active_loads,
-            requested_tool: selected_tool.clone(),
-        })?;
-        let selected_tool = claim_plan.requested_tool.clone();
-        self.storage.insert_task_card(&claim_plan.task_card)?;
-        emit(app, "task:card-created", &claim_plan.task_card)?;
-        for bid in &claim_plan.bids {
-            self.storage.insert_claim_bid(bid)?;
-            emit(app, "claim:bid-submitted", bid)?;
-        }
-        for message in &claim_plan.coordinator_messages {
-            self.storage.insert_message(message)?;
-            emit(app, "chat:message-created", message)?;
-        }
-        if let Some(ref lease) = claim_plan.lease {
-            self.storage.insert_lease(lease)?;
-            emit(app, "lease:granted", lease)?;
-        }
-        if let Some(tool) = selected_tool {
-            if let Some(ref lease) = claim_plan.lease {
-                let tool_run = ToolRun {
-                    id: new_id(),
-                    tool_id: tool.id.clone(),
-                    task_card_id: claim_plan.task_card.id.clone(),
-                    agent_id: lease.owner_agent_id.clone(),
-                    state: if tool.risk_level == crate::core::domain::ToolRiskLevel::High {
-                        ToolRunState::PendingApproval
-                    } else {
-                        ToolRunState::Queued
-                    },
-                    approval_required: tool.risk_level == crate::core::domain::ToolRiskLevel::High,
-                    started_at: None,
-                    finished_at: None,
-                    result_ref: None,
-                };
-                self.storage.insert_tool_run(&tool_run)?;
-                if !tool_run.approval_required {
-                    self.spawn_task_execution(
-                        app.clone(),
-                        claim_plan.task_card.id.clone(),
-                        Some(tool_run.id),
-                    );
-                }
-            }
-        } else if claim_plan.lease.is_some() {
-            self.spawn_task_execution(app.clone(), claim_plan.task_card.id.clone(), None);
-        }
-        Ok(Some(claim_plan.task_card))
-    }
-
-    fn reconcile_parent_task<R: Runtime>(&self, app: &AppHandle<R>, parent_id: &str) -> Result<()> {
-        let parent_task_before = self.storage.get_task_card(parent_id)?;
-        let child_tasks = self.storage.list_child_tasks(parent_id)?;
-        if !self.reconcile_parent_task_state(parent_id)? {
-            return Ok(());
-        }
-        let parent_task = self.storage.get_task_card(parent_id)?;
-        emit(app, "task:status-changed", &parent_task)?;
-        let has_issue = matches!(parent_task.status, TaskStatus::NeedsReview);
-
-        let status_message = ConversationMessage {
-            id: new_id(),
-            conversation_id: parent_task.work_group_id.clone(),
-            work_group_id: parent_task.work_group_id.clone(),
-            sender_kind: SenderKind::System,
-            sender_id: "coordinator".into(),
-            sender_name: "Coordinator".into(),
-            kind: MessageKind::Summary,
-            visibility: Visibility::Main,
-            content: if has_issue {
-                format!(
-                    "Parent task '{}' moved to needs review after child task completion.",
-                    parent_task.title
-                )
-            } else {
-                format!(
-                    "Parent task '{}' completed after all child tasks finished.",
-                    parent_task.title
-                )
-            },
-            mentions: vec![],
-            task_card_id: Some(parent_task.id.clone()),
-            execution_mode: None,
-            created_at: now(),
-        };
-        if parent_task_before.status != parent_task.status {
-            self.storage.insert_message(&status_message)?;
-            emit(app, "chat:message-created", &status_message)?;
-        }
-        self.record_audit(
-            "task.parent_reconciled",
-            "task_card",
-            &parent_task.id,
-            json!({
-                "childTaskIds": child_tasks.iter().map(|task| task.id.clone()).collect::<Vec<_>>(),
-                "status": parent_task.status.clone(),
-            }),
-        )?;
-
-        if let Some(grand_parent_id) = parent_task.parent_id.clone() {
-            self.reconcile_parent_task(app, &grand_parent_id)?;
-        }
-
-        Ok(())
-    }
-
-    fn reconcile_parent_task_state(&self, parent_id: &str) -> Result<bool> {
-        let mut parent_task = self.storage.get_task_card(parent_id)?;
-        let child_tasks = self.storage.list_child_tasks(parent_id)?;
-        if child_tasks.is_empty() {
-            return Ok(false);
-        }
-
-        let has_terminal_children = child_tasks.iter().all(|child| {
-            matches!(
-                child.status,
-                TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::NeedsReview
-            )
-        });
-        if !has_terminal_children {
-            return Ok(false);
-        }
-
-        let has_issue = child_tasks.iter().any(|child| {
-            matches!(
-                child.status,
-                TaskStatus::Cancelled | TaskStatus::NeedsReview
-            )
-        });
-        let next_status = if has_issue {
-            TaskStatus::NeedsReview
-        } else {
-            TaskStatus::Completed
-        };
-        let changed = parent_task.status != next_status;
-        if changed {
-            parent_task.status = next_status;
-            self.storage.update_task_card(&parent_task)?;
-        }
-
-        if let Some(mut lease) = self.storage.get_lease_by_task(parent_id)? {
-            if lease.state != LeaseState::Released {
-                lease.state = LeaseState::Released;
-                lease.released_at = Some(now());
-                lease.preempt_requested_at = None;
-                self.storage.update_lease(&lease)?;
-            }
-        }
-
-        Ok(changed)
-    }
-
     fn record_audit(
         &self,
         event_type: &str,
@@ -1242,438 +694,34 @@ impl AppService {
     }
 }
 
-fn collect_allowed_tools(agents: &[AgentProfile]) -> Vec<String> {
+fn collect_allowed_tools(tool_runtime: &ToolRuntime, agents: &[AgentProfile]) -> Vec<String> {
     let mut ids = Vec::new();
     for agent in agents {
-        for tool_id in &agent.tool_ids {
-            if !ids.contains(tool_id) {
-                ids.push(tool_id.clone());
+        for tool in tool_runtime.available_tools_for_agent(agent) {
+            if !ids.contains(&tool.id) {
+                ids.push(tool.id);
             }
         }
     }
     ids
 }
 
+fn scored_candidates(tool_runtime: &ToolRuntime, agents: &[AgentProfile]) -> Vec<AgentProfile> {
+    agents
+        .iter()
+        .cloned()
+        .map(|mut agent| {
+            agent.tool_ids = tool_runtime
+                .available_tools_for_agent(&agent)
+                .into_iter()
+                .map(|tool| tool.id)
+                .collect();
+            agent
+        })
+        .collect()
+}
+
 fn emit<R: Runtime, T: Serialize>(app: &AppHandle<R>, event: &str, payload: &T) -> Result<()> {
     app.emit(event, payload)
         .map_err(|error| anyhow!("failed to emit {event}: {error}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::AppService;
-    use crate::core::domain::{
-        new_id, now, CreateAgentInput, CreateWorkGroupInput, Lease, LeaseState,
-        SendHumanMessageInput, TaskCard, TaskStatus, ToolRun, ToolRunState, WorkGroupKind,
-    };
-    use anyhow::anyhow;
-    use std::{
-        fs,
-        path::PathBuf,
-        thread,
-        time::Duration,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    fn unique_root(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!("nextchat-service-{prefix}-{nanos}"))
-    }
-
-    fn setup_service() -> (AppService, PathBuf, PathBuf) {
-        let workspace_root = unique_root("workspace");
-        let data_root = unique_root("data");
-        fs::create_dir_all(&workspace_root).expect("workspace");
-        fs::create_dir_all(&data_root).expect("data");
-        let service = AppService::new(workspace_root.clone(), data_root.clone()).expect("service");
-        (service, workspace_root, data_root)
-    }
-
-    #[test]
-    fn minimal_group_flow_creates_task_lease_and_agent_summary() {
-        let (service, _, _) = setup_service();
-        let app = tauri::test::mock_app();
-        let app_handle = app.handle().clone();
-
-        let planner = service
-            .create_agent_profile(CreateAgentInput {
-                name: "Planner".into(),
-                avatar: "PL".into(),
-                role: "Planning Lead".into(),
-                objective: "Produce clear plans and summaries.".into(),
-                provider: "mock".into(),
-                model: "simulation".into(),
-                temperature: 0.2,
-                skill_ids: vec!["skill.builder".into()],
-                tool_ids: vec!["plan.summarize".into()],
-                max_parallel_runs: 2,
-                can_spawn_subtasks: true,
-            })
-            .expect("planner");
-        let reviewer = service
-            .create_agent_profile(CreateAgentInput {
-                name: "Reviewer2".into(),
-                avatar: "R2".into(),
-                role: "Review Lead".into(),
-                objective: "Review plans and keep answers concise.".into(),
-                provider: "mock".into(),
-                model: "simulation".into(),
-                temperature: 0.2,
-                skill_ids: vec!["skill.reviewer".into()],
-                tool_ids: vec!["plan.summarize".into()],
-                max_parallel_runs: 2,
-                can_spawn_subtasks: false,
-            })
-            .expect("reviewer");
-
-        let work_group = service
-            .create_work_group(CreateWorkGroupInput {
-                name: "Smoke Group".into(),
-                goal: "Validate the minimal task flow.".into(),
-                kind: WorkGroupKind::Persistent,
-                default_visibility: "summary".into(),
-                auto_archive: false,
-            })
-            .expect("group");
-        service
-            .add_agent_to_work_group(&work_group.id, &planner.id)
-            .expect("add planner");
-        service
-            .add_agent_to_work_group(&work_group.id, &reviewer.id)
-            .expect("add reviewer");
-
-        service
-            .send_human_message(
-                app_handle,
-                SendHumanMessageInput {
-                    work_group_id: work_group.id.clone(),
-                    content: "Please create a concise plan for launch readiness.".into(),
-                },
-            )
-            .expect("send message");
-
-        let task_id = (0..40)
-            .find_map(|_| {
-                let task = service
-                    .storage
-                    .list_task_cards(Some(&work_group.id))
-                    .expect("tasks")
-                    .into_iter()
-                    .find(|task| task.created_by == "human");
-                if let Some(task) = task {
-                    Some(task.id)
-                } else {
-                    thread::sleep(Duration::from_millis(50));
-                    None
-                }
-            })
-            .expect("task created");
-
-        let final_task = (0..80)
-            .find_map(|_| {
-                let task = service.storage.get_task_card(&task_id).expect("task");
-                if matches!(
-                    task.status,
-                    TaskStatus::Completed | TaskStatus::WaitingApproval | TaskStatus::NeedsReview
-                ) {
-                    Some(task)
-                } else {
-                    thread::sleep(Duration::from_millis(50));
-                    None
-                }
-            })
-            .expect("task reached terminal-ish state");
-
-        assert_eq!(final_task.status, TaskStatus::Completed);
-
-        let lease = service
-            .storage
-            .get_lease_by_task(&task_id)
-            .expect("lease query")
-            .expect("lease exists");
-        assert_eq!(lease.state, LeaseState::Released);
-
-        let bids = service
-            .storage
-            .list_claim_bids()
-            .expect("bids")
-            .into_iter()
-            .filter(|bid| bid.task_card_id == task_id)
-            .collect::<Vec<_>>();
-        assert!(!bids.is_empty(), "expected at least one claim bid");
-
-        let summary_messages = service
-            .storage
-            .list_messages_for_group(&work_group.id)
-            .expect("messages")
-            .into_iter()
-            .filter(|message| {
-                message.task_card_id.as_deref() == Some(task_id.as_str())
-                    && matches!(message.sender_kind, crate::core::domain::SenderKind::Agent)
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            !summary_messages.is_empty(),
-            "expected an agent summary message for the task"
-        );
-    }
-
-    #[test]
-    fn startup_recovery_pauses_low_risk_inflight_work() {
-        let (service, workspace_root, data_root) = setup_service();
-        let work_group = service
-            .storage
-            .list_work_groups()
-            .expect("groups")
-            .into_iter()
-            .next()
-            .expect("seeded group");
-        let agent = service
-            .storage
-            .list_agents()
-            .expect("agents")
-            .into_iter()
-            .next()
-            .expect("seeded agent");
-
-        let task = TaskCard {
-            id: new_id(),
-            parent_id: None,
-            source_message_id: new_id(),
-            title: "Recover queued search".into(),
-            normalized_goal: "Search the workspace after restart.".into(),
-            input_payload: "search the workspace".into(),
-            priority: 10,
-            status: TaskStatus::InProgress,
-            work_group_id: work_group.id.clone(),
-            created_by: "human".into(),
-            assigned_agent_id: Some(agent.id.clone()),
-            created_at: now(),
-        };
-        service.storage.insert_task_card(&task).expect("task");
-        service
-            .storage
-            .insert_lease(&Lease {
-                id: new_id(),
-                task_card_id: task.id.clone(),
-                owner_agent_id: agent.id.clone(),
-                state: LeaseState::Active,
-                granted_at: now(),
-                expires_at: None,
-                preempt_requested_at: None,
-                released_at: None,
-            })
-            .expect("lease");
-        service
-            .storage
-            .insert_tool_run(&ToolRun {
-                id: new_id(),
-                tool_id: "project.search".into(),
-                task_card_id: task.id.clone(),
-                agent_id: agent.id.clone(),
-                state: ToolRunState::Running,
-                approval_required: false,
-                started_at: Some(now()),
-                finished_at: None,
-                result_ref: None,
-            })
-            .expect("tool run");
-
-        let recovered = AppService::new(workspace_root, data_root).expect("recovered service");
-
-        let recovered_task = recovered.storage.get_task_card(&task.id).expect("task");
-        assert_eq!(recovered_task.status, TaskStatus::Paused);
-
-        let recovered_lease = recovered
-            .storage
-            .get_lease_by_task(&task.id)
-            .expect("lease")
-            .expect("lease exists");
-        assert_eq!(recovered_lease.state, LeaseState::Paused);
-
-        let recovered_run = recovered
-            .storage
-            .list_tool_runs()
-            .expect("runs")
-            .into_iter()
-            .find(|run| run.task_card_id == task.id)
-            .expect("run");
-        assert_eq!(recovered_run.state, ToolRunState::Queued);
-        assert!(recovered_run.started_at.is_none());
-    }
-
-    #[test]
-    fn startup_recovery_marks_high_risk_inflight_work_for_review() {
-        let (service, workspace_root, data_root) = setup_service();
-        let work_group = service
-            .storage
-            .list_work_groups()
-            .expect("groups")
-            .into_iter()
-            .next()
-            .expect("seeded group");
-        let agent = service
-            .storage
-            .list_agents()
-            .expect("agents")
-            .into_iter()
-            .find(|item| item.tool_ids.iter().any(|tool| tool == "shell.exec"))
-            .expect("agent with shell");
-
-        let task = TaskCard {
-            id: new_id(),
-            parent_id: None,
-            source_message_id: new_id(),
-            title: "Recover shell execution".into(),
-            normalized_goal: "Run a shell command after approval.".into(),
-            input_payload: "run shell command".into(),
-            priority: 10,
-            status: TaskStatus::InProgress,
-            work_group_id: work_group.id.clone(),
-            created_by: "human".into(),
-            assigned_agent_id: Some(agent.id.clone()),
-            created_at: now(),
-        };
-        service.storage.insert_task_card(&task).expect("task");
-        service
-            .storage
-            .insert_lease(&Lease {
-                id: new_id(),
-                task_card_id: task.id.clone(),
-                owner_agent_id: agent.id.clone(),
-                state: LeaseState::Active,
-                granted_at: now(),
-                expires_at: None,
-                preempt_requested_at: None,
-                released_at: None,
-            })
-            .expect("lease");
-        service
-            .storage
-            .insert_tool_run(&ToolRun {
-                id: new_id(),
-                tool_id: "shell.exec".into(),
-                task_card_id: task.id.clone(),
-                agent_id: agent.id.clone(),
-                state: ToolRunState::Running,
-                approval_required: true,
-                started_at: Some(now()),
-                finished_at: None,
-                result_ref: None,
-            })
-            .expect("tool run");
-
-        let recovered = AppService::new(workspace_root, data_root).expect("recovered service");
-
-        let recovered_task = recovered.storage.get_task_card(&task.id).expect("task");
-        assert_eq!(recovered_task.status, TaskStatus::NeedsReview);
-
-        let recovered_lease = recovered
-            .storage
-            .get_lease_by_task(&task.id)
-            .expect("lease")
-            .expect("lease exists");
-        assert_eq!(recovered_lease.state, LeaseState::Released);
-        assert!(recovered_lease.released_at.is_some());
-
-        let recovered_run = recovered
-            .storage
-            .list_tool_runs()
-            .expect("runs")
-            .into_iter()
-            .find(|run| run.task_card_id == task.id)
-            .expect("run");
-        assert_eq!(recovered_run.state, ToolRunState::Cancelled);
-        assert!(recovered_run.finished_at.is_some());
-    }
-
-    #[test]
-    fn execution_failure_moves_task_to_review_and_releases_lease() {
-        let (service, _, _) = setup_service();
-        let work_group = service
-            .storage
-            .list_work_groups()
-            .expect("groups")
-            .into_iter()
-            .next()
-            .expect("seeded group");
-        let agent = service
-            .storage
-            .list_agents()
-            .expect("agents")
-            .into_iter()
-            .next()
-            .expect("seeded agent");
-
-        let task = TaskCard {
-            id: new_id(),
-            parent_id: None,
-            source_message_id: new_id(),
-            title: "Failing task".into(),
-            normalized_goal: "Simulate execution failure.".into(),
-            input_payload: "simulate failure".into(),
-            priority: 10,
-            status: TaskStatus::InProgress,
-            work_group_id: work_group.id.clone(),
-            created_by: "human".into(),
-            assigned_agent_id: Some(agent.id.clone()),
-            created_at: now(),
-        };
-        service.storage.insert_task_card(&task).expect("task");
-        service
-            .storage
-            .insert_lease(&Lease {
-                id: new_id(),
-                task_card_id: task.id.clone(),
-                owner_agent_id: agent.id.clone(),
-                state: LeaseState::Active,
-                granted_at: now(),
-                expires_at: None,
-                preempt_requested_at: None,
-                released_at: None,
-            })
-            .expect("lease");
-        service
-            .storage
-            .insert_tool_run(&ToolRun {
-                id: new_id(),
-                tool_id: "project.search".into(),
-                task_card_id: task.id.clone(),
-                agent_id: agent.id.clone(),
-                state: ToolRunState::Running,
-                approval_required: false,
-                started_at: Some(now()),
-                finished_at: None,
-                result_ref: None,
-            })
-            .expect("tool run");
-
-        let report = service
-            .handle_task_execution_failure(&task.id, &anyhow!("boom"))
-            .expect("failure report");
-
-        assert_eq!(report.task.expect("task").status, TaskStatus::NeedsReview);
-        assert_eq!(report.cancelled_tool_runs.len(), 1);
-
-        let lease = service
-            .storage
-            .get_lease_by_task(&task.id)
-            .expect("lease")
-            .expect("lease exists");
-        assert_eq!(lease.state, LeaseState::Released);
-        assert!(lease.released_at.is_some());
-
-        let tool_run = service
-            .storage
-            .list_tool_runs()
-            .expect("runs")
-            .into_iter()
-            .find(|run| run.task_card_id == task.id)
-            .expect("tool run");
-        assert_eq!(tool_run.state, ToolRunState::Cancelled);
-        assert!(tool_run.finished_at.is_some());
-    }
 }

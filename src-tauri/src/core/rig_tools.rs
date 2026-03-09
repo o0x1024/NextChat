@@ -11,6 +11,24 @@ use crate::core::domain::{
     TaskExecutionContext, ToolExecutionRequest, ToolHandler, ToolManifest, ToolRiskLevel,
 };
 
+fn sanitize_rig_tool_name(tool_id: &str) -> String {
+    let mut sanitized = String::with_capacity(tool_id.len());
+
+    for ch in tool_id.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    if sanitized.is_empty() {
+        "tool".to_string()
+    } else {
+        sanitized
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RigToolEvent {
@@ -63,6 +81,8 @@ pub struct NextChatRigTool<TTool> {
     tool_handler: Arc<TTool>,
     task_card_id: String,
     agent_id: String,
+    agent: crate::core::domain::AgentProfile,
+    approval_granted: bool,
     call_log: RigToolCallLog,
 }
 
@@ -72,6 +92,8 @@ impl<TTool> NextChatRigTool<TTool> {
         tool_handler: Arc<TTool>,
         task_card_id: String,
         agent_id: String,
+        agent: crate::core::domain::AgentProfile,
+        approval_granted: bool,
         call_log: RigToolCallLog,
     ) -> Self {
         Self {
@@ -79,6 +101,8 @@ impl<TTool> NextChatRigTool<TTool> {
             tool_handler,
             task_card_id,
             agent_id,
+            agent,
+            approval_granted,
             call_log,
         }
     }
@@ -89,7 +113,7 @@ where
     TTool: ToolHandler + 'static,
 {
     fn name(&self) -> String {
-        self.manifest.id.clone()
+        sanitize_rig_tool_name(&self.manifest.id)
     }
 
     fn definition<'a>(
@@ -98,7 +122,7 @@ where
     ) -> rig::wasm_compat::WasmBoxedFuture<'a, ToolDefinition> {
         Box::pin(async move {
             ToolDefinition {
-                name: self.manifest.id.clone(),
+                name: sanitize_rig_tool_name(&self.manifest.id),
                 description: format!(
                     "{}. {} Input must be a JSON object matching this schema: {}",
                     self.manifest.name, self.manifest.description, self.manifest.input_schema
@@ -121,6 +145,8 @@ where
                     input: normalized_input.clone(),
                     task_card_id: self.task_card_id.clone(),
                     agent_id: self.agent_id.clone(),
+                    agent: self.agent.clone(),
+                    approval_granted: self.approval_granted,
                 })
                 .await
                 .map_err(|error| {
@@ -150,11 +176,18 @@ where
     allowed_rig_tools(context)
         .into_iter()
         .map(|manifest| {
+            let approval_granted = context
+                .approved_tool
+                .as_ref()
+                .map(|tool| tool.id == manifest.id)
+                .unwrap_or(false);
             Box::new(NextChatRigTool::new(
                 manifest,
                 tool_handler.clone(),
                 context.task_card.id.clone(),
                 context.agent.id.clone(),
+                context.agent.clone(),
+                approval_granted,
                 call_log.clone(),
             )) as Box<dyn ToolDyn>
         })
@@ -317,10 +350,10 @@ fn normalize_tool_input(args: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed_rig_tools, normalize_tool_input};
+    use super::{allowed_rig_tools, normalize_tool_input, sanitize_rig_tool_name};
     use crate::core::domain::{
-        AgentProfile, MemoryPolicy, ModelPolicy, SystemSettings, TaskCard, TaskExecutionContext,
-        TaskStatus, ToolManifest, ToolRiskLevel, WorkGroup, WorkGroupKind,
+        AgentPermissionPolicy, AgentProfile, MemoryPolicy, ModelPolicy, SystemSettings, TaskCard,
+        TaskExecutionContext, TaskStatus, ToolManifest, ToolRiskLevel, WorkGroup, WorkGroupKind,
     };
 
     fn manifest(id: &str, risk_level: ToolRiskLevel) -> ToolManifest {
@@ -352,6 +385,7 @@ mod tests {
                 max_parallel_runs: 1,
                 can_spawn_subtasks: true,
                 memory_policy: MemoryPolicy::default(),
+                permission_policy: AgentPermissionPolicy::default(),
             },
             work_group: WorkGroup {
                 id: "wg-1".into(),
@@ -380,6 +414,7 @@ mod tests {
                 created_at: "now".into(),
             },
             conversation_window: vec![],
+            memory_context: vec![],
             available_tools: vec![
                 manifest("project.search", ToolRiskLevel::Low),
                 manifest("file.readwrite", ToolRiskLevel::High),
@@ -414,5 +449,11 @@ mod tests {
             normalize_tool_input(r#"{"query":"task"}"#),
             r#"{"query":"task"}"#
         );
+    }
+
+    #[test]
+    fn rig_tool_name_is_sanitized_for_function_calling() {
+        assert_eq!(sanitize_rig_tool_name("plan.summarize"), "plan_summarize");
+        assert_eq!(sanitize_rig_tool_name("browser/automation"), "browser_automation");
     }
 }

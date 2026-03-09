@@ -8,6 +8,12 @@ import type {
   ToolRun,
   WorkGroup,
 } from "../../types";
+import {
+  joinPolicyList,
+  selectedSkillsForAgent,
+  toolExposureReason,
+  type ToolExposureReason,
+} from "./agentPermissions";
 import { roleAccent } from "./ui";
 
 interface AgentWorkspaceProps {
@@ -28,6 +34,19 @@ function riskBadgeClass(riskLevel: ToolManifest["riskLevel"]) {
       return "badge-error";
     case "medium":
       return "badge-warning";
+    default:
+      return "badge-success";
+  }
+}
+
+function exposureBadgeClass(reason: ToolExposureReason) {
+  switch (reason) {
+    case "blocked_by_permission":
+      return "badge-error";
+    case "blocked_by_skill":
+      return "badge-warning";
+    case "not_bound":
+      return "badge-ghost";
     default:
       return "badge-success";
   }
@@ -60,12 +79,31 @@ export function AgentWorkspace({
   const agentMemory = currentAgent
     ? memoryItems.filter((item) => item.scope === "agent" && item.scopeId === currentAgent.id)
     : [];
+  const selectedSkills = currentAgent
+    ? selectedSkillsForAgent(currentAgent, skills)
+    : [];
   const mappedSkills = currentAgent
     ? currentAgent.skillIds.map((skillId) => skills.find((skill) => skill.id === skillId))
     : [];
-  const mappedTools = currentAgent
-    ? currentAgent.toolIds.map((toolId) => tools.find((tool) => tool.id === toolId))
+  const allowedSkillTags = Array.from(
+    new Set(selectedSkills.flatMap((skill) => skill.allowedToolTags)),
+  );
+  const toolAvailability = currentAgent
+    ? tools.map((tool) => ({
+        tool,
+        reason: toolExposureReason(currentAgent, tool, selectedSkills),
+      }))
     : [];
+  const availableToolCount = toolAvailability.filter(
+    ({ reason }) => reason === "available",
+  ).length;
+  const permissionRuleCount = currentAgent
+    ? currentAgent.permissionPolicy.allowToolIds.length +
+      currentAgent.permissionPolicy.denyToolIds.length +
+      currentAgent.permissionPolicy.requireApprovalToolIds.length +
+      currentAgent.permissionPolicy.allowFsRoots.length +
+      currentAgent.permissionPolicy.allowNetworkDomains.length
+    : 0;
 
   return (
     <section className="card card-border flex min-h-0 flex-1 bg-base-100">
@@ -202,6 +240,10 @@ export function AgentWorkspace({
                       <span>{t("tools")}</span>
                       <span className="font-medium">{currentAgent?.toolIds.length ?? 0}</span>
                     </div>
+                    <div className="rounded-box bg-base-200 px-3 py-2">
+                      <span>{t("permissions")}</span>
+                      <span className="font-medium">{permissionRuleCount}</span>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -256,6 +298,14 @@ export function AgentWorkspace({
                   </div>
 
                   <div className="space-y-2">
+                    <div className="rounded-box bg-base-200 px-3 py-2 text-sm text-base-content/60">
+                      <div className="font-medium text-base-content">
+                        {t("skillAllowedToolTags")}
+                      </div>
+                      <div className="mt-1">
+                        {allowedSkillTags.join(", ") || t("notAvailable")}
+                      </div>
+                    </div>
                     {mappedSkills.map((skill, index) =>
                       skill ? (
                         <div
@@ -286,39 +336,50 @@ export function AgentWorkspace({
               <div className="card card-border bg-base-100">
                 <div className="card-body gap-3">
                   <div className="flex items-center justify-between">
-                    <h3 className="card-title text-base">{t("tools")}</h3>
-                    <span className="badge badge-secondary">
-                      {currentAgent?.toolIds.length ?? 0}
-                    </span>
+                    <div>
+                      <h3 className="card-title text-base">{t("tools")}</h3>
+                      <p className="text-sm text-base-content/60">
+                        {t("toolAvailability")}
+                      </p>
+                    </div>
+                    <span className="badge badge-secondary">{availableToolCount}</span>
                   </div>
 
                   <div className="space-y-2">
-                    {mappedTools.map((tool, index) =>
-                      tool ? (
+                    {toolAvailability.map(({ tool, reason }) => (
                         <div
                           key={tool.id}
                           className="flex items-start justify-between gap-3 rounded-box bg-base-200 p-3"
                         >
                           <div>
-                            <div className="font-medium">{tool.name}</div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <div className="font-medium">{tool.name}</div>
+                              <span className={`badge ${exposureBadgeClass(reason)}`}>
+                                {t(`toolStatus.${reason}`)}
+                              </span>
+                            </div>
                             <div className="mt-1 text-sm text-base-content/60">
                               {tool.description}
                             </div>
+                            <div className="mt-1 text-xs text-base-content/50">
+                              {reason === "blocked_by_skill"
+                                ? t("toolStatusBlockedBySkillHint", {
+                                    category: tool.category,
+                                  })
+                                : t(`toolStatusHint.${reason}`)}
+                            </div>
                           </div>
-                          <span className={`badge ${riskBadgeClass(tool.riskLevel)}`}>
-                            {tool.riskLevel}
-                          </span>
+                          <div className="flex flex-col items-end gap-2">
+                            <span className={`badge ${riskBadgeClass(tool.riskLevel)}`}>
+                              {tool.riskLevel}
+                            </span>
+                            <span className="text-xs text-base-content/50">
+                              {tool.category}
+                            </span>
+                          </div>
                         </div>
-                      ) : (
-                        <div
-                          key={currentAgent?.toolIds[index] ?? index}
-                          className="badge badge-secondary"
-                        >
-                          {currentAgent?.toolIds[index]}
-                        </div>
-                      ),
-                    )}
-                    {(currentAgent?.toolIds.length ?? 0) === 0 ? (
+                    ))}
+                    {toolAvailability.length === 0 ? (
                       <span className="text-sm text-base-content/60">{t("notAvailable")}</span>
                     ) : null}
                   </div>
@@ -327,6 +388,53 @@ export function AgentWorkspace({
             </div>
 
             <div className="grid gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,0.9fr)]">
+              <div className="card card-border bg-base-100">
+                <div className="card-body gap-3">
+                  <div className="flex items-center justify-between">
+                    <h3 className="card-title text-base">{t("permissions")}</h3>
+                    <span className="badge badge-secondary">{permissionRuleCount}</span>
+                  </div>
+
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <div>
+                      <div className="mb-2 text-sm font-medium">{t("permissionAllowTools")}</div>
+                      <div className="text-sm text-base-content/60">
+                        {joinPolicyList(currentAgent?.permissionPolicy.allowToolIds ?? []) ||
+                          t("permissionInheritTools")}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="mb-2 text-sm font-medium">{t("permissionDenyTools")}</div>
+                      <div className="text-sm text-base-content/60">
+                        {joinPolicyList(currentAgent?.permissionPolicy.denyToolIds ?? []) ||
+                          t("notAvailable")}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="mb-2 text-sm font-medium">{t("permissionRequireApprovalTools")}</div>
+                      <div className="text-sm text-base-content/60">
+                        {joinPolicyList(currentAgent?.permissionPolicy.requireApprovalToolIds ?? []) ||
+                          t("notAvailable")}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="mb-2 text-sm font-medium">{t("permissionAllowFsRoots")}</div>
+                      <div className="text-sm text-base-content/60">
+                        {joinPolicyList(currentAgent?.permissionPolicy.allowFsRoots ?? []) ||
+                          t("permissionRuntimeDefaultRoots")}
+                      </div>
+                    </div>
+                    <div className="md:col-span-2">
+                      <div className="mb-2 text-sm font-medium">{t("permissionAllowNetworkDomains")}</div>
+                      <div className="text-sm text-base-content/60">
+                        {joinPolicyList(currentAgent?.permissionPolicy.allowNetworkDomains ?? []) ||
+                          t("permissionAllDomains")}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div className="card card-border bg-base-100">
                 <div className="card-body gap-3">
                   <div className="flex items-center justify-between">

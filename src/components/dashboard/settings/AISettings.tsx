@@ -1,9 +1,8 @@
 import { type ChangeEvent, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../../../store/appStore";
-import { defaultProviders } from "../../../store/aiConfigStore";
-import { testProviderConnection } from "../../../lib/tauri";
-import type { AIProviderConfig, AIGlobalConfig } from "../../../types";
+import { refreshProviderModels, testProviderConnection } from "../../../lib/tauri";
+import type { AIProviderConfig } from "../../../types";
 
 function ProviderListItem({
     provider,
@@ -34,33 +33,22 @@ export function AISettings() {
         settings,
         selectedSettingsProviderId: selectedProviderId,
         setSelectedSettingsProviderId: setSelectedProviderId,
+        refresh,
         updateSettings,
     } = useAppStore();
 
-    const { providers, globalConfig } = settings;
+    const { providers } = settings;
 
     const [showApiKey, setShowApiKey] = useState(false);
     const [testStatus, setTestStatus] = useState<"idle" | "testing" | "success" | "error">("idle");
+    const [refreshStatus, setRefreshStatus] = useState<"idle" | "refreshing" | "success" | "error">("idle");
+    const [refreshMessage, setRefreshMessage] = useState("");
 
     const updateProvider = (id: string, updates: Partial<AIProviderConfig>) => {
         const newProviders = providers.map((p) =>
             p.id === id ? { ...p, ...updates } : p
         );
         void updateSettings({ ...settings, providers: newProviders });
-    };
-
-    const updateGlobalConfig = (updates: Partial<AIGlobalConfig>) => {
-        void updateSettings({
-            ...settings,
-            globalConfig: { ...globalConfig, ...updates },
-        });
-    };
-
-    const resetProvider = (id: string) => {
-        const original = defaultProviders.find((p) => p.id === id);
-        if (original) {
-            updateProvider(id, original);
-        }
     };
 
     const activeProvider = providers.find((p) => p.id === selectedProviderId);
@@ -79,18 +67,30 @@ export function AISettings() {
         }
     }
 
-    const llmProviderOptions = providers.map((p: AIProviderConfig) => ({
-        id: p.id,
-        name: p.name,
-        models: p.models,
-    }));
-
-    const selectedDefaultLLMProvider = llmProviderOptions.find(
-        (p: any) => p.id === globalConfig.defaultLLMProvider
-    );
-    const selectedDefaultVLMProvider = llmProviderOptions.find(
-        (p: any) => p.id === globalConfig.defaultVLMProvider
-    );
+    async function handleRefreshModels() {
+        if (!activeProvider) return;
+        setRefreshStatus("refreshing");
+        setRefreshMessage("");
+        try {
+            const updatedProvider = await refreshProviderModels(activeProvider);
+            await refresh();
+            setRefreshStatus("success");
+            setRefreshMessage(
+                t("modelsRefreshed", {
+                    count: updatedProvider.models.length,
+                })
+            );
+        } catch (error) {
+            console.error("Model refresh failed:", error);
+            setRefreshStatus("error");
+            setRefreshMessage(error instanceof Error ? error.message : t("modelRefreshFailed"));
+        } finally {
+            setTimeout(() => {
+                setRefreshStatus("idle");
+                setRefreshMessage("");
+            }, 3000);
+        }
+    }
 
     return (
         <div className="space-y-6">
@@ -98,112 +98,6 @@ export function AISettings() {
                 <h2 className="text-lg font-bold">{t("aiConfiguration")}</h2>
                 <div className="flex items-center gap-2">
                     <span className="badge badge-ghost text-xs">{t("graphicalMode")}</span>
-                </div>
-            </div>
-
-            <div className="card card-border bg-base-100 shadow-sm">
-                <div className="card-body gap-4 p-5">
-                    <div className="flex items-center gap-2 text-sm font-semibold">
-                        <i className="fas fa-cog" />
-                        {t("defaultConfiguration")}
-                    </div>
-
-                    <div className="grid gap-4 md:grid-cols-2">
-                        <div>
-                            <label className="label">
-                                <span className="label-text text-xs font-medium flex items-center gap-1">
-                                    <i className="fas fa-star text-yellow-500" />
-                                    {t("defaultLLMProvider")}
-                                </span>
-                            </label>
-                            <select
-                                className="select select-bordered select-sm w-full"
-                                value={globalConfig.defaultLLMProvider}
-                                onChange={(e: ChangeEvent<HTMLSelectElement>) =>
-                                    updateGlobalConfig({ defaultLLMProvider: e.target.value })
-                                }
-                            >
-                                {llmProviderOptions.map((p) => (
-                                    <option key={p.id} value={p.id}>
-                                        {p.name}
-                                    </option>
-                                ))}
-                            </select>
-                        </div>
-
-                        <div>
-                            <label className="label">
-                                <span className="label-text text-xs font-medium flex items-center gap-1">
-                                    <i className="fas fa-star text-yellow-500" />
-                                    {t("defaultLLMModel")}
-                                    <span className="badge badge-xs badge-ghost ml-1">{t("fastModel")}</span>
-                                </span>
-                            </label>
-                            <select
-                                className="select select-bordered select-sm w-full"
-                                value={globalConfig.defaultLLMModel}
-                                onChange={(e: ChangeEvent<HTMLSelectElement>) =>
-                                    updateGlobalConfig({ defaultLLMModel: e.target.value })
-                                }
-                            >
-                                {(selectedDefaultLLMProvider?.models ?? []).map((m) => (
-                                    <option key={m} value={m}>
-                                        {m}
-                                    </option>
-                                ))}
-                            </select>
-                        </div>
-
-                        <div>
-                            <label className="label">
-                                <span className="label-text text-xs font-medium flex items-center gap-1">
-                                    <i className="fas fa-brain text-purple-500" />
-                                    {t("defaultVLMProvider")}
-                                </span>
-                            </label>
-                            <select
-                                className="select select-bordered select-sm w-full"
-                                value={globalConfig.defaultVLMProvider}
-                                onChange={(e: ChangeEvent<HTMLSelectElement>) =>
-                                    updateGlobalConfig({ defaultVLMProvider: e.target.value })
-                                }
-                            >
-                                {llmProviderOptions.map((p) => (
-                                    <option key={p.id} value={p.id}>
-                                        {p.name}
-                                    </option>
-                                ))}
-                            </select>
-                        </div>
-
-                        <div>
-                            <label className="label">
-                                <span className="label-text text-xs font-medium flex items-center gap-1">
-                                    <i className="fas fa-puzzle-piece text-green-500" />
-                                    {t("defaultVLMModel")}
-                                    <span className="badge badge-xs badge-ghost ml-1">{t("smartModel")}</span>
-                                </span>
-                            </label>
-                            <select
-                                className="select select-bordered select-sm w-full"
-                                value={globalConfig.defaultVLMModel}
-                                onChange={(e: ChangeEvent<HTMLSelectElement>) =>
-                                    updateGlobalConfig({ defaultVLMModel: e.target.value })
-                                }
-                            >
-                                {(selectedDefaultVLMProvider?.models ?? []).map((m) => (
-                                    <option key={m} value={m}>
-                                        {m}
-                                    </option>
-                                ))}
-                            </select>
-                        </div>
-                    </div>
-
-                    <div className="text-xs text-base-content/50 flex items-center gap-1">
-                        <i className="fas fa-info-circle" />
-                        {t("defaultConfigHint")}
-                    </div>
                 </div>
             </div>
 
@@ -290,6 +184,17 @@ export function AISettings() {
                                 <div>
                                     <label className="label">
                                         <span className="label-text text-xs">{t("defaultModel")}</span>
+                                        <button
+                                            className={`btn btn-ghost btn-xs ${refreshStatus === "refreshing" ? "btn-disabled" : ""}`}
+                                            onClick={handleRefreshModels}
+                                        >
+                                            {refreshStatus === "refreshing" ? (
+                                                <span className="loading loading-spinner loading-xs" />
+                                            ) : (
+                                                <i className="fas fa-rotate" />
+                                            )}
+                                            {t("refreshModels")}
+                                        </button>
                                     </label>
                                     <select
                                         className="select select-bordered select-sm w-full"
@@ -302,6 +207,13 @@ export function AISettings() {
                                             <option key={model} value={model}>{model}</option>
                                         ))}
                                     </select>
+                                    {refreshMessage ? (
+                                        <div
+                                            className={`mt-2 text-xs ${refreshStatus === "error" ? "text-error" : "text-base-content/60"}`}
+                                        >
+                                            {refreshMessage}
+                                        </div>
+                                    ) : null}
                                 </div>
                                 <div>
                                     <label className="label">

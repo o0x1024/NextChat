@@ -1,3 +1,5 @@
+mod policy;
+
 use std::{
     collections::HashMap,
     fs,
@@ -8,7 +10,6 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
@@ -22,141 +23,12 @@ use tokio::{
 use walkdir::WalkDir;
 
 use crate::core::domain::{
-    SkillPack, ToolExecutionRequest, ToolExecutionResult, ToolHandler, ToolManifest, ToolRiskLevel,
+    AgentProfile, SkillPack, ToolExecutionRequest, ToolExecutionResult, ToolHandler, ToolManifest,
 };
+use crate::core::permissions::{APPROVAL_REQUIRED_PREFIX, PERMISSION_DENIED_PREFIX};
+use crate::core::skill_policy::{effective_tools_for_agent, selected_skills_for_agent};
+use crate::core::tool_catalog::{BUILTIN_SKILLS, BUILTIN_TOOLS};
 use crate::core::tool_worker::{resolve_worker_binary, ShellWorkerRequest, ShellWorkerResponse};
-
-pub static BUILTIN_TOOLS: Lazy<Vec<ToolManifest>> = Lazy::new(|| {
-    vec![
-        ToolManifest {
-            id: "file.readwrite".into(),
-            name: "File Read/Write".into(),
-            category: "filesystem".into(),
-            risk_level: ToolRiskLevel::High,
-            input_schema: r#"{"path":"string","mode":"read|write","content":"string?"}"#.into(),
-            output_schema: r#"{"content":"string","saved":"boolean","path":"string"}"#.into(),
-            timeout_ms: 30_000,
-            concurrency_limit: 2,
-            permissions: vec!["fs:read".into(), "fs:write".into()],
-            description: "Inspect or modify local workspace files.".into(),
-        },
-        ToolManifest {
-            id: "project.search".into(),
-            name: "Project Search".into(),
-            category: "workspace".into(),
-            risk_level: ToolRiskLevel::Low,
-            input_schema: r#"{"query":"string"}"#.into(),
-            output_schema: r#"{"matches":["string"]}"#.into(),
-            timeout_ms: 15_000,
-            concurrency_limit: 4,
-            permissions: vec!["workspace:index".into()],
-            description: "Search code and notes inside the active workspace.".into(),
-        },
-        ToolManifest {
-            id: "shell.exec".into(),
-            name: "Shell Command".into(),
-            category: "system".into(),
-            risk_level: ToolRiskLevel::High,
-            input_schema: r#"{"command":"string"}"#.into(),
-            output_schema: r#"{"stdout":"string","stderr":"string","status":"number"}"#.into(),
-            timeout_ms: 45_000,
-            concurrency_limit: 1,
-            permissions: vec!["system:shell".into()],
-            description: "Run shell commands in an isolated worker.".into(),
-        },
-        ToolManifest {
-            id: "http.request".into(),
-            name: "HTTP Request".into(),
-            category: "network".into(),
-            risk_level: ToolRiskLevel::Medium,
-            input_schema: r#"{"url":"string","method":"string","body":"string?"}"#.into(),
-            output_schema: r#"{"status":"number","body":"string"}"#.into(),
-            timeout_ms: 20_000,
-            concurrency_limit: 3,
-            permissions: vec!["network:http".into()],
-            description: "Fetch remote APIs and websites with audit logging.".into(),
-        },
-        ToolManifest {
-            id: "browser.automation".into(),
-            name: "Browser Automation".into(),
-            category: "browser".into(),
-            risk_level: ToolRiskLevel::High,
-            input_schema: r#"{"url":"string","actions":["string"]}"#.into(),
-            output_schema: r#"{"snapshot":"string","result":"string"}"#.into(),
-            timeout_ms: 60_000,
-            concurrency_limit: 1,
-            permissions: vec!["browser:automation".into()],
-            description: "Drive a browser session for UI workflows.".into(),
-        },
-        ToolManifest {
-            id: "markdown.compose".into(),
-            name: "Markdown Compose".into(),
-            category: "content".into(),
-            risk_level: ToolRiskLevel::Low,
-            input_schema: r#"{"topic":"string","format":"string"}"#.into(),
-            output_schema: r#"{"markdown":"string"}"#.into(),
-            timeout_ms: 8_000,
-            concurrency_limit: 4,
-            permissions: vec!["content:markdown".into()],
-            description: "Draft markdown reports, specs, and release notes.".into(),
-        },
-        ToolManifest {
-            id: "plan.summarize".into(),
-            name: "Plan & Summarize".into(),
-            category: "coordination".into(),
-            risk_level: ToolRiskLevel::Low,
-            input_schema: r#"{"input":"string"}"#.into(),
-            output_schema: r#"{"summary":"string"}"#.into(),
-            timeout_ms: 5_000,
-            concurrency_limit: 8,
-            permissions: vec!["coordination:summary".into()],
-            description: "Generate execution summaries and concise plans.".into(),
-        },
-    ]
-});
-
-pub static BUILTIN_SKILLS: Lazy<Vec<SkillPack>> = Lazy::new(|| {
-    vec![
-        SkillPack {
-            id: "skill.research".into(),
-            name: "Research Sweep".into(),
-            prompt_template: "Break the task into evidence collection, synthesis, and gaps.".into(),
-            planning_rules: vec![
-                "Collect facts before proposing action.".into(),
-                "Surface uncertainty explicitly.".into(),
-            ],
-            allowed_tool_tags: vec!["workspace".into(), "network".into(), "coordination".into()],
-            done_criteria: vec!["Summarize findings".into(), "Call out blockers".into()],
-        },
-        SkillPack {
-            id: "skill.builder".into(),
-            name: "Builder Loop".into(),
-            prompt_template: "Prefer implementation-ready artifacts and concrete next steps."
-                .into(),
-            planning_rules: vec![
-                "Decompose by dependency order.".into(),
-                "Prefer actionable outputs.".into(),
-            ],
-            allowed_tool_tags: vec![
-                "filesystem".into(),
-                "workspace".into(),
-                "coordination".into(),
-            ],
-            done_criteria: vec!["Produce a change set".into(), "Note verification".into()],
-        },
-        SkillPack {
-            id: "skill.reviewer".into(),
-            name: "Review Lens".into(),
-            prompt_template: "Prioritize regressions, security, and missing tests.".into(),
-            planning_rules: vec![
-                "List findings by severity.".into(),
-                "Separate findings from summary.".into(),
-            ],
-            allowed_tool_tags: vec!["workspace".into(), "coordination".into()],
-            done_criteria: vec!["Identify risks".into(), "Recommend fixes".into()],
-        },
-    ]
-});
 
 #[derive(Debug, Clone)]
 pub struct ToolRuntime {
@@ -226,6 +98,11 @@ impl ToolRuntime {
             .iter()
             .find(|tool| tool.id == tool_id)
             .cloned()
+    }
+
+    pub fn available_tools_for_agent(&self, agent: &AgentProfile) -> Vec<ToolManifest> {
+        let selected_skills = selected_skills_for_agent(agent, &self.builtin_skills());
+        effective_tools_for_agent(agent, &self.builtin_tools(), &selected_skills)
     }
 
     pub fn select_tool_for_text(
@@ -301,6 +178,24 @@ impl ToolRuntime {
 
     fn is_allowed_path(&self, path: &Path) -> bool {
         path.starts_with(&self.workspace_root) || path.starts_with(&self.app_data_dir)
+    }
+
+    fn resolve_permission_root(&self, raw: &str) -> PathBuf {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("app_data") || trimmed.eq_ignore_ascii_case("$APP_DATA") {
+            return self.app_data_dir.clone();
+        }
+        if trimmed.is_empty() || trimmed == "." {
+            return self.workspace_root.clone();
+        }
+
+        let candidate = PathBuf::from(trimmed);
+        let absolute = if candidate.is_absolute() {
+            candidate
+        } else {
+            self.workspace_root.join(candidate)
+        };
+        absolute.canonicalize().unwrap_or(absolute)
     }
 
     fn resolve_path(&self, raw: &str, create_parent: bool) -> Result<PathBuf> {
@@ -856,6 +751,23 @@ impl ToolRuntime {
 #[async_trait]
 impl ToolHandler for ToolRuntime {
     async fn execute(&self, request: ToolExecutionRequest) -> Result<ToolExecutionResult> {
+        let decision = self.authorize_tool_call(&request.agent, &request.tool, &request.input)?;
+        if !decision.allowed {
+            bail!(
+                "{PERMISSION_DENIED_PREFIX} {}",
+                decision
+                    .reason
+                    .unwrap_or_else(|| "tool access rejected".to_string())
+            );
+        }
+        if decision.approval_required && !request.approval_granted {
+            bail!(
+                "{APPROVAL_REQUIRED_PREFIX} tool '{}' needs explicit approval for agent '{}'",
+                request.tool.name,
+                request.agent.name
+            );
+        }
+
         match request.tool.id.as_str() {
             "file.readwrite" => self.run_file_tool(&request).await,
             "project.search" => self.run_search_tool(&request).await,
@@ -910,7 +822,10 @@ fn sanitize_session_name(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::ToolRuntime;
-    use crate::core::domain::{ToolExecutionRequest, ToolHandler};
+    use crate::core::domain::{
+        AgentPermissionPolicy, AgentProfile, MemoryPolicy, ModelPolicy, ToolExecutionRequest,
+        ToolHandler,
+    };
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -922,6 +837,27 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("nextchat-{prefix}-{nanos}"))
+    }
+
+    fn agent() -> AgentProfile {
+        AgentProfile {
+            id: "agent-1".into(),
+            name: "Builder".into(),
+            avatar: "BD".into(),
+            role: "Engineer".into(),
+            objective: "Ship".into(),
+            model_policy: ModelPolicy::default(),
+            skill_ids: vec![],
+            tool_ids: vec![
+                "file.readwrite".into(),
+                "project.search".into(),
+                "http.request".into(),
+            ],
+            max_parallel_runs: 1,
+            can_spawn_subtasks: true,
+            memory_policy: MemoryPolicy::default(),
+            permission_policy: AgentPermissionPolicy::default(),
+        }
     }
 
     #[tokio::test]
@@ -939,6 +875,8 @@ mod tests {
                 input: r#"{"path":"notes/spec.md","mode":"write","content":"hello"}"#.into(),
                 task_card_id: "task-1".into(),
                 agent_id: "agent-1".into(),
+                agent: agent(),
+                approval_granted: true,
             })
             .await
             .expect("write");
@@ -950,6 +888,8 @@ mod tests {
                 input: r#"{"path":"notes/spec.md","mode":"read"}"#.into(),
                 task_card_id: "task-1".into(),
                 agent_id: "agent-1".into(),
+                agent: agent(),
+                approval_granted: true,
             })
             .await
             .expect("read");
@@ -974,10 +914,80 @@ mod tests {
                 input: r#"{"query":"Scout"}"#.into(),
                 task_card_id: "task-1".into(),
                 agent_id: "agent-1".into(),
+                agent: agent(),
+                approval_granted: true,
             })
             .await
             .expect("search");
         assert!(result.output.contains("src/main.ts"));
         assert!(result.output.contains("Scout"));
+    }
+
+    #[test]
+    fn skill_allowlist_blocks_network_tool_authorization() {
+        let workspace_root = unique_root("skill-workspace");
+        let data_root = unique_root("skill-data");
+        fs::create_dir_all(&workspace_root).expect("workspace");
+        fs::create_dir_all(&data_root).expect("data");
+        let runtime = ToolRuntime::new(workspace_root, data_root).expect("runtime");
+        let tool = runtime.tool_by_id("http.request").expect("tool");
+        let mut restricted_agent = agent();
+        restricted_agent.skill_ids = vec!["skill.builder".into()];
+
+        let decision = runtime
+            .authorize_tool_call(
+                &restricted_agent,
+                &tool,
+                r#"{"url":"https://example.com","method":"GET"}"#,
+            )
+            .expect("decision");
+
+        assert!(!decision.allowed);
+        assert!(decision
+            .reason
+            .expect("reason")
+            .contains("skills do not allow tool category"));
+        assert!(runtime
+            .available_tools_for_agent(&restricted_agent)
+            .into_iter()
+            .all(|candidate| candidate.id != "http.request"));
+    }
+
+    #[tokio::test]
+    async fn file_tool_respects_agent_fs_roots() {
+        let workspace_root = unique_root("permission-workspace");
+        let data_root = unique_root("permission-data");
+        fs::create_dir_all(workspace_root.join("allowed")).expect("workspace");
+        fs::create_dir_all(&data_root).expect("data");
+        let runtime = ToolRuntime::new(workspace_root, data_root).expect("runtime");
+        let tool = runtime.tool_by_id("file.readwrite").expect("tool");
+        let mut restricted_agent = agent();
+        restricted_agent.permission_policy.allow_fs_roots = vec!["allowed".into()];
+
+        let error = runtime
+            .execute(ToolExecutionRequest {
+                tool: tool.clone(),
+                input: r#"{"path":"blocked/spec.md","mode":"write","content":"hello"}"#.into(),
+                task_card_id: "task-1".into(),
+                agent_id: "agent-1".into(),
+                agent: restricted_agent.clone(),
+                approval_granted: true,
+            })
+            .await
+            .expect_err("blocked path should fail");
+        assert!(error.to_string().contains("permission denied"));
+
+        let result = runtime
+            .execute(ToolExecutionRequest {
+                tool,
+                input: r#"{"path":"allowed/spec.md","mode":"write","content":"hello"}"#.into(),
+                task_card_id: "task-1".into(),
+                agent_id: "agent-1".into(),
+                agent: restricted_agent,
+                approval_granted: true,
+            })
+            .await
+            .expect("allowed path");
+        assert!(result.output.contains("\"saved\":true"));
     }
 }

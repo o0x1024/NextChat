@@ -9,6 +9,12 @@ import type {
     ToolManifest,
     UpdateAgentInput,
 } from "../../types";
+import {
+    emptyMemoryPolicy,
+    emptyPermissionPolicy,
+    joinPolicyList,
+    splitPolicyList,
+} from "./agentPermissions";
 
 interface AgentManagementProps {
     agents: AgentProfile[];
@@ -32,6 +38,8 @@ const emptyForm: CreateAgentInput = {
     toolIds: [],
     maxParallelRuns: 2,
     canSpawnSubtasks: true,
+    memoryPolicy: emptyMemoryPolicy,
+    permissionPolicy: emptyPermissionPolicy,
 };
 
 const supportedRigProviderTypes = new Set(["OpenAI", "Anthropic", "DeepSeek", "Gemini"]);
@@ -42,31 +50,76 @@ type ProviderAvailability = {
     reason: "disabled" | "missingApiKey" | "unsupported" | "noModels" | null;
 };
 
+function isProviderAvailable(provider: AIProviderConfig): boolean {
+    return (
+        provider.enabled &&
+        supportedRigProviderTypes.has(provider.rigProviderType) &&
+        provider.models.length > 0 &&
+        provider.apiKey.trim().length > 0
+    );
+}
+
+function normalizeProviderValue(value: string | null | undefined): string {
+    return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function findProviderMatch(providers: AIProviderConfig[], rawProvider: string): AIProviderConfig | undefined {
+    const normalizedProvider = normalizeProviderValue(rawProvider);
+    if (!normalizedProvider) {
+        return undefined;
+    }
+
+    return providers.find((provider) => {
+        const candidates = [provider.id, provider.name, provider.rigProviderType];
+        return candidates.some((candidate) => normalizeProviderValue(candidate) === normalizedProvider);
+    });
+}
+
+function resolveProviderModel(provider: AIProviderConfig | undefined, rawModel: string | null | undefined): string {
+    const model = typeof rawModel === "string" ? rawModel.trim() : "";
+
+    if (!provider) {
+        return model;
+    }
+
+    if (provider.models.includes(model)) {
+        return model;
+    }
+
+    if (!model || normalizeProviderValue(model) === "simulation") {
+        return provider.defaultModel || provider.models[0] || "";
+    }
+
+    return model;
+}
+
+function normalizeModelForm(
+    settings: SystemSettings,
+    overrides: Partial<Pick<CreateAgentInput, "provider" | "model" | "temperature">> = {}
+): Pick<CreateAgentInput, "provider" | "model" | "temperature"> {
+    const availableProviders = settings.providers.filter(isProviderAvailable);
+    const preferredProvider =
+        findProviderMatch(settings.providers, overrides.provider ?? settings.globalConfig.defaultLLMProvider) ??
+        settings.providers.find((provider) => normalizeProviderValue(provider.id) === normalizeProviderValue(settings.globalConfig.defaultLLMProvider));
+
+    const selectedProvider = [preferredProvider, ...availableProviders].find(
+        (provider): provider is AIProviderConfig => Boolean(provider && isProviderAvailable(provider))
+    );
+
+    const fallbackProvider = selectedProvider ?? availableProviders[0];
+    const provider = fallbackProvider?.id ?? "";
+    const model = resolveProviderModel(fallbackProvider, overrides.model ?? "");
+    const temperature = overrides.temperature ?? fallbackProvider?.temperature ?? emptyForm.temperature;
+
+    return { provider, model, temperature };
+}
+
 function buildCreateForm(settings: SystemSettings): CreateAgentInput {
-    const preferredProvider = settings.providers.find(
-        (provider) =>
-            provider.id === settings.globalConfig.defaultLLMProvider &&
-            provider.enabled &&
-            supportedRigProviderTypes.has(provider.rigProviderType) &&
-            provider.models.length > 0 &&
-            provider.apiKey.trim().length > 0
-    );
-
-    const fallbackProvider = settings.providers.find(
-        (provider) =>
-            provider.enabled &&
-            supportedRigProviderTypes.has(provider.rigProviderType) &&
-            provider.models.length > 0 &&
-            provider.apiKey.trim().length > 0
-    );
-
-    const selectedProvider = preferredProvider ?? fallbackProvider;
+    const modelForm = normalizeModelForm(settings);
 
     return {
         ...emptyForm,
-        provider: selectedProvider?.id ?? "",
-        model: selectedProvider?.defaultModel ?? selectedProvider?.models[0] ?? "",
-        temperature: selectedProvider?.temperature ?? emptyForm.temperature,
+        ...modelForm,
     };
 }
 
@@ -146,18 +199,33 @@ export function AgentManagement({
 
     function openEdit(agent: AgentProfile) {
         setEditingAgent(agent);
+        const modelForm = normalizeModelForm(settings, {
+            provider: agent.modelPolicy.provider,
+            model: agent.modelPolicy.model,
+            temperature: agent.modelPolicy.temperature,
+        });
         setForm({
             name: agent.name,
             avatar: agent.avatar,
             role: agent.role,
             objective: agent.objective,
-            provider: agent.modelPolicy.provider,
-            model: agent.modelPolicy.model,
-            temperature: agent.modelPolicy.temperature,
+            ...modelForm,
             skillIds: [...agent.skillIds],
             toolIds: [...agent.toolIds],
             maxParallelRuns: agent.maxParallelRuns,
             canSpawnSubtasks: agent.canSpawnSubtasks,
+            memoryPolicy: {
+                readScope: [...agent.memoryPolicy.readScope],
+                writeScope: [...agent.memoryPolicy.writeScope],
+                pinnedMemoryIds: [...agent.memoryPolicy.pinnedMemoryIds],
+            },
+            permissionPolicy: {
+                allowToolIds: [...agent.permissionPolicy.allowToolIds],
+                denyToolIds: [...agent.permissionPolicy.denyToolIds],
+                requireApprovalToolIds: [...agent.permissionPolicy.requireApprovalToolIds],
+                allowFsRoots: [...agent.permissionPolicy.allowFsRoots],
+                allowNetworkDomains: [...agent.permissionPolicy.allowNetworkDomains],
+            },
         });
         setModalOpen(true);
     }
@@ -433,11 +501,12 @@ export function AgentManagement({
                                             className="select select-bordered select-sm w-full font-medium"
                                             value={form.provider}
                                             onChange={(e: ChangeEvent<HTMLSelectElement>) => {
-                                                const provider = settings.providers.find(p => p.id === e.target.value);
+                                                const modelForm = normalizeModelForm(settings, {
+                                                    provider: e.target.value,
+                                                });
                                                 setForm((f) => ({
                                                     ...f,
-                                                    provider: e.target.value,
-                                                    model: provider?.defaultModel || provider?.models[0] || ""
+                                                    ...modelForm,
                                                 }));
                                             }}
                                         >
@@ -551,6 +620,188 @@ export function AgentManagement({
                                             </label>
                                         ))}
                                     </div>
+                                </div>
+                            </div>
+
+                            <div className="bg-base-200/50 rounded-2xl p-5 border border-base-content/5 space-y-4">
+                                <div className="flex items-center gap-2 text-xs font-bold text-info uppercase tracking-widest">
+                                    <i className="fas fa-brain" /> {t("memoryPolicyTitle")}
+                                </div>
+                                <div className="grid gap-4 md:grid-cols-2">
+                                    <div className="form-control">
+                                        <label className="label">
+                                            <span className="label-text text-xs opacity-60">{t("readScope")}</span>
+                                        </label>
+                                        <textarea
+                                            rows={2}
+                                            className="textarea textarea-bordered w-full bg-base-100/70 text-sm"
+                                            placeholder={t("readScopeHint")}
+                                            value={joinPolicyList(form.memoryPolicy.readScope)}
+                                            onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                                                setForm((f) => ({
+                                                    ...f,
+                                                    memoryPolicy: {
+                                                        ...f.memoryPolicy,
+                                                        readScope: splitPolicyList(e.target.value),
+                                                    },
+                                                }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="form-control">
+                                        <label className="label">
+                                            <span className="label-text text-xs opacity-60">{t("writeScope")}</span>
+                                        </label>
+                                        <textarea
+                                            rows={2}
+                                            className="textarea textarea-bordered w-full bg-base-100/70 text-sm"
+                                            placeholder={t("writeScopeHint")}
+                                            value={joinPolicyList(form.memoryPolicy.writeScope)}
+                                            onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                                                setForm((f) => ({
+                                                    ...f,
+                                                    memoryPolicy: {
+                                                        ...f.memoryPolicy,
+                                                        writeScope: splitPolicyList(e.target.value),
+                                                    },
+                                                }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="form-control md:col-span-2">
+                                        <label className="label">
+                                            <span className="label-text text-xs opacity-60">{t("pinnedMemory")}</span>
+                                        </label>
+                                        <textarea
+                                            rows={2}
+                                            className="textarea textarea-bordered w-full bg-base-100/70 text-sm"
+                                            placeholder={t("pinnedMemoryHint")}
+                                            value={joinPolicyList(form.memoryPolicy.pinnedMemoryIds)}
+                                            onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                                                setForm((f) => ({
+                                                    ...f,
+                                                    memoryPolicy: {
+                                                        ...f.memoryPolicy,
+                                                        pinnedMemoryIds: splitPolicyList(e.target.value),
+                                                    },
+                                                }))
+                                            }
+                                        />
+                                    </div>
+                                </div>
+                                <div className="rounded-xl border border-info/20 bg-info/10 px-3 py-2 text-xs text-info">
+                                    {t("memoryPolicyHint")}
+                                </div>
+                            </div>
+
+                            <div className="bg-base-200/50 rounded-2xl p-5 border border-base-content/5 space-y-4">
+                                <div className="flex items-center gap-2 text-xs font-bold text-warning uppercase tracking-widest">
+                                    <i className="fas fa-shield-halved" /> {t("permissions")}
+                                </div>
+                                <div className="grid gap-4 md:grid-cols-2">
+                                    <div className="form-control">
+                                        <label className="label">
+                                            <span className="label-text text-xs opacity-60">{t("permissionAllowTools")}</span>
+                                        </label>
+                                        <textarea
+                                            rows={2}
+                                            className="textarea textarea-bordered w-full bg-base-100/70 text-sm"
+                                            placeholder={t("permissionAllowToolsHint")}
+                                            value={joinPolicyList(form.permissionPolicy.allowToolIds)}
+                                            onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                                                setForm((f) => ({
+                                                    ...f,
+                                                    permissionPolicy: {
+                                                        ...f.permissionPolicy,
+                                                        allowToolIds: splitPolicyList(e.target.value),
+                                                    },
+                                                }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="form-control">
+                                        <label className="label">
+                                            <span className="label-text text-xs opacity-60">{t("permissionDenyTools")}</span>
+                                        </label>
+                                        <textarea
+                                            rows={2}
+                                            className="textarea textarea-bordered w-full bg-base-100/70 text-sm"
+                                            placeholder={t("permissionDenyToolsHint")}
+                                            value={joinPolicyList(form.permissionPolicy.denyToolIds)}
+                                            onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                                                setForm((f) => ({
+                                                    ...f,
+                                                    permissionPolicy: {
+                                                        ...f.permissionPolicy,
+                                                        denyToolIds: splitPolicyList(e.target.value),
+                                                    },
+                                                }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="form-control">
+                                        <label className="label">
+                                            <span className="label-text text-xs opacity-60">{t("permissionRequireApprovalTools")}</span>
+                                        </label>
+                                        <textarea
+                                            rows={2}
+                                            className="textarea textarea-bordered w-full bg-base-100/70 text-sm"
+                                            placeholder={t("permissionRequireApprovalToolsHint")}
+                                            value={joinPolicyList(form.permissionPolicy.requireApprovalToolIds)}
+                                            onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                                                setForm((f) => ({
+                                                    ...f,
+                                                    permissionPolicy: {
+                                                        ...f.permissionPolicy,
+                                                        requireApprovalToolIds: splitPolicyList(e.target.value),
+                                                    },
+                                                }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="form-control">
+                                        <label className="label">
+                                            <span className="label-text text-xs opacity-60">{t("permissionAllowFsRoots")}</span>
+                                        </label>
+                                        <textarea
+                                            rows={2}
+                                            className="textarea textarea-bordered w-full bg-base-100/70 text-sm"
+                                            placeholder={t("permissionAllowFsRootsHint")}
+                                            value={joinPolicyList(form.permissionPolicy.allowFsRoots)}
+                                            onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                                                setForm((f) => ({
+                                                    ...f,
+                                                    permissionPolicy: {
+                                                        ...f.permissionPolicy,
+                                                        allowFsRoots: splitPolicyList(e.target.value),
+                                                    },
+                                                }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="form-control md:col-span-2">
+                                        <label className="label">
+                                            <span className="label-text text-xs opacity-60">{t("permissionAllowNetworkDomains")}</span>
+                                        </label>
+                                        <textarea
+                                            rows={2}
+                                            className="textarea textarea-bordered w-full bg-base-100/70 text-sm"
+                                            placeholder={t("permissionAllowNetworkDomainsHint")}
+                                            value={joinPolicyList(form.permissionPolicy.allowNetworkDomains)}
+                                            onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                                                setForm((f) => ({
+                                                    ...f,
+                                                    permissionPolicy: {
+                                                        ...f.permissionPolicy,
+                                                        allowNetworkDomains: splitPolicyList(e.target.value),
+                                                    },
+                                                }))
+                                            }
+                                        />
+                                    </div>
+                                </div>
+                                <div className="rounded-xl border border-warning/20 bg-warning/10 px-3 py-2 text-xs text-warning">
+                                    {t("permissionPolicyHint")}
                                 </div>
                             </div>
 

@@ -46,10 +46,7 @@ async fn update_agent_profile(
 }
 
 #[tauri::command]
-async fn delete_agent_profile(
-    state: State<'_, SharedState>,
-    id: String,
-) -> Result<(), String> {
+async fn delete_agent_profile(state: State<'_, SharedState>, id: String) -> Result<(), String> {
     state
         .service
         .delete_agent_profile(&id)
@@ -179,9 +176,7 @@ async fn get_audit_events(
 }
 
 #[tauri::command]
-async fn get_settings(
-    state: State<'_, SharedState>,
-) -> Result<SystemSettings, String> {
+async fn get_settings(state: State<'_, SharedState>) -> Result<SystemSettings, String> {
     state
         .service
         .get_settings()
@@ -200,10 +195,20 @@ async fn update_settings(
 }
 
 #[tauri::command]
-async fn test_provider_connection(
-    config: AIProviderConfig,
-) -> Result<(), String> {
+async fn test_provider_connection(config: AIProviderConfig) -> Result<(), String> {
     test_connection(&config)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn refresh_provider_models(
+    state: State<'_, SharedState>,
+    config: AIProviderConfig,
+) -> Result<AIProviderConfig, String> {
+    state
+        .service
+        .refresh_provider_models(config)
         .await
         .map_err(|error| error.to_string())
 }
@@ -245,7 +250,8 @@ pub fn run() {
             get_audit_events,
             get_settings,
             update_settings,
-            test_provider_connection
+            test_provider_connection,
+            refresh_provider_models
         ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri application");

@@ -5,9 +5,11 @@ use regex::Regex;
 use serde_json::json;
 
 use crate::core::domain::{
-    new_id, now, AgentProfile, ClaimBid, ClaimContext, ClaimPlan, ClaimScorer, ConversationMessage,
-    Lease, LeaseState, MessageKind, SenderKind, TaskStatus, ToolManifest, Visibility,
+    new_id, now, AgentProfile, ClaimBid, ClaimContext, ClaimPlan, ClaimScoreBreakdown,
+    ClaimScoreFactor, ClaimScoreFactorKind, ClaimScorer, ConversationMessage, Lease, LeaseState,
+    MessageKind, SenderKind, TaskStatus, ToolManifest, Visibility,
 };
+use crate::core::permissions::is_tool_enabled_for_agent;
 
 #[derive(Debug, Clone)]
 pub struct Coordinator;
@@ -42,56 +44,144 @@ impl Coordinator {
         mentioned_agent_ids: &[String],
         active_load: i64,
         requested_tool: &Option<ToolManifest>,
-    ) -> (f64, Vec<String>, String) {
+    ) -> (f64, Vec<String>, String, ClaimScoreBreakdown) {
         let lowered = content.to_lowercase();
         let role_lower = agent.role.to_lowercase();
         let objective_lower = agent.objective.to_lowercase();
         let mut score = 10.0;
+        let mut factors = vec![ClaimScoreFactor {
+            kind: ClaimScoreFactorKind::Base,
+            score: 10.0,
+            detail: "Base eligibility score.".into(),
+        }];
 
         if mentioned_agent_ids.contains(&agent.id) {
             score += 35.0;
+            factors.push(ClaimScoreFactor {
+                kind: ClaimScoreFactorKind::Mention,
+                score: 35.0,
+                detail: "Directly mentioned in the request.".into(),
+            });
         }
 
         if active_load >= agent.max_parallel_runs {
             score -= 40.0;
+            factors.push(ClaimScoreFactor {
+                kind: ClaimScoreFactorKind::OverCapacity,
+                score: -40.0,
+                detail: format!(
+                    "Current load {active_load} is already at or above the parallel limit {}.",
+                    agent.max_parallel_runs
+                ),
+            });
         } else {
-            score += ((agent.max_parallel_runs - active_load).max(0) as f64) * 2.5;
+            let headroom_score = ((agent.max_parallel_runs - active_load).max(0) as f64) * 2.5;
+            score += headroom_score;
+            factors.push(ClaimScoreFactor {
+                kind: ClaimScoreFactorKind::Capacity,
+                score: headroom_score,
+                detail: format!(
+                    "Load {active_load} / {} leaves execution headroom.",
+                    agent.max_parallel_runs
+                ),
+            });
         }
 
+        let mut matched_keywords = Vec::new();
         for keyword in lowered.split_whitespace() {
             if role_lower.contains(keyword) || objective_lower.contains(keyword) {
                 score += 3.0;
+                if !matched_keywords.iter().any(|item: &String| item == keyword) {
+                    matched_keywords.push(keyword.to_string());
+                }
             }
+        }
+        if !matched_keywords.is_empty() {
+            factors.push(ClaimScoreFactor {
+                kind: ClaimScoreFactorKind::RoleMatch,
+                score: (matched_keywords.len() as f64) * 3.0,
+                detail: format!("Role/objective matched: {}.", matched_keywords.join(", ")),
+            });
         }
 
         let mut expected_tools = Vec::new();
         if let Some(tool) = requested_tool {
-            if agent.tool_ids.contains(&tool.id) {
+            if is_tool_enabled_for_agent(agent, &tool.id) {
                 score += 20.0;
                 expected_tools.push(tool.id.clone());
+                factors.push(ClaimScoreFactor {
+                    kind: ClaimScoreFactorKind::ToolCoverage,
+                    score: 20.0,
+                    detail: format!("Can execute requested tool '{}'.", tool.name),
+                });
             } else {
                 score -= 8.0;
+                factors.push(ClaimScoreFactor {
+                    kind: ClaimScoreFactorKind::ToolMismatch,
+                    score: -8.0,
+                    detail: format!("Does not expose requested tool '{}'.", tool.name),
+                });
             }
         }
 
+        let mut matched_skills = Vec::new();
         for skill in &agent.skill_ids {
             if lowered.contains("research") && skill.contains("research") {
                 score += 8.0;
+                matched_skills.push(skill.clone());
             }
             if lowered.contains("build") && skill.contains("builder") {
                 score += 8.0;
+                matched_skills.push(skill.clone());
             }
             if lowered.contains("review") && skill.contains("reviewer") {
                 score += 8.0;
+                matched_skills.push(skill.clone());
             }
         }
+        matched_skills.sort();
+        matched_skills.dedup();
+        if !matched_skills.is_empty() {
+            factors.push(ClaimScoreFactor {
+                kind: ClaimScoreFactorKind::SkillMatch,
+                score: (matched_skills.len() as f64) * 8.0,
+                detail: format!("Matching skills: {}.", matched_skills.join(", ")),
+            });
+        }
 
-        score -= (active_load as f64) * 12.0;
-        let rationale = format!(
-            "{} matched with load {} / parallel limit {} and tools {:?}",
-            agent.role, active_load, agent.max_parallel_runs, expected_tools
-        );
-        (score, expected_tools, rationale)
+        let load_penalty = (active_load as f64) * 12.0;
+        score -= load_penalty;
+        if load_penalty > 0.0 {
+            factors.push(ClaimScoreFactor {
+                kind: ClaimScoreFactorKind::LoadPenalty,
+                score: -load_penalty,
+                detail: format!("Concurrent load penalty for {active_load} active task(s)."),
+            });
+        }
+
+        let rationale = build_rationale(agent, &factors);
+        (
+            score,
+            expected_tools,
+            rationale,
+            ClaimScoreBreakdown { factors },
+        )
+    }
+}
+
+fn build_rationale(agent: &AgentProfile, factors: &[ClaimScoreFactor]) -> String {
+    let highlights = factors
+        .iter()
+        .filter(|factor| factor.score.abs() >= 8.0 && factor.kind != ClaimScoreFactorKind::Base)
+        .map(|factor| factor.detail.clone())
+        .collect::<Vec<_>>();
+    if highlights.is_empty() {
+        format!(
+            "{} matched the request with no strong positive or negative bias.",
+            agent.role
+        )
+    } else {
+        format!("{} {}", agent.role, highlights.join(" "))
     }
 }
 
@@ -99,8 +189,8 @@ impl Coordinator {
 mod tests {
     use super::Coordinator;
     use crate::core::domain::{
-        AgentProfile, ClaimContext, ClaimScorer, MemoryPolicy, ModelPolicy, TaskCard, TaskStatus,
-        ToolManifest, WorkGroup, WorkGroupKind,
+        AgentPermissionPolicy, AgentProfile, ClaimContext, ClaimScoreFactorKind, ClaimScorer,
+        MemoryPolicy, ModelPolicy, TaskCard, TaskStatus, ToolManifest, WorkGroup, WorkGroupKind,
     };
 
     fn agent(id: &str, name: &str, role: &str) -> AgentProfile {
@@ -116,6 +206,7 @@ mod tests {
             max_parallel_runs: 2,
             can_spawn_subtasks: true,
             memory_policy: MemoryPolicy::default(),
+            permission_policy: AgentPermissionPolicy::default(),
         }
     }
 
@@ -226,6 +317,50 @@ mod tests {
 
         assert_eq!(plan.lease.expect("lease").owner_agent_id, builder.id);
     }
+
+    #[test]
+    fn bid_breakdown_exposes_mention_and_tool_factors() {
+        let scorer = Coordinator;
+        let mut reviewer = agent("a2", "Reviewer", "Quality Reviewer");
+        reviewer.tool_ids = vec!["shell.exec".into(), "plan.summarize".into()];
+
+        let plan = scorer
+            .score(ClaimContext {
+                task_card: task_card(),
+                work_group: work_group(),
+                candidates: vec![agent("a1", "Scout", "Research Lead"), reviewer.clone()],
+                content: "@Reviewer review and run shell validation".into(),
+                mentioned_agent_ids: vec![reviewer.id.clone()],
+                active_loads: vec![("a1".into(), 0), ("a2".into(), 0)],
+                requested_tool: Some(ToolManifest {
+                    id: "shell.exec".into(),
+                    name: "Shell Command".into(),
+                    category: "system".into(),
+                    risk_level: crate::core::domain::ToolRiskLevel::High,
+                    input_schema: "{}".into(),
+                    output_schema: "{}".into(),
+                    timeout_ms: 1000,
+                    concurrency_limit: 1,
+                    permissions: vec!["system:shell".into()],
+                    description: "Run shell".into(),
+                }),
+            })
+            .expect("score plan");
+
+        let winning_bid = plan
+            .bids
+            .into_iter()
+            .find(|bid| bid.agent_id == reviewer.id)
+            .expect("reviewer bid");
+        assert!(winning_bid
+            .score_breakdown
+            .factors
+            .iter()
+            .any(|factor| factor.kind == ClaimScoreFactorKind::Mention && factor.score > 0.0));
+        assert!(winning_bid.score_breakdown.factors.iter().any(|factor| {
+            factor.kind == ClaimScoreFactorKind::ToolCoverage && factor.score > 0.0
+        }));
+    }
 }
 
 impl ClaimScorer for Coordinator {
@@ -245,19 +380,21 @@ impl ClaimScorer for Coordinator {
 
         let mut bids = Vec::new();
         for candidate in &candidates {
-            let (capability_score, expected_tools, rationale) = self.score_candidate(
-                candidate,
-                &content,
-                &mentioned_agent_ids,
-                *load_map.get(&candidate.id).unwrap_or(&0),
-                &requested_tool,
-            );
+            let (capability_score, expected_tools, rationale, score_breakdown) = self
+                .score_candidate(
+                    candidate,
+                    &content,
+                    &mentioned_agent_ids,
+                    *load_map.get(&candidate.id).unwrap_or(&0),
+                    &requested_tool,
+                );
             bids.push(ClaimBid {
                 id: new_id(),
                 task_card_id: task_card.id.clone(),
                 agent_id: candidate.id.clone(),
                 rationale,
                 capability_score,
+                score_breakdown,
                 expected_tools,
                 estimated_cost: (task_card.priority as f64) * 0.4 + 1.0,
                 created_at: created_at.clone(),

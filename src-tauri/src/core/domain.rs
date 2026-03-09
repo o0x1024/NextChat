@@ -25,13 +25,14 @@ impl Default for SenderKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageKind {
     Text,
     Summary,
     ToolCall,
     ToolResult,
+    Collaboration,
     Approval,
     Status,
 }
@@ -141,12 +142,13 @@ impl Default for ToolRunState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryScope {
     User,
     WorkGroup,
     Agent,
+    Task,
 }
 
 impl Default for MemoryScope {
@@ -193,6 +195,41 @@ impl Default for MemoryPolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentPermissionPolicy {
+    pub allow_tool_ids: Vec<String>,
+    pub deny_tool_ids: Vec<String>,
+    pub require_approval_tool_ids: Vec<String>,
+    pub allow_fs_roots: Vec<String>,
+    pub allow_network_domains: Vec<String>,
+}
+
+impl AgentPermissionPolicy {
+    pub fn allows_tool_id(&self, tool_id: &str) -> bool {
+        let tool_id = tool_id.to_string();
+        (self.allow_tool_ids.is_empty() || self.allow_tool_ids.contains(&tool_id))
+            && !self.deny_tool_ids.contains(&tool_id)
+    }
+
+    pub fn requires_approval(&self, tool_id: &str) -> bool {
+        self.require_approval_tool_ids
+            .contains(&tool_id.to_string())
+    }
+}
+
+impl Default for AgentPermissionPolicy {
+    fn default() -> Self {
+        Self {
+            allow_tool_ids: vec![],
+            deny_tool_ids: vec![],
+            require_approval_tool_ids: vec![],
+            allow_fs_roots: vec![],
+            allow_network_domains: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentProfile {
     pub id: String,
     pub name: String,
@@ -205,6 +242,7 @@ pub struct AgentProfile {
     pub max_parallel_runs: i64,
     pub can_spawn_subtasks: bool,
     pub memory_policy: MemoryPolicy,
+    pub permission_policy: AgentPermissionPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,9 +302,38 @@ pub struct ClaimBid {
     pub agent_id: String,
     pub rationale: String,
     pub capability_score: f64,
+    pub score_breakdown: ClaimScoreBreakdown,
     pub expected_tools: Vec<String>,
     pub estimated_cost: f64,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimScoreBreakdown {
+    pub factors: Vec<ClaimScoreFactor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimScoreFactor {
+    pub kind: ClaimScoreFactorKind,
+    pub score: f64,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimScoreFactorKind {
+    Base,
+    Mention,
+    Capacity,
+    OverCapacity,
+    RoleMatch,
+    ToolCoverage,
+    ToolMismatch,
+    SkillMatch,
+    LoadPenalty,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,8 +537,12 @@ impl Default for SystemSettings {
                     enabled: false,
                     rig_provider_type: "DeepSeek".into(),
                     api_key: "".into(),
-                    base_url: "https://api.deepseek.com/v1".into(),
-                    models: vec!["deepseek-chat".into(), "deepseek-coder".into(), "deepseek-reasoner".into()],
+                    base_url: "https://api.deepseek.com".into(),
+                    models: vec![
+                        "deepseek-chat".into(),
+                        "deepseek-coder".into(),
+                        "deepseek-reasoner".into(),
+                    ],
                     default_model: "deepseek-chat".into(),
                     ..AIProviderConfig::default()
                 },
@@ -512,6 +583,8 @@ pub struct CreateAgentInput {
     pub tool_ids: Vec<String>,
     pub max_parallel_runs: i64,
     pub can_spawn_subtasks: bool,
+    pub memory_policy: MemoryPolicy,
+    pub permission_policy: AgentPermissionPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -529,6 +602,8 @@ pub struct UpdateAgentInput {
     pub tool_ids: Vec<String>,
     pub max_parallel_runs: i64,
     pub can_spawn_subtasks: bool,
+    pub memory_policy: MemoryPolicy,
+    pub permission_policy: AgentPermissionPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -556,6 +631,7 @@ pub struct TaskExecutionContext {
     pub work_group_members: Vec<AgentProfile>,
     pub task_card: TaskCard,
     pub conversation_window: Vec<ConversationMessage>,
+    pub memory_context: Vec<MemoryItem>,
     pub available_tools: Vec<ToolManifest>,
     pub available_skills: Vec<SkillPack>,
     pub approved_tool: Option<ToolManifest>,
@@ -569,6 +645,8 @@ pub struct ToolExecutionRequest {
     pub input: String,
     pub task_card_id: String,
     pub agent_id: String,
+    pub agent: AgentProfile,
+    pub approval_granted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

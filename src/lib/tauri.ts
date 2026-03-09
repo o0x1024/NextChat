@@ -90,6 +90,12 @@ export async function testProviderConnection(config: AIProviderConfig): Promise<
   return invoke("test_provider_connection", { config });
 }
 
+export async function refreshProviderModels(
+  config: AIProviderConfig,
+): Promise<AIProviderConfig> {
+  return invoke("refresh_provider_models", { config });
+}
+
 export function subscribeToEvents(onEvent: () => void) {
   return Promise.all(eventNames.map((eventName) => listen(eventName, onEvent)));
 }

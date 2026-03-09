@@ -2,6 +2,7 @@ import { useTranslation } from "react-i18next";
 import type {
   AgentProfile,
   ClaimBid,
+  ClaimScoreFactor,
   Lease,
   MemoryItem,
   TaskCard,
@@ -48,6 +49,10 @@ export function TaskWorkspace({
   const childTasks = currentTask
     ? currentTasks.filter((task) => task.parentId === currentTask.id)
     : [];
+  const childTaskSummary = childTasks.reduce<Record<string, number>>((acc, task) => {
+    acc[task.status] = (acc[task.status] ?? 0) + 1;
+    return acc;
+  }, {});
   const taskBids = currentTask
     ? claimBids
         .filter((bid) => bid.taskCardId === currentTask.id)
@@ -56,9 +61,40 @@ export function TaskWorkspace({
   const taskToolRuns = currentTask
     ? toolRuns.filter((run) => run.taskCardId === currentTask.id)
     : [];
+  const winningBid = currentLease
+    ? taskBids.find((bid) => bid.agentId === currentLease.ownerAgentId) ?? taskBids[0]
+    : taskBids[0];
   const relatedMemory = currentTask
-    ? memoryItems.filter((item) => item.scopeId === currentTask.id)
+    ? memoryItems.filter((item) => item.scope === "task" && item.scopeId === currentTask.id)
     : [];
+  const winnerAgent = winningBid
+    ? agents.find((agent) => agent.id === winningBid.agentId)
+    : undefined;
+  const blockingChildCount = childTasks.filter((task) =>
+    ["cancelled", "needs_review"].includes(task.status),
+  ).length;
+  const pendingApprovalCount = taskToolRuns.filter(
+    (run) => run.approvalRequired && run.state === "pending_approval",
+  ).length;
+  const approvalBlocked = taskToolRuns.some(
+    (run) => run.approvalRequired && run.state === "cancelled",
+  );
+  const runningToolNames = taskToolRuns
+    .filter((run) => run.state === "running")
+    .map((run) => tools.find((tool) => tool.id === run.toolId)?.name ?? run.toolId);
+  const statusReason = currentTask
+    ? describeTaskStatus({
+        t,
+        task: currentTask,
+        lease: currentLease,
+        childTaskCount: childTasks.length,
+        blockingChildCount,
+        pendingApprovalCount,
+        approvalBlocked,
+        runningToolNames,
+        winnerName: winnerAgent?.name,
+      })
+    : "";
 
   return (
     <section className="card card-border flex min-h-0 flex-1 bg-base-100">
@@ -119,6 +155,20 @@ export function TaskWorkspace({
                       </span>
                     </div>
                     <p className="whitespace-pre-wrap text-sm">{currentTask.inputPayload}</p>
+                    <div className="rounded-box bg-base-200 px-4 py-3">
+                      <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-base-content/50">
+                        {t("statusReason")}
+                      </div>
+                      <p className="text-sm">{statusReason}</p>
+                      {winningBid && winnerAgent ? (
+                        <p className="mt-2 text-sm text-base-content/65">
+                          {t("leaseWinnerReason", {
+                            name: winnerAgent.name,
+                            score: winningBid.capabilityScore.toFixed(1),
+                          })}
+                        </p>
+                      ) : null}
+                    </div>
                     <div className="stats stats-vertical bg-base-200 lg:stats-horizontal">
                       <div className="stat">
                         <div className="stat-title">{t("created")}</div>
@@ -149,6 +199,15 @@ export function TaskWorkspace({
                         <h3 className="card-title text-base">{t("childTasks")}</h3>
                         <span className="badge badge-secondary">{childTasks.length}</span>
                       </div>
+                      {childTasks.length > 0 ? (
+                        <div className="flex flex-wrap gap-2">
+                          {Object.entries(childTaskSummary).map(([status, count]) => (
+                            <span key={status} className={`badge ${statusBadgeClass(status as TaskCard["status"])}`}>
+                              {t(`taskStatus.${status as TaskCard["status"]}`)} {count}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
                       <div className="space-y-2">
                         {childTasks.map((task) => (
                           <button
@@ -178,18 +237,42 @@ export function TaskWorkspace({
                       <div className="space-y-2">
                         {taskBids.map((bid) => {
                           const agent = agents.find((item) => item.id === bid.agentId);
+                          const isWinner = currentLease?.ownerAgentId === bid.agentId;
                           return (
                             <div
                               key={bid.id}
                               className="rounded-box bg-base-200 px-4 py-3"
                             >
                               <div className="flex items-center justify-between gap-3">
-                                <strong>{agent?.name ?? bid.agentId}</strong>
-                                <span className="badge badge-primary">
-                                  {t("capabilityScore")}: {bid.capabilityScore}
+                                <div className="flex items-center gap-2">
+                                  <strong>{agent?.name ?? bid.agentId}</strong>
+                                  {isWinner ? (
+                                    <span className="badge badge-success">{t("winningBid")}</span>
+                                  ) : null}
+                                </div>
+                                <span className={`badge ${isWinner ? "badge-success" : "badge-primary"}`}>
+                                  {t("capabilityScore")}: {bid.capabilityScore.toFixed(1)}
                                 </span>
                               </div>
                               <p className="mt-2 text-sm text-base-content/70">{bid.rationale}</p>
+                              <div className="mt-3 space-y-2">
+                                {bid.scoreBreakdown.factors.map((factor, index) => (
+                                  <div
+                                    key={`${bid.id}-${factor.kind}-${index}`}
+                                    className="flex items-start justify-between gap-3 rounded-box bg-base-100 px-3 py-2"
+                                  >
+                                    <div>
+                                      <div className="text-sm font-medium">
+                                        {t(`claimFactor.${factor.kind}`)}
+                                      </div>
+                                      <div className="text-xs text-base-content/60">{factor.detail}</div>
+                                    </div>
+                                    <span className={`badge ${scoreBadgeClass(factor)}`}>
+                                      {formatSignedScore(factor.score)}
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
                               <div className="mt-2 flex flex-wrap gap-2">
                                 {bid.expectedTools.map((toolId) => (
                                   <span key={toolId} className="badge badge-neutral">
@@ -254,6 +337,13 @@ export function TaskWorkspace({
                           >
                             <div>{memory.content}</div>
                             <div className="mt-2 flex flex-wrap gap-2">
+                              <span className="badge badge-outline">{memory.scope}</span>
+                              {memory.pinned ? (
+                                <span className="badge badge-warning">pinned</span>
+                              ) : null}
+                              {memory.ttl ? (
+                                <span className="badge badge-neutral">ttl:{memory.ttl}</span>
+                              ) : null}
                               {memory.tags.map((tag) => (
                                 <span key={tag} className="badge badge-neutral">
                                   {tag}
@@ -285,4 +375,76 @@ export function TaskWorkspace({
       </div>
     </section>
   );
+}
+
+function describeTaskStatus({
+  t,
+  task,
+  lease,
+  childTaskCount,
+  blockingChildCount,
+  pendingApprovalCount,
+  approvalBlocked,
+  runningToolNames,
+  winnerName,
+}: {
+  t: ReturnType<typeof useTranslation>["t"];
+  task: TaskCard;
+  lease?: Lease | null;
+  childTaskCount: number;
+  blockingChildCount: number;
+  pendingApprovalCount: number;
+  approvalBlocked: boolean;
+  runningToolNames: string[];
+  winnerName?: string;
+}) {
+  switch (task.status) {
+    case "pending":
+      return t("taskStatusReason.pending");
+    case "bidding":
+      return t("taskStatusReason.bidding");
+    case "leased":
+      return winnerName
+        ? t("taskStatusReason.leasedWithOwner", { name: winnerName })
+        : t("taskStatusReason.leased");
+    case "waiting_children":
+      return t("taskStatusReason.waiting_children", { count: childTaskCount });
+    case "waiting_approval":
+      return t("taskStatusReason.waiting_approval", { count: pendingApprovalCount || 1 });
+    case "in_progress":
+      return runningToolNames.length > 0
+        ? t("taskStatusReason.in_progress_tools", { names: runningToolNames.join(", ") })
+        : t("taskStatusReason.in_progress");
+    case "paused":
+      return lease?.preemptRequestedAt
+        ? t("taskStatusReason.paused_preempted")
+        : t("taskStatusReason.paused");
+    case "cancelled":
+      return t("taskStatusReason.cancelled");
+    case "completed":
+      return childTaskCount > 0
+        ? t("taskStatusReason.completed_children", { count: childTaskCount })
+        : t("taskStatusReason.completed");
+    case "needs_review":
+      if (blockingChildCount > 0) {
+        return t("taskStatusReason.needs_review_children", { count: blockingChildCount });
+      }
+      if (approvalBlocked) {
+        return t("taskStatusReason.needs_review_approval");
+      }
+      return t("taskStatusReason.needs_review");
+    default:
+      return task.status;
+  }
+}
+
+function scoreBadgeClass(factor: ClaimScoreFactor) {
+  if (factor.score > 0) return "badge-success";
+  if (factor.score < 0) return "badge-warning";
+  return "badge-ghost";
+}
+
+function formatSignedScore(score: number) {
+  if (score > 0) return `+${score.toFixed(1)}`;
+  return score.toFixed(1);
 }

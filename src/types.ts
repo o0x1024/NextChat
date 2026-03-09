@@ -4,6 +4,7 @@ export type MessageKind =
   | "summary"
   | "tool_call"
   | "tool_result"
+  | "collaboration"
   | "approval"
   | "status";
 export type Visibility = "main" | "backstage";
@@ -41,6 +42,14 @@ export interface MemoryPolicy {
   pinnedMemoryIds: string[];
 }
 
+export interface AgentPermissionPolicy {
+  allowToolIds: string[];
+  denyToolIds: string[];
+  requireApprovalToolIds: string[];
+  allowFsRoots: string[];
+  allowNetworkDomains: string[];
+}
+
 export interface AgentProfile {
   id: string;
   name: string;
@@ -53,6 +62,7 @@ export interface AgentProfile {
   maxParallelRuns: number;
   canSpawnSubtasks: boolean;
   memoryPolicy: MemoryPolicy;
+  permissionPolicy: AgentPermissionPolicy;
 }
 
 export interface WorkGroup {
@@ -104,9 +114,31 @@ export interface ClaimBid {
   agentId: string;
   rationale: string;
   capabilityScore: number;
+  scoreBreakdown: ClaimScoreBreakdown;
   expectedTools: string[];
   estimatedCost: number;
   createdAt: string;
+}
+
+export interface ClaimScoreBreakdown {
+  factors: ClaimScoreFactor[];
+}
+
+export type ClaimScoreFactorKind =
+  | "base"
+  | "mention"
+  | "capacity"
+  | "over_capacity"
+  | "role_match"
+  | "tool_coverage"
+  | "tool_mismatch"
+  | "skill_match"
+  | "load_penalty";
+
+export interface ClaimScoreFactor {
+  kind: ClaimScoreFactorKind;
+  score: number;
+  detail: string;
 }
 
 export interface Lease {
@@ -156,7 +188,7 @@ export interface SkillPack {
 
 export interface MemoryItem {
   id: string;
-  scope: "user" | "work_group" | "agent";
+  scope: "user" | "work_group" | "agent" | "task";
   scopeId: string;
   content: string;
   tags: string[];
@@ -232,6 +264,8 @@ export interface CreateAgentInput {
   toolIds: string[];
   maxParallelRuns: number;
   canSpawnSubtasks: boolean;
+  memoryPolicy: MemoryPolicy;
+  permissionPolicy: AgentPermissionPolicy;
 }
 
 export interface UpdateAgentInput extends CreateAgentInput {
