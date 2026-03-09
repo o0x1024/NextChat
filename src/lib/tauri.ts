@@ -13,17 +13,17 @@ import type {
 } from "../types";
 
 export const eventNames = [
-  "chat.message.created",
-  "task.card.created",
-  "claim.bid.submitted",
-  "lease.granted",
-  "lease.preempt_requested",
-  "task.status.changed",
-  "tool.run.started",
-  "tool.run.completed",
-  "approval.requested",
-  "memory.updated",
-  "audit.event.created",
+  "chat:message-created",
+  "task:card-created",
+  "claim:bid-submitted",
+  "lease:granted",
+  "lease:preempt-requested",
+  "task:status-changed",
+  "tool:run-started",
+  "tool:run-completed",
+  "approval:requested",
+  "memory:updated",
+  "audit:event-created",
 ];
 
 export async function getDashboardState(): Promise<DashboardState> {

@@ -7,6 +7,7 @@ export type MessageKind =
   | "approval"
   | "status";
 export type Visibility = "main" | "backstage";
+export type ExecutionMode = "real_model" | "fallback";
 export type WorkGroupKind = "persistent" | "ephemeral";
 export type TaskStatus =
   | "pending"
@@ -78,6 +79,7 @@ export interface ConversationMessage {
   content: string;
   mentions: string[];
   taskCardId?: string | null;
+  executionMode?: ExecutionMode | null;
   createdAt: string;
 }
 
@@ -193,6 +195,9 @@ export interface AIGlobalConfig {
   defaultLLMModel: string;
   defaultVLMProvider: string;
   defaultVLMModel: string;
+  maskApiKeys: boolean;
+  enableAuditLog: boolean;
+  proxyUrl: string;
 }
 
 export interface SystemSettings {

@@ -55,6 +55,13 @@ impl Default for Visibility {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    RealModel,
+    Fallback,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkGroupKind {
@@ -228,6 +235,7 @@ pub struct ConversationMessage {
     pub content: String,
     pub mentions: Vec<String>,
     pub task_card_id: Option<String>,
+    pub execution_mode: Option<ExecutionMode>,
     pub created_at: String,
 }
 
@@ -364,6 +372,9 @@ pub struct AIGlobalConfig {
     pub default_llm_model: String,
     pub default_vlm_provider: String,
     pub default_vlm_model: String,
+    pub mask_api_keys: bool,
+    pub enable_audit_log: bool,
+    pub proxy_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,6 +419,9 @@ impl Default for AIGlobalConfig {
             default_llm_model: "gpt-4o".into(),
             default_vlm_provider: "gemini".into(),
             default_vlm_model: "gemini-2.0-flash".into(),
+            mask_api_keys: true,
+            enable_audit_log: true,
+            proxy_url: "".into(),
         }
     }
 }
@@ -571,6 +585,7 @@ pub struct AgentExecution {
     pub backstage_notes: String,
     pub suggested_subtasks: Vec<String>,
     pub tool_output: Option<String>,
+    pub execution_mode: ExecutionMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

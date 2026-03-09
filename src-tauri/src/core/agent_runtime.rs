@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use regex::Regex;
 
 use crate::core::domain::{
-    AgentExecution, AgentExecutor, ModelProviderAdapter, TaskExecutionContext,
+    AgentExecution, AgentExecutor, ExecutionMode, ModelProviderAdapter, TaskExecutionContext,
     ToolExecutionRequest, ToolHandler,
 };
 use crate::core::llm_rig::complete_task_with_tools;
@@ -180,7 +180,13 @@ where
                 context.agent.name, context.task_card.title
             ))
         };
+        let used_real_model = model_summary.is_some();
         let summary = model_summary.or(fallback_summary).unwrap_or_default();
+        let execution_mode = if used_real_model {
+            ExecutionMode::RealModel
+        } else {
+            ExecutionMode::Fallback
+        };
 
         let suggested_subtasks = build_suggested_subtasks(&context);
 
@@ -214,6 +220,7 @@ where
             backstage_notes,
             suggested_subtasks,
             tool_output,
+            execution_mode,
         })
     }
 }

@@ -312,6 +312,7 @@ impl ClaimScorer for Coordinator {
             },
             mentions: vec![],
             task_card_id: Some(task_card.id.clone()),
+            execution_mode: None,
             created_at: created_at.clone(),
         }];
 
@@ -336,6 +337,7 @@ impl ClaimScorer for Coordinator {
                 ),
                 mentions: vec![bid.agent_id.clone()],
                 task_card_id: Some(task_card.id.clone()),
+                execution_mode: None,
                 created_at: created_at.clone(),
             });
         }
@@ -357,6 +359,7 @@ impl ClaimScorer for Coordinator {
             content: payload.to_string(),
             mentions: vec![],
             task_card_id: Some(task_card.id.clone()),
+            execution_mode: None,
             created_at,
         });
 

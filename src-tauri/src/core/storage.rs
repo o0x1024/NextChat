@@ -5,9 +5,10 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::core::domain::{
-    new_id, now, AgentProfile, AuditEvent, ClaimBid, ConversationMessage, DashboardState, Lease,
-    LeaseState, MemoryItem, MemoryPolicy, MemoryScope, MessageKind, ModelPolicy, SenderKind,
-    SystemSettings, TaskCard, ToolRun, Visibility, WorkGroup, WorkGroupKind,
+    new_id, now, AgentProfile, AuditEvent, ClaimBid, ConversationMessage, DashboardState,
+    ExecutionMode, Lease, LeaseState, MemoryItem, MemoryPolicy, MemoryScope, MessageKind,
+    ModelPolicy, SenderKind, SystemSettings, TaskCard, ToolRun, Visibility, WorkGroup,
+    WorkGroupKind,
 };
 
 #[derive(Clone, Debug)]
@@ -74,6 +75,7 @@ impl Storage {
                   content TEXT NOT NULL,
                   mentions TEXT NOT NULL,
                   task_card_id TEXT,
+                  execution_mode TEXT,
                   created_at TEXT NOT NULL
                 );
 
@@ -159,6 +161,7 @@ impl Storage {
                 CREATE INDEX IF NOT EXISTS idx_tool_runs_task ON tool_runs(task_card_id);
                 "#,
             )?;
+            ensure_column(conn, "messages", "execution_mode", "TEXT")?;
             Ok(())
         })
     }
@@ -263,8 +266,8 @@ impl Storage {
                 r#"
                 INSERT INTO messages (
                   id, conversation_id, work_group_id, sender_kind, sender_id, sender_name, kind,
-                  visibility, content, mentions, task_card_id, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11)
+                  visibility, content, mentions, task_card_id, execution_mode, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, ?11)
                 "#,
                 params![
                     new_id(),
@@ -473,8 +476,8 @@ impl Storage {
                 r#"
                 INSERT INTO messages (
                   id, conversation_id, work_group_id, sender_kind, sender_id, sender_name, kind,
-                  visibility, content, mentions, task_card_id, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                  visibility, content, mentions, task_card_id, execution_mode, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 "#,
                 params![
                     message.id,
@@ -488,6 +491,11 @@ impl Storage {
                     message.content,
                     json(&message.mentions)?,
                     message.task_card_id,
+                    message
+                        .execution_mode
+                        .as_ref()
+                        .map(json)
+                        .transpose()?,
                     message.created_at,
                 ],
             )?;
@@ -848,6 +856,21 @@ fn bool_to_i64(value: bool) -> i64 {
     }
 }
 
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let columns = collect_rows(rows)?;
+
+    if !columns.iter().any(|existing| existing == column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+
+    Ok(())
+}
+
 fn decode<T: DeserializeOwned>(raw: String) -> rusqlite::Result<T> {
     serde_json::from_str(&raw).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
@@ -912,6 +935,10 @@ fn map_message(row: &Row<'_>) -> rusqlite::Result<ConversationMessage> {
         content: row.get("content")?,
         mentions: decode(row.get("mentions")?)?,
         task_card_id: row.get("task_card_id")?,
+        execution_mode: row
+            .get::<_, Option<String>>("execution_mode")?
+            .map(decode::<ExecutionMode>)
+            .transpose()?,
         created_at: row.get("created_at")?,
     })
 }

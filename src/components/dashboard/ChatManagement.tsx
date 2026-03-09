@@ -7,6 +7,7 @@ import type {
   ConversationMessage,
   CreateWorkGroupInput,
   Lease,
+  SystemSettings,
   TaskCard,
   ToolManifest,
   ToolRun,
@@ -23,6 +24,7 @@ interface ChatManagementProps {
   claimBids: ClaimBid[];
   toolRuns: ToolRun[];
   tools: ToolManifest[];
+  settings: SystemSettings;
   selectedWorkGroupId?: string;
   language: Language;
   backstageOpen: boolean;
@@ -39,6 +41,12 @@ function senderBubbleClass(message: ConversationMessage) {
   if (message.senderKind === "human") return "chat-bubble-primary";
   if (message.senderKind === "agent") return "chat-bubble-secondary";
   return "chat-bubble-neutral";
+}
+
+function executionBadgeClass(message: ConversationMessage) {
+  if (message.executionMode === "real_model") return "badge-success";
+  if (message.executionMode === "fallback") return "badge-warning";
+  return "badge-ghost";
 }
 
 const emptyGroupForm: CreateWorkGroupInput = {
@@ -58,6 +66,7 @@ export function ChatManagement({
   claimBids,
   toolRuns,
   tools,
+  settings,
   selectedWorkGroupId,
   language,
   backstageOpen,
@@ -271,6 +280,13 @@ export function ChatManagement({
                         {message.visibility === "backstage" && (
                           <span className="ml-1 badge badge-warning badge-xs">{t("backstage")}</span>
                         )}
+                        {message.executionMode && (
+                          <span className={`ml-1 badge badge-xs ${executionBadgeClass(message)}`}>
+                            {message.executionMode === "real_model"
+                              ? t("realModelReady")
+                              : t("fallbackExecution")}
+                          </span>
+                        )}
                         <time className="ml-2">{formatTime(message.createdAt, language)}</time>
                       </div>
                       <div className={`chat-bubble whitespace-pre-wrap text-sm ${senderBubbleClass(message)}`}>
@@ -338,7 +354,7 @@ export function ChatManagement({
                       {/* Right Group: Model & Send */}
                       <div className="flex items-center gap-4">
                         <div className="flex items-center gap-1.5 text-[10px] font-bold text-base-content/40 cursor-pointer hover:text-primary transition-all">
-                          ark-code-latest <i className="fas fa-chevron-down text-[8px]" />
+                          {settings.globalConfig.defaultLLMModel} <i className="fas fa-chevron-down text-[8px]" />
                         </div>
                         <div className="text-base-content/30"><i className="fas fa-language text-xs" /></div>
                         <button

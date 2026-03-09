@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use serde_json::json;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 
 use crate::core::{
     agent_runtime::AgentRuntime,
@@ -231,9 +231,9 @@ impl AppService {
         Ok(())
     }
 
-    pub fn send_human_message(
+    pub fn send_human_message<R: Runtime>(
         &self,
-        app: AppHandle,
+        app: AppHandle<R>,
         input: SendHumanMessageInput,
     ) -> Result<ConversationMessage> {
         let work_group = self.storage.get_work_group(&input.work_group_id)?;
@@ -256,10 +256,11 @@ impl AppService {
             content: input.content.clone(),
             mentions,
             task_card_id: None,
+            execution_mode: None,
             created_at: now(),
         };
         self.storage.insert_message(&human_message)?;
-        emit(&app, "chat.message.created", &human_message)?;
+        emit(&app, "chat:message-created", &human_message)?;
 
         self.preempt_active_leases(&app, &work_group.id)?;
 
@@ -304,7 +305,7 @@ impl AppService {
         }
 
         self.storage.insert_task_card(&claim_plan.task_card)?;
-        emit(&app, "task.card.created", &claim_plan.task_card)?;
+        emit(&app, "task:card-created", &claim_plan.task_card)?;
         self.record_audit(
             "task.created",
             "task_card",
@@ -314,17 +315,17 @@ impl AppService {
 
         for bid in &claim_plan.bids {
             self.storage.insert_claim_bid(bid)?;
-            emit(&app, "claim.bid.submitted", bid)?;
+            emit(&app, "claim:bid-submitted", bid)?;
         }
 
         for message in &claim_plan.coordinator_messages {
             self.storage.insert_message(message)?;
-            emit(&app, "chat.message.created", message)?;
+            emit(&app, "chat:message-created", message)?;
         }
 
         if let Some(ref lease) = claim_plan.lease {
             self.storage.insert_lease(lease)?;
-            emit(&app, "lease.granted", lease)?;
+            emit(&app, "lease:granted", lease)?;
             self.record_audit(
                 "lease.granted",
                 "lease",
@@ -364,11 +365,12 @@ impl AppService {
                         content: format!("Approval required for {} before execution.", tool.name),
                         mentions: vec![lease.owner_agent_id.clone()],
                         task_card_id: Some(claim_plan.task_card.id.clone()),
+                        execution_mode: None,
                         created_at: now(),
                     };
                     self.storage.insert_message(&approval_message)?;
-                    emit(&app, "chat.message.created", &approval_message)?;
-                    emit(&app, "approval.requested", &tool_run)?;
+                    emit(&app, "chat:message-created", &approval_message)?;
+                    emit(&app, "approval:requested", &tool_run)?;
                 } else {
                     self.spawn_task_execution(
                         app.clone(),
@@ -384,9 +386,9 @@ impl AppService {
         Ok(human_message)
     }
 
-    pub fn approve_tool_run(
+    pub fn approve_tool_run<R: Runtime>(
         &self,
-        app: AppHandle,
+        app: AppHandle<R>,
         tool_run_id: &str,
         approved: bool,
     ) -> Result<ToolRun> {
@@ -394,7 +396,7 @@ impl AppService {
         if approved {
             tool_run.state = ToolRunState::Queued;
             self.storage.insert_tool_run(&tool_run)?;
-            emit(&app, "tool.run.started", &tool_run)?;
+            emit(&app, "tool:run-started", &tool_run)?;
             self.record_audit(
                 "tool_run.approved",
                 "tool_run",
@@ -413,7 +415,7 @@ impl AppService {
             let mut task_card = self.storage.get_task_card(&tool_run.task_card_id)?;
             task_card.status = TaskStatus::NeedsReview;
             self.storage.update_task_card(&task_card)?;
-            emit(&app, "task.status.changed", &task_card)?;
+            emit(&app, "task:status-changed", &task_card)?;
             self.record_audit(
                 "tool_run.rejected",
                 "tool_run",
@@ -424,7 +426,11 @@ impl AppService {
         Ok(tool_run)
     }
 
-    pub fn cancel_task_card(&self, app: AppHandle, task_card_id: &str) -> Result<TaskCard> {
+    pub fn cancel_task_card<R: Runtime>(
+        &self,
+        app: AppHandle<R>,
+        task_card_id: &str,
+    ) -> Result<TaskCard> {
         let mut task = self.storage.get_task_card(task_card_id)?;
         task.status = TaskStatus::Cancelled;
         self.storage.update_task_card(&task)?;
@@ -434,11 +440,11 @@ impl AppService {
             self.storage.update_lease(&lease)?;
         }
         self.record_audit("task.cancelled", "task_card", &task.id, json!({}))?;
-        emit(&app, "task.status.changed", &task)?;
+        emit(&app, "task:status-changed", &task)?;
         Ok(task)
     }
 
-    pub fn pause_lease(&self, app: AppHandle, lease_id: &str) -> Result<Lease> {
+    pub fn pause_lease<R: Runtime>(&self, app: AppHandle<R>, lease_id: &str) -> Result<Lease> {
         let mut lease = self
             .storage
             .list_leases()?
@@ -450,12 +456,16 @@ impl AppService {
         if let Ok(mut task) = self.storage.get_task_card(&lease.task_card_id) {
             task.status = TaskStatus::Paused;
             self.storage.update_task_card(&task)?;
-            emit(&app, "task.status.changed", &task)?;
+            emit(&app, "task:status-changed", &task)?;
         }
         Ok(lease)
     }
 
-    pub fn resume_task_card(&self, app: AppHandle, task_card_id: &str) -> Result<TaskCard> {
+    pub fn resume_task_card<R: Runtime>(
+        &self,
+        app: AppHandle<R>,
+        task_card_id: &str,
+    ) -> Result<TaskCard> {
         let mut task = self.storage.get_task_card(task_card_id)?;
         task.status = TaskStatus::Leased;
         self.storage.update_task_card(&task)?;
@@ -463,20 +473,20 @@ impl AppService {
             lease.state = LeaseState::Active;
             lease.preempt_requested_at = None;
             self.storage.update_lease(&lease)?;
-            emit(&app, "lease.granted", &lease)?;
+            emit(&app, "lease:granted", &lease)?;
         }
-        emit(&app, "task.status.changed", &task)?;
+        emit(&app, "task:status-changed", &task)?;
         self.spawn_task_execution(app, task.id.clone(), None);
         Ok(task)
     }
 
-    fn preempt_active_leases(&self, app: &AppHandle, work_group_id: &str) -> Result<()> {
+    fn preempt_active_leases<R: Runtime>(&self, app: &AppHandle<R>, work_group_id: &str) -> Result<()> {
         let leases = self.storage.list_active_leases_for_group(work_group_id)?;
         for mut lease in leases {
             lease.state = LeaseState::PreemptRequested;
             lease.preempt_requested_at = Some(now());
             self.storage.update_lease(&lease)?;
-            emit(app, "lease.preempt_requested", &lease)?;
+            emit(app, "lease:preempt-requested", &lease)?;
             self.record_audit(
                 "lease.preempt_requested",
                 "lease",
@@ -670,9 +680,9 @@ impl AppService {
         Ok(())
     }
 
-    fn spawn_task_execution(
+    fn spawn_task_execution<R: Runtime>(
         &self,
-        app: AppHandle,
+        app: AppHandle<R>,
         task_card_id: String,
         tool_run_id: Option<String>,
     ) {
@@ -684,12 +694,12 @@ impl AppService {
             {
                 if let Ok(report) = service.handle_task_execution_failure(&task_card_id, &error) {
                     if let Some(task) = report.task {
-                        let _ = emit(&app, "task.status.changed", &task);
+                        let _ = emit(&app, "task:status-changed", &task);
                     }
                     for tool_run in report.cancelled_tool_runs {
-                        let _ = emit(&app, "tool.run.completed", &tool_run);
+                        let _ = emit(&app, "tool:run-completed", &tool_run);
                     }
-                    let _ = emit(&app, "audit.event.created", &report.audit_event);
+                    let _ = emit(&app, "audit:event-created", &report.audit_event);
                 }
             }
         });
@@ -757,9 +767,9 @@ impl AppService {
         })
     }
 
-    async fn run_task(
+    async fn run_task<R: Runtime>(
         &self,
-        app: AppHandle,
+        app: AppHandle<R>,
         task_card_id: &str,
         tool_run_id: Option<&str>,
     ) -> Result<()> {
@@ -774,7 +784,7 @@ impl AppService {
 
         task.status = TaskStatus::InProgress;
         self.storage.update_task_card(&task)?;
-        emit(&app, "task.status.changed", &task)?;
+        emit(&app, "task:status-changed", &task)?;
 
         let work_group = self.storage.get_work_group(&task.work_group_id)?;
         let owner_id = lease.owner_agent_id.clone();
@@ -791,7 +801,7 @@ impl AppService {
             tool_run.state = ToolRunState::Running;
             tool_run.started_at = Some(now());
             self.storage.insert_tool_run(&tool_run)?;
-            emit(&app, "tool.run.started", &tool_run)?;
+            emit(&app, "tool:run-started", &tool_run)?;
             self.tool_runtime.tool_by_id(&tool_run.tool_id)
         } else {
             self.tool_runtime
@@ -812,10 +822,11 @@ impl AppService {
                 content: format!("Executing tool '{}' for task '{}'.", tool.name, task.title),
                 mentions: vec![agent.id.clone()],
                 task_card_id: Some(task.id.clone()),
+                execution_mode: None,
                 created_at: now(),
             };
             self.storage.insert_message(&tool_call_message)?;
-            emit(&app, "chat.message.created", &tool_call_message)?;
+            emit(&app, "chat:message-created", &tool_call_message)?;
             self.record_audit(
                 "tool_run.started",
                 "task_card",
@@ -858,7 +869,7 @@ impl AppService {
             tool_run.finished_at = Some(now());
             tool_run.result_ref = execution.tool_output.clone();
             self.storage.insert_tool_run(&tool_run)?;
-            emit(&app, "tool.run.completed", &tool_run)?;
+            emit(&app, "tool:run-completed", &tool_run)?;
         }
 
         if let Some(tool_output) = execution.tool_output.clone() {
@@ -874,10 +885,11 @@ impl AppService {
                 content: tool_output.clone(),
                 mentions: vec![agent.id.clone()],
                 task_card_id: Some(task.id.clone()),
+                execution_mode: Some(execution.execution_mode.clone()),
                 created_at: now(),
             };
             self.storage.insert_message(&tool_result_message)?;
-            emit(&app, "chat.message.created", &tool_result_message)?;
+            emit(&app, "chat:message-created", &tool_result_message)?;
             self.record_audit(
                 "tool_run.completed",
                 "task_card",
@@ -898,10 +910,11 @@ impl AppService {
             content: execution.summary.clone(),
             mentions: vec![],
             task_card_id: Some(task.id.clone()),
+            execution_mode: Some(execution.execution_mode.clone()),
             created_at: now(),
         };
         self.storage.insert_message(&summary_message)?;
-        emit(&app, "chat.message.created", &summary_message)?;
+        emit(&app, "chat:message-created", &summary_message)?;
 
         let backstage_message = ConversationMessage {
             id: new_id(),
@@ -915,10 +928,11 @@ impl AppService {
             content: execution.backstage_notes.clone(),
             mentions: vec![],
             task_card_id: Some(task.id.clone()),
+            execution_mode: Some(execution.execution_mode.clone()),
             created_at: now(),
         };
         self.storage.insert_message(&backstage_message)?;
-        emit(&app, "chat.message.created", &backstage_message)?;
+        emit(&app, "chat:message-created", &backstage_message)?;
 
         self.storage.insert_memory_item(&MemoryItem {
             id: new_id(),
@@ -933,7 +947,7 @@ impl AppService {
         })?;
         emit(
             &app,
-            "memory.updated",
+            "memory:updated",
             &json!({ "agentId": agent.id, "taskCardId": task.id }),
         )?;
 
@@ -949,7 +963,7 @@ impl AppService {
         if !spawned_subtasks.is_empty() {
             task.status = TaskStatus::WaitingChildren;
             self.storage.update_task_card(&task)?;
-            emit(&app, "task.status.changed", &task)?;
+            emit(&app, "task:status-changed", &task)?;
             let waiting_message = ConversationMessage {
                 id: new_id(),
                 conversation_id: work_group.id.clone(),
@@ -966,10 +980,11 @@ impl AppService {
                 ),
                 mentions: vec![agent.id.clone()],
                 task_card_id: Some(task.id.clone()),
+                execution_mode: None,
                 created_at: now(),
             };
             self.storage.insert_message(&waiting_message)?;
-            emit(&app, "chat.message.created", &waiting_message)?;
+            emit(&app, "chat:message-created", &waiting_message)?;
             self.record_audit(
                 "task.waiting_children",
                 "task_card",
@@ -988,7 +1003,7 @@ impl AppService {
             self.storage.update_lease(&lease)?;
             task.status = TaskStatus::Paused;
             self.storage.update_task_card(&task)?;
-            emit(&app, "task.status.changed", &task)?;
+            emit(&app, "task:status-changed", &task)?;
             return Ok(());
         }
 
@@ -998,7 +1013,7 @@ impl AppService {
 
         task.status = TaskStatus::Completed;
         self.storage.update_task_card(&task)?;
-        emit(&app, "task.status.changed", &task)?;
+        emit(&app, "task:status-changed", &task)?;
         self.record_audit(
             "task.completed",
             "task_card",
@@ -1011,9 +1026,9 @@ impl AppService {
         Ok(())
     }
 
-    fn spawn_subtask(
+    fn spawn_subtask<R: Runtime>(
         &self,
-        app: &AppHandle,
+        app: &AppHandle<R>,
         parent_task: &TaskCard,
         owner_agent: &AgentProfile,
         content: &str,
@@ -1062,18 +1077,18 @@ impl AppService {
         })?;
         let selected_tool = claim_plan.requested_tool.clone();
         self.storage.insert_task_card(&claim_plan.task_card)?;
-        emit(app, "task.card.created", &claim_plan.task_card)?;
+        emit(app, "task:card-created", &claim_plan.task_card)?;
         for bid in &claim_plan.bids {
             self.storage.insert_claim_bid(bid)?;
-            emit(app, "claim.bid.submitted", bid)?;
+            emit(app, "claim:bid-submitted", bid)?;
         }
         for message in &claim_plan.coordinator_messages {
             self.storage.insert_message(message)?;
-            emit(app, "chat.message.created", message)?;
+            emit(app, "chat:message-created", message)?;
         }
         if let Some(ref lease) = claim_plan.lease {
             self.storage.insert_lease(lease)?;
-            emit(app, "lease.granted", lease)?;
+            emit(app, "lease:granted", lease)?;
         }
         if let Some(tool) = selected_tool {
             if let Some(ref lease) = claim_plan.lease {
@@ -1107,14 +1122,14 @@ impl AppService {
         Ok(Some(claim_plan.task_card))
     }
 
-    fn reconcile_parent_task(&self, app: &AppHandle, parent_id: &str) -> Result<()> {
+    fn reconcile_parent_task<R: Runtime>(&self, app: &AppHandle<R>, parent_id: &str) -> Result<()> {
         let parent_task_before = self.storage.get_task_card(parent_id)?;
         let child_tasks = self.storage.list_child_tasks(parent_id)?;
         if !self.reconcile_parent_task_state(parent_id)? {
             return Ok(());
         }
         let parent_task = self.storage.get_task_card(parent_id)?;
-        emit(app, "task.status.changed", &parent_task)?;
+        emit(app, "task:status-changed", &parent_task)?;
         let has_issue = matches!(parent_task.status, TaskStatus::NeedsReview);
 
         let status_message = ConversationMessage {
@@ -1139,11 +1154,12 @@ impl AppService {
             },
             mentions: vec![],
             task_card_id: Some(parent_task.id.clone()),
+            execution_mode: None,
             created_at: now(),
         };
         if parent_task_before.status != parent_task.status {
             self.storage.insert_message(&status_message)?;
-            emit(app, "chat.message.created", &status_message)?;
+            emit(app, "chat:message-created", &status_message)?;
         }
         self.record_audit(
             "task.parent_reconciled",
@@ -1238,7 +1254,7 @@ fn collect_allowed_tools(agents: &[AgentProfile]) -> Vec<String> {
     ids
 }
 
-fn emit<T: Serialize>(app: &AppHandle, event: &str, payload: &T) -> Result<()> {
+fn emit<R: Runtime, T: Serialize>(app: &AppHandle<R>, event: &str, payload: &T) -> Result<()> {
     app.emit(event, payload)
         .map_err(|error| anyhow!("failed to emit {event}: {error}"))
 }
@@ -1247,12 +1263,15 @@ fn emit<T: Serialize>(app: &AppHandle, event: &str, payload: &T) -> Result<()> {
 mod tests {
     use super::AppService;
     use crate::core::domain::{
-        new_id, now, Lease, LeaseState, TaskCard, TaskStatus, ToolRun, ToolRunState,
+        new_id, now, CreateAgentInput, CreateWorkGroupInput, Lease, LeaseState,
+        SendHumanMessageInput, TaskCard, TaskStatus, ToolRun, ToolRunState, WorkGroupKind,
     };
     use anyhow::anyhow;
     use std::{
         fs,
         path::PathBuf,
+        thread,
+        time::Duration,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1271,6 +1290,135 @@ mod tests {
         fs::create_dir_all(&data_root).expect("data");
         let service = AppService::new(workspace_root.clone(), data_root.clone()).expect("service");
         (service, workspace_root, data_root)
+    }
+
+    #[test]
+    fn minimal_group_flow_creates_task_lease_and_agent_summary() {
+        let (service, _, _) = setup_service();
+        let app = tauri::test::mock_app();
+        let app_handle = app.handle().clone();
+
+        let planner = service
+            .create_agent_profile(CreateAgentInput {
+                name: "Planner".into(),
+                avatar: "PL".into(),
+                role: "Planning Lead".into(),
+                objective: "Produce clear plans and summaries.".into(),
+                provider: "mock".into(),
+                model: "simulation".into(),
+                temperature: 0.2,
+                skill_ids: vec!["skill.builder".into()],
+                tool_ids: vec!["plan.summarize".into()],
+                max_parallel_runs: 2,
+                can_spawn_subtasks: true,
+            })
+            .expect("planner");
+        let reviewer = service
+            .create_agent_profile(CreateAgentInput {
+                name: "Reviewer2".into(),
+                avatar: "R2".into(),
+                role: "Review Lead".into(),
+                objective: "Review plans and keep answers concise.".into(),
+                provider: "mock".into(),
+                model: "simulation".into(),
+                temperature: 0.2,
+                skill_ids: vec!["skill.reviewer".into()],
+                tool_ids: vec!["plan.summarize".into()],
+                max_parallel_runs: 2,
+                can_spawn_subtasks: false,
+            })
+            .expect("reviewer");
+
+        let work_group = service
+            .create_work_group(CreateWorkGroupInput {
+                name: "Smoke Group".into(),
+                goal: "Validate the minimal task flow.".into(),
+                kind: WorkGroupKind::Persistent,
+                default_visibility: "summary".into(),
+                auto_archive: false,
+            })
+            .expect("group");
+        service
+            .add_agent_to_work_group(&work_group.id, &planner.id)
+            .expect("add planner");
+        service
+            .add_agent_to_work_group(&work_group.id, &reviewer.id)
+            .expect("add reviewer");
+
+        service
+            .send_human_message(
+                app_handle,
+                SendHumanMessageInput {
+                    work_group_id: work_group.id.clone(),
+                    content: "Please create a concise plan for launch readiness.".into(),
+                },
+            )
+            .expect("send message");
+
+        let task_id = (0..40)
+            .find_map(|_| {
+                let task = service
+                    .storage
+                    .list_task_cards(Some(&work_group.id))
+                    .expect("tasks")
+                    .into_iter()
+                    .find(|task| task.created_by == "human");
+                if let Some(task) = task {
+                    Some(task.id)
+                } else {
+                    thread::sleep(Duration::from_millis(50));
+                    None
+                }
+            })
+            .expect("task created");
+
+        let final_task = (0..80)
+            .find_map(|_| {
+                let task = service.storage.get_task_card(&task_id).expect("task");
+                if matches!(
+                    task.status,
+                    TaskStatus::Completed | TaskStatus::WaitingApproval | TaskStatus::NeedsReview
+                ) {
+                    Some(task)
+                } else {
+                    thread::sleep(Duration::from_millis(50));
+                    None
+                }
+            })
+            .expect("task reached terminal-ish state");
+
+        assert_eq!(final_task.status, TaskStatus::Completed);
+
+        let lease = service
+            .storage
+            .get_lease_by_task(&task_id)
+            .expect("lease query")
+            .expect("lease exists");
+        assert_eq!(lease.state, LeaseState::Released);
+
+        let bids = service
+            .storage
+            .list_claim_bids()
+            .expect("bids")
+            .into_iter()
+            .filter(|bid| bid.task_card_id == task_id)
+            .collect::<Vec<_>>();
+        assert!(!bids.is_empty(), "expected at least one claim bid");
+
+        let summary_messages = service
+            .storage
+            .list_messages_for_group(&work_group.id)
+            .expect("messages")
+            .into_iter()
+            .filter(|message| {
+                message.task_card_id.as_deref() == Some(task_id.as_str())
+                    && matches!(message.sender_kind, crate::core::domain::SenderKind::Agent)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !summary_messages.is_empty(),
+            "expected an agent summary message for the task"
+        );
     }
 
     #[test]

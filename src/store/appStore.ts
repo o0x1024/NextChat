@@ -77,6 +77,9 @@ const emptyState: DashboardState = {
       defaultLLMModel: "gpt-4o",
       defaultVLMProvider: "gemini",
       defaultVLMModel: "gemini-2.0-flash",
+      maskApiKeys: true,
+      enableAuditLog: true,
+      proxyUrl: "",
     },
   },
 };

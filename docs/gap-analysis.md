@@ -6,9 +6,9 @@
 
 | ID | 优先级 | 主题 | 当前状态 | 依赖 | 验收方式 |
 | --- | --- | --- | --- | --- | --- |
-| GA-01 | P0 | 修复编译和启动断点 | 未开始 | 无 | `cargo check`、`npm run build`、`tauri dev` |
-| GA-02 | P0 | 单群组最小闭环验收 | 未开始 | GA-01 | 手工 checklist 或自动化 smoke |
-| GA-03 | P0 | 单 Agent 执行能力收口 | 未开始 | GA-01 | provider 限制、降级提示、真实执行标识 |
+| GA-01 | P0 | 修复编译和启动断点 | 已完成 | 无 | `cargo check`、`npm run build`、`tauri dev` |
+| GA-02 | P0 | 单群组最小闭环验收 | 已完成 | GA-01 | 手工 checklist 或自动化 smoke |
+| GA-03 | P0 | 单 Agent 执行能力收口 | 已完成 | GA-01 | provider 限制、降级提示、真实执行标识 |
 | GA-04 | P1 | 独立权限模型 | 未开始 | GA-01, GA-03 | 授权拒绝测试、审计记录、UI 提示 |
 | GA-05 | P1 | skill 驱动工具裁剪 | 未开始 | GA-04 | skill 变更前后工具集合对比 |
 | GA-06 | P1 | memory 策略闭环 | 未开始 | GA-03 | memory 注入可见、读写规则生效 |
@@ -63,7 +63,7 @@
 
 ### P0-3 做实单 Agent 执行能力
 - 现状
-  - provider UI 多于实际后端能力，当前真正接入的只有 `openai`。
+  - provider UI 需要和运行时支持范围保持一致，避免未配置 provider 继续伪装成可用。
   - 没有可用模型时，会退回模板式 summary。
 - 任务
   - 明确首版只支持哪些 provider，并在 UI 中做真实限制。
@@ -72,6 +72,11 @@
 - 完成标准
   - 用户能明确知道某个 agent 当前是“真实模型执行”还是“降级执行”。
   - 未接通的 provider 不能在 UI 中伪装成可用。
+- 本轮已完成
+  - agent 创建/编辑弹窗现在只允许选择“运行时支持 + 已启用 + 已配置 API key + 有模型列表”的 provider。
+  - 不可用 provider 会显示明确原因，例如禁用、缺少 API key、运行时未支持、没有模型。
+  - 未满足条件时，创建/更新按钮会被禁用，避免继续制造“看起来可配、实际不可执行”的 agent。
+  - agent 执行后写入 `executionMode`，主聊天消息会直接标记“真实模型就绪 / 降级执行”，避免用户误判本次结果来自真实 LLM。
 
 ## P1：让 tools、permissions、skills 从字段变成真实约束
 

@@ -2,6 +2,7 @@ import { type ChangeEvent, type FormEvent, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type {
     AgentProfile,
+    AIProviderConfig,
     CreateAgentInput,
     SkillPack,
     SystemSettings,
@@ -33,6 +34,42 @@ const emptyForm: CreateAgentInput = {
     canSpawnSubtasks: true,
 };
 
+const supportedRigProviderTypes = new Set(["OpenAI", "Anthropic", "DeepSeek", "Gemini"]);
+
+type ProviderAvailability = {
+    provider: AIProviderConfig;
+    available: boolean;
+    reason: "disabled" | "missingApiKey" | "unsupported" | "noModels" | null;
+};
+
+function buildCreateForm(settings: SystemSettings): CreateAgentInput {
+    const preferredProvider = settings.providers.find(
+        (provider) =>
+            provider.id === settings.globalConfig.defaultLLMProvider &&
+            provider.enabled &&
+            supportedRigProviderTypes.has(provider.rigProviderType) &&
+            provider.models.length > 0 &&
+            provider.apiKey.trim().length > 0
+    );
+
+    const fallbackProvider = settings.providers.find(
+        (provider) =>
+            provider.enabled &&
+            supportedRigProviderTypes.has(provider.rigProviderType) &&
+            provider.models.length > 0 &&
+            provider.apiKey.trim().length > 0
+    );
+
+    const selectedProvider = preferredProvider ?? fallbackProvider;
+
+    return {
+        ...emptyForm,
+        provider: selectedProvider?.id ?? "",
+        model: selectedProvider?.defaultModel ?? selectedProvider?.models[0] ?? "",
+        temperature: selectedProvider?.temperature ?? emptyForm.temperature,
+    };
+}
+
 export function AgentManagement({
     agents,
     skills,
@@ -49,6 +86,47 @@ export function AgentManagement({
     const [form, setForm] = useState<CreateAgentInput>(emptyForm);
     const [search, setSearch] = useState("");
 
+    const providerAvailability = useMemo<ProviderAvailability[]>(
+        () =>
+            settings.providers.map((provider) => {
+                if (!provider.enabled) {
+                    return { provider, available: false, reason: "disabled" };
+                }
+
+                if (!supportedRigProviderTypes.has(provider.rigProviderType)) {
+                    return { provider, available: false, reason: "unsupported" };
+                }
+
+                if (provider.models.length === 0) {
+                    return { provider, available: false, reason: "noModels" };
+                }
+
+                if (provider.apiKey.trim().length === 0) {
+                    return { provider, available: false, reason: "missingApiKey" };
+                }
+
+                return { provider, available: true, reason: null };
+            }),
+        [settings.providers]
+    );
+
+    const providerAvailabilityById = useMemo(
+        () => new Map(providerAvailability.map((item) => [item.provider.id, item])),
+        [providerAvailability]
+    );
+
+    const selectedProviderInfo = providerAvailabilityById.get(form.provider) ?? null;
+    const selectedProvider = selectedProviderInfo?.provider ?? null;
+    const selectedProviderModels = selectedProvider?.models ?? [];
+    const hasCustomModel = form.model.trim().length > 0 && !selectedProviderModels.includes(form.model);
+    const canSubmit = Boolean(
+        form.name.trim() &&
+        form.role.trim() &&
+        form.provider.trim() &&
+        form.model.trim() &&
+        selectedProviderInfo?.available
+    );
+
     const filteredAgents = useMemo(() => {
         if (!search.trim()) return agents;
         const q = search.toLowerCase();
@@ -62,7 +140,7 @@ export function AgentManagement({
 
     function openCreate() {
         setEditingAgent(null);
-        setForm(emptyForm);
+        setForm(buildCreateForm(settings));
         setModalOpen(true);
     }
 
@@ -86,6 +164,9 @@ export function AgentManagement({
 
     async function handleSubmit(e: FormEvent<HTMLFormElement>) {
         e.preventDefault();
+        if (!canSubmit) {
+            return;
+        }
         if (editingAgent) {
             await onUpdateAgent({ id: editingAgent.id, ...form });
         } else {
@@ -105,6 +186,45 @@ export function AgentManagement({
 
     function toggleArrayItem(arr: string[], item: string): string[] {
         return arr.includes(item) ? arr.filter((i) => i !== item) : [...arr, item];
+    }
+
+    function providerReasonLabel(reason: ProviderAvailability["reason"]): string {
+        switch (reason) {
+            case "disabled":
+                return t("disabled");
+            case "missingApiKey":
+                return t("providerMissingApiKey");
+            case "unsupported":
+                return t("providerUnsupportedRuntime");
+            case "noModels":
+                return t("providerNoModels");
+            default:
+                return "";
+        }
+    }
+
+    function providerReasonHint(reason: ProviderAvailability["reason"]): string {
+        switch (reason) {
+            case "disabled":
+                return t("providerDisabledHint");
+            case "missingApiKey":
+                return t("providerMissingApiKeyHint");
+            case "unsupported":
+                return t("providerUnsupportedRuntimeHint");
+            case "noModels":
+                return t("providerNoModelsHint");
+            default:
+                return t("providerReadyHint");
+        }
+    }
+
+    function providerRuntimeLabel(providerId: string): string {
+        const providerInfo = providerAvailabilityById.get(providerId);
+        if (providerInfo?.available) {
+            return t("realModelReady");
+        }
+
+        return t("fallbackExecution");
     }
 
     return (
@@ -165,6 +285,17 @@ export function AgentManagement({
                                         <div className="flex items-center gap-1.5">
                                             <i className="fas fa-microchip text-[10px] opacity-40" />
                                             <span className="text-xs font-medium opacity-80">{agent.modelPolicy.model}</span>
+                                        </div>
+                                        <div className="mt-1">
+                                            <span
+                                                className={`badge badge-xs border-none ${providerAvailabilityById.get(agent.modelPolicy.provider)?.available
+                                                    ? "bg-success/10 text-success"
+                                                    : "bg-warning/10 text-warning"
+                                                    }`}
+                                                title={providerReasonHint(providerAvailabilityById.get(agent.modelPolicy.provider)?.reason ?? null)}
+                                            >
+                                                {providerRuntimeLabel(agent.modelPolicy.provider)}
+                                            </span>
                                         </div>
                                     </td>
                                     <td className="py-4 text-center">
@@ -306,14 +437,16 @@ export function AgentManagement({
                                                 setForm((f) => ({
                                                     ...f,
                                                     provider: e.target.value,
-                                                    model: provider?.defaultModel || ""
+                                                    model: provider?.defaultModel || provider?.models[0] || ""
                                                 }));
                                             }}
                                         >
                                             <option disabled value="">{t("selectProvider")}</option>
-                                            {settings.providers.filter(p => p.enabled).map((p) => (
-                                                <option key={p.id} value={p.id}>
-                                                    {p.name}
+                                            {providerAvailability.map(({ provider, available, reason }) => (
+                                                <option key={provider.id} value={provider.id} disabled={!available}>
+                                                    {available
+                                                        ? provider.name
+                                                        : `${provider.name} (${providerReasonLabel(reason)})`}
                                                 </option>
                                             ))}
                                         </select>
@@ -325,16 +458,27 @@ export function AgentManagement({
                                         <select
                                             className="select select-bordered select-sm w-full font-medium"
                                             value={form.model}
+                                            disabled={!selectedProviderInfo?.available}
                                             onChange={(e: ChangeEvent<HTMLSelectElement>) =>
                                                 setForm((f) => ({ ...f, model: e.target.value }))
                                             }
                                         >
-                                            {(settings.providers.find(p => p.id === form.provider)?.models || []).map(m => (
+                                            {selectedProviderModels.map(m => (
                                                 <option key={m} value={m}>{m}</option>
                                             ))}
-                                            <option value={form.model}>{form.model} (Custom)</option>
+                                            {hasCustomModel && <option value={form.model}>{form.model} (Custom)</option>}
                                         </select>
                                     </div>
+                                </div>
+                                <div
+                                    className={`rounded-xl border px-3 py-2 text-xs ${selectedProviderInfo?.available
+                                        ? "border-success/20 bg-success/5 text-success"
+                                        : "border-warning/20 bg-warning/10 text-warning"
+                                        }`}
+                                >
+                                    {selectedProviderInfo
+                                        ? providerReasonHint(selectedProviderInfo.reason)
+                                        : t("providerSelectionRequiredHint")}
                                 </div>
                                 <div className="form-control">
                                     <label className="label flex justify-between">
@@ -414,7 +558,7 @@ export function AgentManagement({
                                 <button className="btn btn-ghost" type="button" onClick={() => setModalOpen(false)}>
                                     {t("cancel")}
                                 </button>
-                                <button className="btn btn-primary px-8" type="submit">
+                                <button className="btn btn-primary px-8" type="submit" disabled={!canSubmit}>
                                     {editingAgent ? t("updateAgent") : t("createAgent")}
                                 </button>
                             </div>

@@ -167,6 +167,7 @@ function App() {
                 claimBids={claimBids}
                 toolRuns={toolRuns}
                 tools={tools}
+                settings={settings}
                 selectedWorkGroupId={selectedWorkGroupId}
                 language={language as Language}
                 backstageOpen={backstageOpen}

@@ -319,8 +319,8 @@ fn normalize_tool_input(args: &str) -> String {
 mod tests {
     use super::{allowed_rig_tools, normalize_tool_input};
     use crate::core::domain::{
-        AgentProfile, MemoryPolicy, ModelPolicy, TaskCard, TaskExecutionContext, TaskStatus,
-        ToolManifest, ToolRiskLevel, WorkGroup, WorkGroupKind,
+        AgentProfile, MemoryPolicy, ModelPolicy, SystemSettings, TaskCard, TaskExecutionContext,
+        TaskStatus, ToolManifest, ToolRiskLevel, WorkGroup, WorkGroupKind,
     };
 
     fn manifest(id: &str, risk_level: ToolRiskLevel) -> ToolManifest {
@@ -386,6 +386,7 @@ mod tests {
             ],
             available_skills: vec![],
             approved_tool,
+            settings: SystemSettings::default(),
         }
     }
 
