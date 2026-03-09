@@ -1,0 +1,39 @@
+[package]
+name = "nextchat-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Desktop-first multi-agent workspace built with Tauri v2."
+
+[lib]
+name = "nextchat_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0.6", features = [] }
+
+[dependencies]
+anyhow = "1.0.95"
+async-trait = "0.1.83"
+chrono = { version = "0.4.39", features = ["serde"] }
+once_cell = "1.20.2"
+regex = "1.11.1"
+reqwest = { version = "0.12.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+rig = { package = "rig-core", version = "0.32.0" }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+serde = { version = "1.0.216", features = ["derive"] }
+serde_json = "1.0.133"
+tauri = { version = "2.1.1", features = [] }
+tokio = { version = "1.42.0", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "process",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+uuid = { version = "1.11.0", features = ["serde", "v4"] }
+walkdir = "2.5.0"
