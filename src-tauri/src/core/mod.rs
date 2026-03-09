@@ -2,6 +2,7 @@ pub mod agent_runtime;
 pub mod coordinator;
 pub mod domain;
 pub mod llm_rig;
+pub mod logging;
 pub mod memory;
 pub mod permissions;
 pub mod rig_tools;

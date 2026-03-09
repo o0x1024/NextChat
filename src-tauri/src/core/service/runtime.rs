@@ -312,25 +312,25 @@ impl AppService {
             cancelled_tool_runs.push(tool_run);
         }
 
-        let message = if permission_guard_error {
-            task.as_ref().map(|current_task| ConversationMessage {
-                id: new_id(),
-                conversation_id: current_task.work_group_id.clone(),
-                work_group_id: current_task.work_group_id.clone(),
-                sender_kind: SenderKind::System,
-                sender_id: "coordinator".into(),
-                sender_name: "Coordinator".into(),
-                kind: MessageKind::Status,
-                visibility: Visibility::Main,
-                content: format!("Execution blocked by permission guard. {error_message}"),
-                mentions: vec![],
-                task_card_id: Some(current_task.id.clone()),
-                execution_mode: None,
-                created_at: now(),
-            })
-        } else {
-            None
-        };
+        let message = task.as_ref().map(|current_task| ConversationMessage {
+            id: new_id(),
+            conversation_id: current_task.work_group_id.clone(),
+            work_group_id: current_task.work_group_id.clone(),
+            sender_kind: SenderKind::System,
+            sender_id: "coordinator".into(),
+            sender_name: "Coordinator".into(),
+            kind: MessageKind::Status,
+            visibility: Visibility::Main,
+            content: if permission_guard_error {
+                format!("Execution blocked by permission guard. {error_message}")
+            } else {
+                format!("Task execution failed and was moved to review. {error_message}")
+            },
+            mentions: vec![],
+            task_card_id: Some(current_task.id.clone()),
+            execution_mode: None,
+            created_at: now(),
+        });
         if let Some(ref message) = message {
             self.storage.insert_message(message)?;
         }

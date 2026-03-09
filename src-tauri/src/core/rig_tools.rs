@@ -454,6 +454,9 @@ mod tests {
     #[test]
     fn rig_tool_name_is_sanitized_for_function_calling() {
         assert_eq!(sanitize_rig_tool_name("plan.summarize"), "plan_summarize");
-        assert_eq!(sanitize_rig_tool_name("browser/automation"), "browser_automation");
+        assert_eq!(
+            sanitize_rig_tool_name("browser/automation"),
+            "browser_automation"
+        );
     }
 }

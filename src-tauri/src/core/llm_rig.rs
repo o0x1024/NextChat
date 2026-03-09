@@ -2,17 +2,21 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use reqwest::Client;
 use rig::{
+    agent::{HookAction, PromptHook, ToolCallHookAction},
     client::CompletionClient,
-    completion::Prompt,
+    completion::{CompletionModel, CompletionResponse, Message, Prompt},
     providers::{anthropic, gemini, openai},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use uuid::Uuid;
 
 use crate::core::{
     domain::{
         AIProviderConfig, ModelPolicy, ModelProviderAdapter, SystemSettings, TaskExecutionContext,
         ToolHandler,
     },
+    logging,
     rig_tools::{build_rig_tools, RigToolCallLog, RigToolEvent},
 };
 
@@ -24,6 +28,135 @@ pub struct RigAgentResponse {
 
 #[derive(Debug, Clone, Default)]
 pub struct RigModelAdapter;
+
+#[derive(Debug, Clone)]
+struct LlmRequestLogContext {
+    session_id: String,
+    operation: String,
+    provider_id: String,
+    provider_type: String,
+    model: String,
+    base_url: String,
+    temperature: f64,
+    max_tokens: u64,
+    max_turns: usize,
+    agent_id: Option<String>,
+    agent_name: Option<String>,
+    task_card_id: Option<String>,
+    work_group_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LlmRequestHook {
+    context: LlmRequestLogContext,
+}
+
+impl LlmRequestHook {
+    fn log(&self, phase: &str, payload: serde_json::Value) {
+        logging::llm_event(&self.context.operation, phase, payload);
+    }
+
+    fn common_payload(&self) -> serde_json::Value {
+        json!({
+            "sessionId": self.context.session_id,
+            "providerId": self.context.provider_id,
+            "providerType": self.context.provider_type,
+            "model": self.context.model,
+            "baseUrl": self.context.base_url,
+            "temperature": self.context.temperature,
+            "maxTokens": self.context.max_tokens,
+            "maxTurns": self.context.max_turns,
+            "agentId": self.context.agent_id,
+            "agentName": self.context.agent_name,
+            "taskCardId": self.context.task_card_id,
+            "workGroupId": self.context.work_group_id,
+        })
+    }
+}
+
+impl<M> PromptHook<M> for LlmRequestHook
+where
+    M: CompletionModel,
+{
+    async fn on_completion_call(&self, prompt: &Message, history: &[Message]) -> HookAction {
+        self.log(
+            "completion_call",
+            merge_json(
+                self.common_payload(),
+                json!({
+                    "historyCount": history.len(),
+                    "prompt": serialize_for_log(prompt, 16_000),
+                }),
+            ),
+        );
+        HookAction::cont()
+    }
+
+    async fn on_completion_response(
+        &self,
+        _prompt: &Message,
+        response: &CompletionResponse<M::Response>,
+    ) -> HookAction {
+        self.log(
+            "completion_response",
+            merge_json(
+                self.common_payload(),
+                json!({
+                    "messageId": response.message_id,
+                    "usage": response.usage,
+                    "choice": serialize_for_log(&response.choice, 16_000),
+                }),
+            ),
+        );
+        HookAction::cont()
+    }
+
+    async fn on_tool_call(
+        &self,
+        tool_name: &str,
+        tool_call_id: Option<String>,
+        internal_call_id: &str,
+        args: &str,
+    ) -> ToolCallHookAction {
+        self.log(
+            "tool_call",
+            merge_json(
+                self.common_payload(),
+                json!({
+                    "toolName": tool_name,
+                    "toolCallId": tool_call_id,
+                    "internalCallId": internal_call_id,
+                    "args": logging::truncate(args, 8_000),
+                }),
+            ),
+        );
+        ToolCallHookAction::cont()
+    }
+
+    async fn on_tool_result(
+        &self,
+        tool_name: &str,
+        tool_call_id: Option<String>,
+        internal_call_id: &str,
+        args: &str,
+        result: &str,
+    ) -> HookAction {
+        self.log(
+            "tool_result",
+            merge_json(
+                self.common_payload(),
+                json!({
+                    "toolName": tool_name,
+                    "toolCallId": tool_call_id,
+                    "internalCallId": internal_call_id,
+                    "args": logging::truncate(args, 8_000),
+                    "result": logging::truncate(result, 12_000),
+                }),
+            ),
+        );
+        HookAction::cont()
+    }
+}
 
 fn normalized_openai_compatible_base_url(base_url: &str) -> Option<String> {
     let trimmed = base_url.trim().trim_end_matches('/');
@@ -127,6 +260,121 @@ where
         }
     }
     unique
+}
+
+fn max_turns_for_config(config: &AIProviderConfig) -> usize {
+    config.max_dialog_rounds.max(1) as usize
+}
+
+fn new_llm_log_context(
+    operation: &str,
+    config: &AIProviderConfig,
+    model: &str,
+    temperature: f64,
+    agent_id: Option<&str>,
+    agent_name: Option<&str>,
+    task_card_id: Option<&str>,
+    work_group_id: Option<&str>,
+) -> LlmRequestLogContext {
+    LlmRequestLogContext {
+        session_id: Uuid::new_v4().to_string(),
+        operation: operation.to_string(),
+        provider_id: config.id.clone(),
+        provider_type: config.rig_provider_type.clone(),
+        model: model.to_string(),
+        base_url: config.base_url.clone(),
+        temperature,
+        max_tokens: config.max_tokens as u64,
+        max_turns: max_turns_for_config(config),
+        agent_id: agent_id.map(ToOwned::to_owned),
+        agent_name: agent_name.map(ToOwned::to_owned),
+        task_card_id: task_card_id.map(ToOwned::to_owned),
+        work_group_id: work_group_id.map(ToOwned::to_owned),
+    }
+}
+
+fn serialize_for_log<T>(value: &T, max_chars: usize) -> String
+where
+    T: Serialize,
+{
+    match serde_json::to_string(value) {
+        Ok(serialized) => logging::truncate(&serialized, max_chars),
+        Err(error) => format!("<serialization_error: {error}>"),
+    }
+}
+
+fn merge_json(left: serde_json::Value, right: serde_json::Value) -> serde_json::Value {
+    match (left, right) {
+        (serde_json::Value::Object(mut left), serde_json::Value::Object(right)) => {
+            left.extend(right);
+            serde_json::Value::Object(left)
+        }
+        (_, right) => right,
+    }
+}
+
+fn log_llm_start(
+    context: &LlmRequestLogContext,
+    preamble: &str,
+    prompt: &str,
+    extra: serde_json::Value,
+) {
+    logging::llm_event(
+        &context.operation,
+        "request_start",
+        merge_json(
+            json!({
+                "sessionId": context.session_id,
+                "providerId": context.provider_id,
+                "providerType": context.provider_type,
+                "model": context.model,
+                "baseUrl": context.base_url,
+                "temperature": context.temperature,
+                "maxTokens": context.max_tokens,
+                "maxTurns": context.max_turns,
+                "agentId": context.agent_id,
+                "agentName": context.agent_name,
+                "taskCardId": context.task_card_id,
+                "workGroupId": context.work_group_id,
+                "preamble": logging::truncate(preamble, 8_000),
+                "prompt": logging::truncate(prompt, 16_000),
+            }),
+            extra,
+        ),
+    );
+}
+
+fn log_llm_skip(operation: &str, provider_id: &str, reason: &str) {
+    logging::warn(operation, reason);
+    logging::llm_event(
+        operation,
+        "skipped",
+        json!({
+            "providerId": provider_id,
+            "reason": reason,
+        }),
+    );
+}
+
+fn log_llm_error<E>(context: &LlmRequestLogContext, error: &E)
+where
+    E: std::fmt::Display,
+{
+    let message = error.to_string();
+    logging::error(&context.operation, &message);
+    logging::llm_event(
+        &context.operation,
+        "request_error",
+        json!({
+            "sessionId": context.session_id,
+            "providerId": context.provider_id,
+            "providerType": context.provider_type,
+            "model": context.model,
+            "taskCardId": context.task_card_id,
+            "agentId": context.agent_id,
+            "error": message,
+        }),
+    );
 }
 
 async fn parse_json_response<T>(response: reqwest::Response) -> Result<T>
@@ -243,23 +491,73 @@ async fn fetch_gemini_models(config: &AIProviderConfig) -> Result<Vec<String>> {
 }
 
 pub async fn refresh_models(config: &AIProviderConfig) -> Result<Vec<String>> {
-    let models = match config.rig_provider_type.as_str() {
-        "OpenAI" | "DeepSeek" | "Groq" => fetch_openai_compatible_models(config).await?,
-        "Anthropic" => fetch_anthropic_models(config).await?,
-        "Gemini" => fetch_gemini_models(config).await?,
-        _ => {
-            return Err(anyhow!(
+    logging::llm_event(
+        "llm.refresh_models",
+        "request_start",
+        json!({
+            "providerId": config.id,
+            "providerType": config.rig_provider_type,
+            "baseUrl": config.base_url,
+        }),
+    );
+
+    let result = async {
+        match config.rig_provider_type.as_str() {
+            "OpenAI" | "DeepSeek" | "Groq" => fetch_openai_compatible_models(config).await,
+            "Anthropic" => fetch_anthropic_models(config).await,
+            "Gemini" => fetch_gemini_models(config).await,
+            _ => Err(anyhow!(
                 "Unsupported provider type for model refresh: {}",
                 config.rig_provider_type
-            ));
+            )),
+        }
+    }
+    .await;
+
+    let result = match result {
+        Ok(models) => models,
+        Err(error) => {
+            logging::error("llm.refresh_models", error.to_string());
+            logging::llm_event(
+                "llm.refresh_models",
+                "request_error",
+                json!({
+                    "providerId": config.id,
+                    "providerType": config.rig_provider_type,
+                    "error": error.to_string(),
+                }),
+            );
+            return Err(error);
         }
     };
 
-    if models.is_empty() {
-        return Err(anyhow!("No models were returned by the provider"));
+    if result.is_empty() {
+        let error = anyhow!("No models were returned by the provider");
+        logging::error("llm.refresh_models", error.to_string());
+        logging::llm_event(
+            "llm.refresh_models",
+            "request_error",
+            json!({
+                "providerId": config.id,
+                "providerType": config.rig_provider_type,
+                "error": error.to_string(),
+            }),
+        );
+        return Err(error);
     }
 
-    Ok(models)
+    logging::llm_event(
+        "llm.refresh_models",
+        "request_success",
+        json!({
+            "providerId": config.id,
+            "providerType": config.rig_provider_type,
+            "modelCount": result.len(),
+            "models": result.clone(),
+        }),
+    );
+
+    Ok(result)
 }
 
 pub async fn complete_task_with_tools<TTool>(
@@ -280,50 +578,120 @@ where
 
     let config = match config {
         Some(c) if c.enabled && !c.api_key.is_empty() => c,
-        _ => return Ok(None),
+        _ => {
+            log_llm_skip(
+                "llm.complete_task_with_tools",
+                provider_id,
+                "Skipped tool-capable LLM request because provider is missing, disabled, or has no API key",
+            );
+            return Ok(None);
+        }
     };
+
+    let log_context = new_llm_log_context(
+        "llm.complete_task_with_tools",
+        config,
+        &context.agent.model_policy.model,
+        context.agent.model_policy.temperature,
+        Some(&context.agent.id),
+        Some(&context.agent.name),
+        Some(&context.task_card.id),
+        Some(&context.work_group.id),
+    );
+    log_llm_start(
+        &log_context,
+        preamble,
+        prompt,
+        json!({
+            "toolCount": context.available_tools.len(),
+            "skillCount": context.available_skills.len(),
+        }),
+    );
 
     let call_log = RigToolCallLog::new();
     let tools = build_rig_tools(context, tool_handler, call_log.clone());
-
-    let (summary, tool_events) = match config.rig_provider_type.as_str() {
-        "OpenAI" | "DeepSeek" => {
-            let client = openai_compatible_client(config)?;
-
-            let agent = client
-                .agent(&context.agent.model_policy.model)
-                .preamble(preamble)
-                .temperature(context.agent.model_policy.temperature)
-                .max_tokens(config.max_tokens as u64)
-                .tools(tools)
-                .build();
-
-            (agent.prompt(prompt).await?, call_log.snapshot())
-        }
-        "Anthropic" => {
-            let client = anthropic::Client::new(&config.api_key)?;
-            let agent = client
-                .agent(&context.agent.model_policy.model)
-                .preamble(preamble)
-                .temperature(context.agent.model_policy.temperature)
-                .max_tokens(config.max_tokens as u64)
-                .tools(tools)
-                .build();
-            (agent.prompt(prompt).await?, call_log.snapshot())
-        }
-        "Gemini" => {
-            let client = gemini::Client::new(&config.api_key)?;
-            let agent = client
-                .agent(&context.agent.model_policy.model)
-                .preamble(preamble)
-                .temperature(context.agent.model_policy.temperature)
-                .max_tokens(config.max_tokens as u64)
-                .tools(tools)
-                .build();
-            (agent.prompt(prompt).await?, call_log.snapshot())
-        }
-        _ => return Ok(None),
+    let hook = LlmRequestHook {
+        context: log_context.clone(),
     };
+
+    let result = async {
+        match config.rig_provider_type.as_str() {
+            "OpenAI" | "DeepSeek" => {
+                let client = openai_compatible_client(config)?;
+
+                let agent = client
+                    .agent(&context.agent.model_policy.model)
+                    .preamble(preamble)
+                    .default_max_turns(max_turns_for_config(config))
+                    .temperature(context.agent.model_policy.temperature)
+                    .max_tokens(config.max_tokens as u64)
+                    .tools(tools)
+                    .build();
+
+                Ok::<_, anyhow::Error>((
+                    agent.prompt(prompt).with_hook(hook.clone()).await?,
+                    call_log.snapshot(),
+                ))
+            }
+            "Anthropic" => {
+                let client = anthropic::Client::new(&config.api_key)?;
+                let agent = client
+                    .agent(&context.agent.model_policy.model)
+                    .preamble(preamble)
+                    .default_max_turns(max_turns_for_config(config))
+                    .temperature(context.agent.model_policy.temperature)
+                    .max_tokens(config.max_tokens as u64)
+                    .tools(tools)
+                    .build();
+                Ok::<_, anyhow::Error>((
+                    agent.prompt(prompt).with_hook(hook.clone()).await?,
+                    call_log.snapshot(),
+                ))
+            }
+            "Gemini" => {
+                let client = gemini::Client::new(&config.api_key)?;
+                let agent = client
+                    .agent(&context.agent.model_policy.model)
+                    .preamble(preamble)
+                    .default_max_turns(max_turns_for_config(config))
+                    .temperature(context.agent.model_policy.temperature)
+                    .max_tokens(config.max_tokens as u64)
+                    .tools(tools)
+                    .build();
+                Ok::<_, anyhow::Error>((
+                    agent.prompt(prompt).with_hook(hook).await?,
+                    call_log.snapshot(),
+                ))
+            }
+            _ => Err(anyhow!(
+                "Unsupported provider type '{}' for tool-capable LLM request",
+                config.rig_provider_type
+            )),
+        }
+    }
+    .await;
+
+    let (summary, tool_events) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            log_llm_error(&log_context, &error);
+            return Err(error);
+        }
+    };
+
+    logging::llm_event(
+        "llm.complete_task_with_tools",
+        "request_success",
+        json!({
+            "sessionId": log_context.session_id,
+            "providerId": log_context.provider_id,
+            "providerType": log_context.provider_type,
+            "model": log_context.model,
+            "taskCardId": log_context.task_card_id,
+            "toolEventCount": tool_events.len(),
+            "summary": logging::truncate(&summary, 12_000),
+        }),
+    );
 
     Ok(Some(RigAgentResponse {
         summary,
@@ -345,78 +713,179 @@ impl ModelProviderAdapter for RigModelAdapter {
 
         let config = match config {
             Some(c) if c.enabled && !c.api_key.is_empty() => c,
-            _ => return Ok(None),
+            _ => {
+                log_llm_skip(
+                    "llm.complete",
+                    provider_id,
+                    "Skipped LLM completion because provider is missing, disabled, or has no API key",
+                );
+                return Ok(None);
+            }
         };
 
-        let summary = match config.rig_provider_type.as_str() {
-            "OpenAI" | "DeepSeek" => {
-                let client = openai_compatible_client(config)?;
+        let log_context = new_llm_log_context(
+            "llm.complete",
+            config,
+            &policy.model,
+            policy.temperature,
+            None,
+            None,
+            None,
+            None,
+        );
+        log_llm_start(&log_context, preamble, prompt, json!({}));
 
-                let agent = client
-                    .agent(&policy.model)
-                    .preamble(preamble)
-                    .temperature(policy.temperature)
-                    .max_tokens(config.max_tokens as u64)
-                    .build();
-
-                agent.prompt(prompt).await?
-            }
-            "Anthropic" => {
-                let client = anthropic::Client::new(&config.api_key)?;
-                let agent = client
-                    .agent(&policy.model)
-                    .preamble(preamble)
-                    .temperature(policy.temperature)
-                    .max_tokens(config.max_tokens as u64)
-                    .build();
-                agent.prompt(prompt).await?
-            }
-            "Gemini" => {
-                let client = gemini::Client::new(&config.api_key)?;
-                let agent = client
-                    .agent(&policy.model)
-                    .preamble(preamble)
-                    .temperature(policy.temperature)
-                    .max_tokens(config.max_tokens as u64)
-                    .build();
-                agent.prompt(prompt).await?
-            }
-            _ => return Ok(None),
+        let hook = LlmRequestHook {
+            context: log_context.clone(),
         };
+
+        let result = async {
+            match config.rig_provider_type.as_str() {
+                "OpenAI" | "DeepSeek" => {
+                    let client = openai_compatible_client(config)?;
+
+                    let agent = client
+                        .agent(&policy.model)
+                        .preamble(preamble)
+                        .default_max_turns(max_turns_for_config(config))
+                        .temperature(policy.temperature)
+                        .max_tokens(config.max_tokens as u64)
+                        .build();
+
+                    Ok::<_, anyhow::Error>(agent.prompt(prompt).with_hook(hook.clone()).await?)
+                }
+                "Anthropic" => {
+                    let client = anthropic::Client::new(&config.api_key)?;
+                    let agent = client
+                        .agent(&policy.model)
+                        .preamble(preamble)
+                        .default_max_turns(max_turns_for_config(config))
+                        .temperature(policy.temperature)
+                        .max_tokens(config.max_tokens as u64)
+                        .build();
+                    Ok::<_, anyhow::Error>(agent.prompt(prompt).with_hook(hook.clone()).await?)
+                }
+                "Gemini" => {
+                    let client = gemini::Client::new(&config.api_key)?;
+                    let agent = client
+                        .agent(&policy.model)
+                        .preamble(preamble)
+                        .default_max_turns(max_turns_for_config(config))
+                        .temperature(policy.temperature)
+                        .max_tokens(config.max_tokens as u64)
+                        .build();
+                    Ok::<_, anyhow::Error>(agent.prompt(prompt).with_hook(hook).await?)
+                }
+                _ => Err(anyhow!(
+                    "Unsupported provider type '{}' for LLM completion",
+                    config.rig_provider_type
+                )),
+            }
+        }
+        .await;
+
+        let summary = match result {
+            Ok(summary) => summary,
+            Err(error) => {
+                log_llm_error(&log_context, &error);
+                return Err(error);
+            }
+        };
+
+        logging::llm_event(
+            "llm.complete",
+            "request_success",
+            json!({
+                "sessionId": log_context.session_id,
+                "providerId": log_context.provider_id,
+                "providerType": log_context.provider_type,
+                "model": log_context.model,
+                "summary": logging::truncate(&summary, 12_000),
+            }),
+        );
 
         Ok(Some(summary))
     }
 }
 
 pub async fn test_connection(config: &AIProviderConfig) -> Result<()> {
-    match config.rig_provider_type.as_str() {
-        "OpenAI" | "DeepSeek" => {
-            let client = openai_compatible_client(config)?;
-            let agent = client.agent(&config.default_model).max_tokens(1).build();
-            agent.prompt("ping").await?;
+    let log_context = new_llm_log_context(
+        "llm.test_connection",
+        config,
+        &config.default_model,
+        config.temperature,
+        None,
+        None,
+        None,
+        None,
+    );
+    log_llm_start(&log_context, "", "ping", json!({}));
+
+    let hook = LlmRequestHook {
+        context: log_context.clone(),
+    };
+
+    let result = async {
+        match config.rig_provider_type.as_str() {
+            "OpenAI" | "DeepSeek" => {
+                let client = openai_compatible_client(config)?;
+                let agent = client.agent(&config.default_model).max_tokens(1).build();
+                Ok::<_, anyhow::Error>(
+                    agent
+                        .prompt("ping")
+                        .with_hook(hook.clone())
+                        .await
+                        .map(|_| ())?,
+                )
+            }
+            "Anthropic" => {
+                let client = anthropic::Client::new(&config.api_key)?;
+                let agent = client.agent(&config.default_model).max_tokens(1).build();
+                Ok::<_, anyhow::Error>(
+                    agent
+                        .prompt("ping")
+                        .with_hook(hook.clone())
+                        .await
+                        .map(|_| ())?,
+                )
+            }
+            "Gemini" => {
+                let client = gemini::Client::new(&config.api_key)?;
+                let agent = client.agent(&config.default_model).max_tokens(1).build();
+                Ok::<_, anyhow::Error>(agent.prompt("ping").with_hook(hook).await.map(|_| ())?)
+            }
+            _ => Err(anyhow!("Unsupported provider type for connection test")),
+        }
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            logging::llm_event(
+                "llm.test_connection",
+                "request_success",
+                json!({
+                    "sessionId": log_context.session_id,
+                    "providerId": log_context.provider_id,
+                    "providerType": log_context.provider_type,
+                    "model": log_context.model,
+                }),
+            );
             Ok(())
         }
-        "Anthropic" => {
-            let client = anthropic::Client::new(&config.api_key)?;
-            let agent = client.agent(&config.default_model).max_tokens(1).build();
-            agent.prompt("ping").await?;
-            Ok(())
+        Err(error) => {
+            log_llm_error(&log_context, &error);
+            Err(error)
         }
-        "Gemini" => {
-            let client = gemini::Client::new(&config.api_key)?;
-            let agent = client.agent(&config.default_model).max_tokens(1).build();
-            agent.prompt("ping").await?;
-            Ok(())
-        }
-        _ => Err(anyhow::anyhow!(
-            "Unsupported provider type for connection test"
-        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{normalized_openai_compatible_base_url, openai_compatible_api_base_url};
+    use super::{
+        max_turns_for_config, normalized_openai_compatible_base_url, openai_compatible_api_base_url,
+    };
+    use crate::core::domain::AIProviderConfig;
 
     #[test]
     fn strips_trailing_v1_for_openai_compatible_providers() {
@@ -448,5 +917,15 @@ mod tests {
             openai_compatible_api_base_url("https://api.groq.com/openai/v1"),
             "https://api.groq.com/openai/v1"
         );
+    }
+
+    #[test]
+    fn max_turns_falls_back_to_one_when_config_is_non_positive() {
+        let mut config = AIProviderConfig::default();
+        config.max_dialog_rounds = 420;
+        assert_eq!(max_turns_for_config(&config), 420);
+
+        config.max_dialog_rounds = 0;
+        assert_eq!(max_turns_for_config(&config), 1);
     }
 }
