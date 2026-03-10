@@ -1,5 +1,6 @@
 mod bids;
 mod memory;
+mod work_groups;
 
 use std::{fs, path::PathBuf};
 
@@ -60,6 +61,7 @@ impl Storage {
                   kind TEXT NOT NULL,
                   name TEXT NOT NULL,
                   goal TEXT NOT NULL,
+                  working_directory TEXT NOT NULL,
                   member_agent_ids TEXT NOT NULL,
                   default_visibility TEXT NOT NULL,
                   auto_archive INTEGER NOT NULL,
@@ -169,6 +171,13 @@ impl Storage {
             ensure_column(conn, "messages", "execution_mode", "TEXT")?;
             ensure_column(conn, "agents", "permission_policy", "TEXT")?;
             ensure_column(conn, "claim_bids", "score_breakdown", "TEXT")?;
+            ensure_column(
+                conn,
+                "work_groups",
+                "working_directory",
+                "TEXT NOT NULL DEFAULT '.'",
+            )?;
+            ensure_column(conn, "work_groups", "owner_agent_id", "TEXT")?;
             conn.execute(
                 "UPDATE agents SET permission_policy = ?1 WHERE permission_policy IS NULL",
                 params![json(&AgentPermissionPolicy::default())?],
@@ -177,6 +186,39 @@ impl Storage {
                 "UPDATE claim_bids SET score_breakdown = ?1 WHERE score_breakdown IS NULL",
                 params![json(&crate::core::domain::ClaimScoreBreakdown::default())?],
             )?;
+            conn.execute(
+                "UPDATE work_groups SET working_directory = '.' WHERE working_directory IS NULL OR trim(working_directory) = ''",
+                [],
+            )?;
+            {
+                let mut stmt =
+                    conn.prepare("SELECT id, owner_agent_id, member_agent_ids FROM work_groups")?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (group_id, owner_agent_id, member_agent_ids) = row?;
+                    if owner_agent_id
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|value| !value.is_empty())
+                    {
+                        continue;
+                    }
+                    let members: Vec<String> = decode(member_agent_ids)?;
+                    let Some(first_member) = members.first() else {
+                        continue;
+                    };
+                    conn.execute(
+                        "UPDATE work_groups SET owner_agent_id = ?1 WHERE id = ?2",
+                        params![first_member, group_id],
+                    )?;
+                }
+            }
             Ok(())
         })
     }
@@ -198,9 +240,11 @@ impl Storage {
                     "Map the problem space, gather context, and keep the team aligned on evidence.",
                     vec!["skill.research".to_string()],
                     vec![
-                        "project.search".to_string(),
-                        "http.request".to_string(),
-                        "plan.summarize".to_string(),
+                        "Grep".to_string(),
+                        "WebSearch".to_string(),
+                        "WebFetch".to_string(),
+                        "Read".to_string(),
+                        "Task".to_string(),
                     ],
                 ),
                 (
@@ -210,11 +254,15 @@ impl Storage {
                     "Turn task cards into executable changes, plans, and runnable artifacts.",
                     vec!["skill.builder".to_string()],
                     vec![
-                        "file.readwrite".to_string(),
-                        "project.search".to_string(),
-                        "shell.exec".to_string(),
-                        "markdown.compose".to_string(),
-                        "plan.summarize".to_string(),
+                        "Read".to_string(),
+                        "Edit".to_string(),
+                        "Write".to_string(),
+                        "MultiEdit".to_string(),
+                        "Grep".to_string(),
+                        "Glob".to_string(),
+                        "Bash".to_string(),
+                        "TodoWrite".to_string(),
+                        "ExitPlanMode".to_string(),
                     ],
                 ),
                 (
@@ -224,9 +272,10 @@ impl Storage {
                     "Stress test proposals, spot regressions, and keep the bar high.",
                     vec!["skill.reviewer".to_string()],
                     vec![
-                        "project.search".to_string(),
-                        "markdown.compose".to_string(),
-                        "plan.summarize".to_string(),
+                        "Read".to_string(),
+                        "Grep".to_string(),
+                        "LS".to_string(),
+                        "TodoWrite".to_string(),
                     ],
                 ),
             ];
@@ -264,15 +313,17 @@ impl Storage {
             conn.execute(
                 r#"
                 INSERT INTO work_groups (
-                  id, kind, name, goal, member_agent_ids, default_visibility, auto_archive, created_at, archived_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
+                  id, kind, name, goal, working_directory, member_agent_ids, owner_agent_id, default_visibility, auto_archive, created_at, archived_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)
                 "#,
                 params![
                     work_group_id,
                     json(&WorkGroupKind::Persistent)?,
                     "Launch Deck",
                     "Coordinate product planning, implementation, and review work in one room.",
+                    ".",
                     json(&agent_ids)?,
+                    agent_ids.first().cloned(),
                     "summary",
                     0_i64,
                     created_at,
@@ -395,20 +446,31 @@ impl Storage {
 
     pub fn delete_agent(&self, agent_id: &str) -> Result<()> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT id, member_agent_ids FROM work_groups")?;
+            let mut stmt =
+                conn.prepare("SELECT id, owner_agent_id, member_agent_ids FROM work_groups")?;
             let group_rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })?;
 
             for group_row in group_rows {
-                let (group_id, member_agent_ids) = group_row?;
+                let (group_id, owner_agent_id, member_agent_ids) = group_row?;
                 let mut members: Vec<String> = decode(member_agent_ids)?;
                 let original_len = members.len();
                 members.retain(|member_id| member_id != agent_id);
-                if members.len() != original_len {
+                let mut next_owner = owner_agent_id;
+                let mut owner_changed = false;
+                if next_owner.as_deref() == Some(agent_id) {
+                    next_owner = members.first().cloned();
+                    owner_changed = true;
+                }
+                if members.len() != original_len || owner_changed {
                     conn.execute(
-                        "UPDATE work_groups SET member_agent_ids = ?1 WHERE id = ?2",
-                        params![json(&members)?, group_id],
+                        "UPDATE work_groups SET member_agent_ids = ?1, owner_agent_id = ?2 WHERE id = ?3",
+                        params![json(&members)?, next_owner, group_id],
                     )?;
                 }
             }
@@ -419,73 +481,6 @@ impl Storage {
             }
             Ok(())
         })
-    }
-
-    pub fn insert_work_group(&self, work_group: &WorkGroup) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"
-                INSERT OR REPLACE INTO work_groups (
-                  id, kind, name, goal, member_agent_ids, default_visibility, auto_archive, created_at, archived_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                "#,
-                params![
-                    work_group.id,
-                    json(&work_group.kind)?,
-                    work_group.name,
-                    work_group.goal,
-                    json(&work_group.member_agent_ids)?,
-                    work_group.default_visibility,
-                    bool_to_i64(work_group.auto_archive),
-                    work_group.created_at,
-                    work_group.archived_at,
-                ],
-            )?;
-            Ok(())
-        })
-    }
-
-    pub fn list_work_groups(&self) -> Result<Vec<WorkGroup>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT * FROM work_groups ORDER BY created_at ASC")?;
-            let rows = stmt.query_map([], map_work_group)?;
-            collect_rows(rows)
-        })
-    }
-
-    pub fn get_work_group(&self, work_group_id: &str) -> Result<WorkGroup> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                "SELECT * FROM work_groups WHERE id = ?1",
-                params![work_group_id],
-                map_work_group,
-            )
-            .context("work group not found")
-        })
-    }
-
-    pub fn add_agent_to_work_group(
-        &self,
-        work_group_id: &str,
-        agent_id: &str,
-    ) -> Result<WorkGroup> {
-        let mut group = self.get_work_group(work_group_id)?;
-        if !group.member_agent_ids.contains(&agent_id.to_string()) {
-            group.member_agent_ids.push(agent_id.to_string());
-            self.insert_work_group(&group)?;
-        }
-        Ok(group)
-    }
-
-    pub fn remove_agent_from_work_group(
-        &self,
-        work_group_id: &str,
-        agent_id: &str,
-    ) -> Result<WorkGroup> {
-        let mut group = self.get_work_group(work_group_id)?;
-        group.member_agent_ids.retain(|current| current != agent_id);
-        self.insert_work_group(&group)?;
-        Ok(group)
     }
 
     pub fn insert_message(&self, message: &ConversationMessage) -> Result<()> {
@@ -813,10 +808,19 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str)
     let columns = collect_rows(rows)?;
 
     if !columns.iter().any(|existing| existing == column) {
-        conn.execute(
+        if let Err(error) = conn.execute(
             &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
             [],
-        )?;
+        ) {
+            let duplicate_column = matches!(
+                &error,
+                rusqlite::Error::SqliteFailure(_, Some(message))
+                    if message.contains("duplicate column name")
+            );
+            if !duplicate_column {
+                return Err(error.into());
+            }
+        }
     }
 
     Ok(())
@@ -870,6 +874,7 @@ fn map_work_group(row: &Row<'_>) -> rusqlite::Result<WorkGroup> {
         kind: decode(row.get("kind")?)?,
         name: row.get("name")?,
         goal: row.get("goal")?,
+        working_directory: row.get("working_directory")?,
         member_agent_ids: decode(row.get("member_agent_ids")?)?,
         default_visibility: row.get("default_visibility")?,
         auto_archive: row.get::<_, i64>("auto_archive")? == 1,

@@ -4,7 +4,7 @@ use tauri::{AppHandle, Runtime};
 
 use super::{emit, AppService};
 use crate::core::domain::{
-    new_id, now, AgentProfile, MemoryItem, MemoryScope, TaskCard, WorkGroup,
+    new_id, now, AgentProfile, ConversationMessage, MemoryItem, MemoryScope, TaskCard, WorkGroup,
 };
 use crate::core::memory::{
     build_memory_snapshot, memory_context_for_task, scope_key, writable_scope_enabled,
@@ -12,6 +12,73 @@ use crate::core::memory::{
 };
 
 impl AppService {
+    pub(super) fn seed_work_group_memory(
+        &self,
+        work_group: &WorkGroup,
+        owner: &AgentProfile,
+    ) -> Result<()> {
+        let content = format!(
+            "群聊协作章程\n- 群主: {}\n- 群目标: {}\n- 机制: 群主先拆解任务，再组织成员并行执行，最后汇总交付。",
+            owner.name,
+            if work_group.goal.trim().is_empty() {
+                "待补充"
+            } else {
+                work_group.goal.trim()
+            }
+        );
+        self.storage.insert_memory_item(&MemoryItem {
+            id: new_id(),
+            scope: MemoryScope::WorkGroup,
+            scope_id: work_group.id.clone(),
+            content,
+            tags: vec![
+                "group_charter".into(),
+                "owner".into(),
+                "coordination".into(),
+            ],
+            embedding_ref: None,
+            pinned: true,
+            ttl: None,
+            created_at: now(),
+        })?;
+        Ok(())
+    }
+
+    pub(super) fn remember_human_directive<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        message: &ConversationMessage,
+    ) -> Result<()> {
+        let memory = MemoryItem {
+            id: new_id(),
+            scope: MemoryScope::WorkGroup,
+            scope_id: message.work_group_id.clone(),
+            content: summarize_human_directive(&message.content),
+            tags: vec!["human".into(), "directive".into(), "chat_memory".into()],
+            embedding_ref: None,
+            pinned: false,
+            ttl: Some(14 * 24 * 60 * 60),
+            created_at: now(),
+        };
+        self.storage.insert_memory_item(&memory)?;
+        emit(
+            app,
+            "memory:updated",
+            &json!({
+                "workGroupId": message.work_group_id,
+                "memoryId": memory.id,
+                "source": "human_directive",
+            }),
+        )?;
+        self.record_audit(
+            "memory.human_directive_recorded",
+            "work_group",
+            &message.work_group_id,
+            json!({ "messageId": message.id }),
+        )?;
+        Ok(())
+    }
+
     pub(super) fn load_memory_context(
         &self,
         agent: &AgentProfile,
@@ -116,4 +183,14 @@ impl AppService {
 
         Ok(())
     }
+}
+
+fn summarize_human_directive(content: &str) -> String {
+    let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return "Human directive: (empty)".to_string();
+    }
+    let truncated = trimmed.chars().take(280).collect::<String>();
+    format!("Human directive: {truncated}")
 }

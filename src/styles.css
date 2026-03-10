@@ -3,3 +3,52 @@
 @plugin "daisyui" {
     themes: all;
 }
+
+.chat-markdown {
+    overflow-wrap: anywhere;
+}
+
+.chat-markdown > :first-child {
+    margin-top: 0;
+}
+
+.chat-markdown > :last-child {
+    margin-bottom: 0;
+}
+
+.chat-markdown p,
+.chat-markdown ul,
+.chat-markdown ol,
+.chat-markdown blockquote,
+.chat-markdown pre,
+.chat-markdown table,
+.chat-markdown hr {
+    margin: 0.5rem 0;
+}
+
+.chat-markdown ul,
+.chat-markdown ol {
+    padding-left: 1.25rem;
+}
+
+.chat-markdown blockquote {
+    border-left: 3px solid color-mix(in srgb, currentColor 18%, transparent);
+    opacity: 0.9;
+    padding-left: 0.75rem;
+}
+
+.chat-markdown table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+    font-size: 0.875rem;
+}
+
+.chat-markdown th,
+.chat-markdown td {
+    border: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+    padding: 0.35rem 0.6rem;
+    text-align: left;
+    vertical-align: top;
+}

@@ -9,7 +9,9 @@ use serde_json::{json, Value};
 
 use crate::core::domain::{
     TaskExecutionContext, ToolExecutionRequest, ToolHandler, ToolManifest, ToolRiskLevel,
+    ToolStreamChunk,
 };
+use tokio::sync::mpsc::UnboundedSender;
 
 fn sanitize_rig_tool_name(tool_id: &str) -> String {
     let mut sanitized = String::with_capacity(tool_id.len());
@@ -82,8 +84,10 @@ pub struct NextChatRigTool<TTool> {
     task_card_id: String,
     agent_id: String,
     agent: crate::core::domain::AgentProfile,
+    working_directory: String,
     approval_granted: bool,
     call_log: RigToolCallLog,
+    tool_stream: Option<UnboundedSender<ToolStreamChunk>>,
 }
 
 impl<TTool> NextChatRigTool<TTool> {
@@ -93,8 +97,10 @@ impl<TTool> NextChatRigTool<TTool> {
         task_card_id: String,
         agent_id: String,
         agent: crate::core::domain::AgentProfile,
+        working_directory: String,
         approval_granted: bool,
         call_log: RigToolCallLog,
+        tool_stream: Option<UnboundedSender<ToolStreamChunk>>,
     ) -> Self {
         Self {
             manifest,
@@ -102,8 +108,10 @@ impl<TTool> NextChatRigTool<TTool> {
             task_card_id,
             agent_id,
             agent,
+            working_directory,
             approval_granted,
             call_log,
+            tool_stream,
         }
     }
 }
@@ -147,6 +155,8 @@ where
                     agent_id: self.agent_id.clone(),
                     agent: self.agent.clone(),
                     approval_granted: self.approval_granted,
+                    working_directory: self.working_directory.clone(),
+                    tool_stream: self.tool_stream.clone(),
                 })
                 .await
                 .map_err(|error| {
@@ -187,8 +197,10 @@ where
                 context.task_card.id.clone(),
                 context.agent.id.clone(),
                 context.agent.clone(),
+                context.work_group.working_directory.clone(),
                 approval_granted,
                 call_log.clone(),
+                context.tool_stream.clone(),
             )) as Box<dyn ToolDyn>
         })
         .collect()
@@ -230,150 +242,16 @@ fn tool_parameters_schema(manifest: &ToolManifest) -> Value {
         }
     }
 
-    match manifest.id.as_str() {
-        "project.search" => json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search term or code fragment to find in the workspace."
-                }
-            },
-            "required": ["query"]
-        }),
-        "file.readwrite" => json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute or workspace-relative file path."
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["read", "write"],
-                    "description": "Use read to inspect files, write to save content."
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Required when mode is write."
-                }
-            },
-            "required": ["path", "mode"]
-        }),
-        "shell.exec" => json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "Shell command to run in the workspace."
-                }
-            },
-            "required": ["command"]
-        }),
-        "http.request" => json!({
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "Target URL."
-                },
-                "method": {
-                    "type": "string",
-                    "enum": ["GET", "POST", "PUT", "DELETE"],
-                    "description": "HTTP method."
-                },
-                "body": {
-                    "type": "string",
-                    "description": "Optional request body."
-                }
-            },
-            "required": ["url"]
-        }),
-        "browser.automation" => json!({
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "Page URL to open."
-                },
-                "actions": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Optional Playwright CLI actions."
-                }
-            },
-            "required": ["url"]
-        }),
-        "markdown.compose" => json!({
-            "type": "object",
-            "properties": {
-                "topic": {
-                    "type": "string",
-                    "description": "Topic to draft."
-                },
-                "format": {
-                    "type": "string",
-                    "description": "Desired markdown format, for example report, notes, or checklist."
-                }
-            },
-            "required": ["topic"]
-        }),
-        "plan.summarize" => json!({
-            "type": "object",
-            "properties": {
-                "input": {
-                    "type": "string",
-                    "description": "Text to summarize into a concise plan or status update."
-                }
-            },
-            "required": ["input"]
-        }),
-        "skills.manage" => json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["list", "install_local", "install_github", "update", "toggle", "delete"],
-                    "description": "Operation type."
-                },
-                "source": {
-                    "type": "string",
-                    "description": "Required for install actions. Local path for install_local, GitHub repo for install_github."
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Optional skill sub-path when installing from GitHub."
-                },
-                "skill_id": {
-                    "type": "string",
-                    "description": "Target installed skill id for update/toggle/delete."
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Optional updated display name for update."
-                },
-                "prompt_template": {
-                    "type": "string",
-                    "description": "Optional updated description for update."
-                },
-                "enabled": {
-                    "type": "boolean",
-                    "description": "Required boolean flag for toggle."
-                }
-            },
-            "required": ["action"]
-        }),
-        _ => json!({
-            "type": "object",
-            "properties": {
-                "input": {
-                    "type": "string",
-                    "description": format!("Input for {}", manifest.name)
-                }
-            },
-            "required": ["input"]
-        }),
-    }
+    json!({
+        "type": "object",
+        "properties": {
+            "input": {
+                "type": "string",
+                "description": format!("Input for {}", manifest.name)
+            }
+        },
+        "required": ["input"]
+    })
 }
 
 fn normalize_tool_input(args: &str) -> String {
@@ -433,6 +311,7 @@ mod tests {
                 kind: WorkGroupKind::Persistent,
                 name: "WG".into(),
                 goal: "Goal".into(),
+                working_directory: ".".into(),
                 member_agent_ids: vec!["agent-1".into()],
                 default_visibility: "summary".into(),
                 auto_archive: false,
@@ -463,6 +342,8 @@ mod tests {
             available_skills: vec![],
             approved_tool,
             settings: SystemSettings::default(),
+            summary_stream: None,
+            tool_stream: None,
         }
     }
 

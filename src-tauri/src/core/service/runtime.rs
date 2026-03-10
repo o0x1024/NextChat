@@ -3,8 +3,9 @@ use std::collections::HashSet;
 use anyhow::{anyhow, Result};
 use serde_json::json;
 use tauri::{AppHandle, Runtime};
+use tokio::sync::{mpsc, oneshot};
 
-use super::{collect_allowed_tools, emit, scored_candidates, AppService};
+use super::{collect_allowed_tools, emit, execution_payloads, scored_candidates, AppService};
 use crate::core::domain::{
     new_id, now, AgentExecutor, AgentProfile, AuditEvent, ChatStreamEvent, ChatStreamPhase,
     ClaimContext, ClaimScorer, ConversationMessage, LeaseState, MessageKind, SenderKind, TaskCard,
@@ -312,25 +313,30 @@ impl AppService {
             cancelled_tool_runs.push(tool_run);
         }
 
-        let message = task.as_ref().map(|current_task| ConversationMessage {
-            id: new_id(),
-            conversation_id: current_task.work_group_id.clone(),
-            work_group_id: current_task.work_group_id.clone(),
-            sender_kind: SenderKind::System,
-            sender_id: "coordinator".into(),
-            sender_name: "Coordinator".into(),
-            kind: MessageKind::Status,
-            visibility: Visibility::Main,
-            content: if permission_guard_error {
-                format!("Execution blocked by permission guard. {error_message}")
-            } else {
-                format!("Task execution failed and was moved to review. {error_message}")
-            },
-            mentions: vec![],
-            task_card_id: Some(current_task.id.clone()),
-            execution_mode: None,
-            created_at: now(),
+        let message = task.as_ref().map(|current_task| {
+            let mut message = ConversationMessage {
+                id: new_id(),
+                conversation_id: current_task.work_group_id.clone(),
+                work_group_id: current_task.work_group_id.clone(),
+                sender_kind: SenderKind::System,
+                sender_id: "coordinator".into(),
+                sender_name: "Coordinator".into(),
+                kind: MessageKind::Status,
+                visibility: Visibility::Main,
+                content: if permission_guard_error {
+                    format!("Execution blocked by permission guard. {error_message}")
+                } else {
+                    format!("Task execution failed and was moved to review. {error_message}")
+                },
+                mentions: vec![],
+                task_card_id: Some(current_task.id.clone()),
+                execution_mode: None,
+                created_at: now(),
+            };
+            self.assign_group_owner_sender(&mut message)?;
+            Ok::<ConversationMessage, anyhow::Error>(message)
         });
+        let message = message.transpose()?;
         if let Some(ref message) = message {
             self.storage.insert_message(message)?;
         }
@@ -408,11 +414,15 @@ impl AppService {
             self.tool_runtime
                 .select_tool_for_text(&task.input_payload, &auto_runnable_tool_ids)
         };
+        let tool_call_id = approved_tool.as_ref().map(|_| new_id());
 
         if let Some(tool) = approved_tool.clone() {
-            let decision =
-                self.tool_runtime
-                    .authorize_tool_call(&agent, &tool, &task.input_payload)?;
+            let decision = self.tool_runtime.authorize_tool_call(
+                &agent,
+                &tool,
+                &task.input_payload,
+                &work_group.working_directory,
+            )?;
             if !decision.allowed {
                 self.handle_permission_denial(
                     &app,
@@ -441,12 +451,16 @@ impl AppService {
                 id: new_id(),
                 conversation_id: work_group.id.clone(),
                 work_group_id: work_group.id.clone(),
-                sender_kind: SenderKind::System,
-                sender_id: "coordinator".into(),
-                sender_name: "Coordinator".into(),
+                sender_kind: SenderKind::Agent,
+                sender_id: agent.id.clone(),
+                sender_name: agent.name.clone(),
                 kind: MessageKind::ToolCall,
                 visibility: Visibility::Backstage,
-                content: format!("Executing tool '{}' for task '{}'.", tool.name, task.title),
+                content: execution_payloads::structured_tool_call_content(
+                    &tool,
+                    tool_call_id.as_deref().unwrap_or(tool.id.as_str()),
+                    &task.input_payload,
+                ),
                 mentions: vec![agent.id.clone()],
                 task_card_id: Some(task.id.clone()),
                 execution_mode: None,
@@ -468,7 +482,153 @@ impl AppService {
             .filter(|tool| !agent.permission_policy.requires_approval(&tool.id))
             .collect();
 
-        let execution = self
+        let summary_stream_id = new_id();
+        let start_event = ChatStreamEvent {
+            stream_id: summary_stream_id.clone(),
+            phase: ChatStreamPhase::Start,
+            conversation_id: work_group.id.clone(),
+            work_group_id: work_group.id.clone(),
+            sender_id: agent.id.clone(),
+            sender_name: agent.name.clone(),
+            kind: MessageKind::Summary,
+            visibility: Visibility::Main,
+            task_card_id: Some(task.id.clone()),
+            sequence: 0,
+            delta: None,
+            full_content: None,
+            created_at: now(),
+        };
+        emit(&app, "chat:stream-start", &start_event)?;
+
+        let (summary_stream_tx, mut summary_stream_rx) = mpsc::unbounded_channel::<String>();
+        let (summary_stream_state_tx, summary_stream_state_rx) =
+            oneshot::channel::<(String, i64)>();
+        let stream_app = app.clone();
+        let stream_conversation_id = work_group.id.clone();
+        let stream_work_group_id = work_group.id.clone();
+        let stream_sender_id = agent.id.clone();
+        let stream_sender_name = agent.name.clone();
+        let stream_task_card_id = Some(task.id.clone());
+        let stream_id = summary_stream_id.clone();
+        tokio::spawn(async move {
+            let mut streamed_summary = String::new();
+            let mut sequence: i64 = 0;
+            while let Some(delta) = summary_stream_rx.recv().await {
+                if delta.is_empty() {
+                    continue;
+                }
+                sequence += 1;
+                streamed_summary.push_str(&delta);
+                let event = ChatStreamEvent {
+                    stream_id: stream_id.clone(),
+                    phase: ChatStreamPhase::Delta,
+                    conversation_id: stream_conversation_id.clone(),
+                    work_group_id: stream_work_group_id.clone(),
+                    sender_id: stream_sender_id.clone(),
+                    sender_name: stream_sender_name.clone(),
+                    kind: MessageKind::Summary,
+                    visibility: Visibility::Main,
+                    task_card_id: stream_task_card_id.clone(),
+                    sequence,
+                    delta: Some(delta),
+                    full_content: None,
+                    created_at: now(),
+                };
+                let _ = emit(&stream_app, "chat:stream-delta", &event);
+            }
+            let _ = summary_stream_state_tx.send((streamed_summary, sequence));
+        });
+
+        let tool_stream_id = new_id();
+        let (tool_stream_tx, mut tool_stream_rx) =
+            mpsc::unbounded_channel::<crate::core::domain::ToolStreamChunk>();
+        let (tool_stream_state_tx, tool_stream_state_rx) =
+            oneshot::channel::<(String, i64, bool)>();
+        let tool_stream_app = app.clone();
+        let tool_stream_conversation_id = work_group.id.clone();
+        let tool_stream_work_group_id = work_group.id.clone();
+        let tool_stream_sender_id = agent.id.clone();
+        let tool_stream_sender_name = agent.name.clone();
+        let tool_stream_task_card_id = Some(task.id.clone());
+        tokio::spawn(async move {
+            let mut started = false;
+            let mut full_content = String::new();
+            let mut sequence: i64 = 0;
+
+            while let Some(chunk) = tool_stream_rx.recv().await {
+                if chunk.delta.is_empty() {
+                    continue;
+                }
+                if !started {
+                    let start = ChatStreamEvent {
+                        stream_id: tool_stream_id.clone(),
+                        phase: ChatStreamPhase::Start,
+                        conversation_id: tool_stream_conversation_id.clone(),
+                        work_group_id: tool_stream_work_group_id.clone(),
+                        sender_id: tool_stream_sender_id.clone(),
+                        sender_name: tool_stream_sender_name.clone(),
+                        kind: MessageKind::ToolResult,
+                        visibility: Visibility::Backstage,
+                        task_card_id: tool_stream_task_card_id.clone(),
+                        sequence,
+                        delta: None,
+                        full_content: None,
+                        created_at: now(),
+                    };
+                    let _ = emit(&tool_stream_app, "chat:stream-start", &start);
+                    started = true;
+                }
+
+                sequence += 1;
+                let prefix = if chunk.channel == "stderr" {
+                    format!("[{} stderr] ", chunk.tool_id)
+                } else {
+                    format!("[{}] ", chunk.tool_id)
+                };
+                let delta = format!("{prefix}{}", chunk.delta);
+                full_content.push_str(&delta);
+                let event = ChatStreamEvent {
+                    stream_id: tool_stream_id.clone(),
+                    phase: ChatStreamPhase::Delta,
+                    conversation_id: tool_stream_conversation_id.clone(),
+                    work_group_id: tool_stream_work_group_id.clone(),
+                    sender_id: tool_stream_sender_id.clone(),
+                    sender_name: tool_stream_sender_name.clone(),
+                    kind: MessageKind::ToolResult,
+                    visibility: Visibility::Backstage,
+                    task_card_id: tool_stream_task_card_id.clone(),
+                    sequence,
+                    delta: Some(delta),
+                    full_content: None,
+                    created_at: now(),
+                };
+                let _ = emit(&tool_stream_app, "chat:stream-delta", &event);
+            }
+
+            if started {
+                sequence += 1;
+                let done = ChatStreamEvent {
+                    stream_id: tool_stream_id,
+                    phase: ChatStreamPhase::Done,
+                    conversation_id: tool_stream_conversation_id,
+                    work_group_id: tool_stream_work_group_id,
+                    sender_id: tool_stream_sender_id,
+                    sender_name: tool_stream_sender_name,
+                    kind: MessageKind::ToolResult,
+                    visibility: Visibility::Backstage,
+                    task_card_id: tool_stream_task_card_id,
+                    sequence,
+                    delta: None,
+                    full_content: Some(full_content.clone()),
+                    created_at: now(),
+                };
+                let _ = emit(&tool_stream_app, "chat:stream-done", &done);
+            }
+
+            let _ = tool_stream_state_tx.send((full_content, sequence, started));
+        });
+
+        let execution_result = self
             .agent_runtime
             .execute_task(TaskExecutionContext {
                 agent: agent.clone(),
@@ -481,8 +641,56 @@ impl AppService {
                 available_skills,
                 approved_tool: approved_tool.clone(),
                 settings: self.storage.get_settings()?,
+                summary_stream: Some(summary_stream_tx.clone()),
+                tool_stream: Some(tool_stream_tx.clone()),
             })
-            .await?;
+            .await;
+        drop(summary_stream_tx);
+        drop(tool_stream_tx);
+        let (streamed_summary, last_sequence) =
+            summary_stream_state_rx.await.unwrap_or((String::new(), 0));
+        let _ = tool_stream_state_rx.await;
+
+        let execution = match execution_result {
+            Ok(execution) => {
+                let done_event = ChatStreamEvent {
+                    stream_id: summary_stream_id.clone(),
+                    phase: ChatStreamPhase::Done,
+                    conversation_id: work_group.id.clone(),
+                    work_group_id: work_group.id.clone(),
+                    sender_id: agent.id.clone(),
+                    sender_name: agent.name.clone(),
+                    kind: MessageKind::Summary,
+                    visibility: Visibility::Main,
+                    task_card_id: Some(task.id.clone()),
+                    sequence: last_sequence + 1,
+                    delta: None,
+                    full_content: Some(execution.summary.clone()),
+                    created_at: now(),
+                };
+                emit(&app, "chat:stream-done", &done_event)?;
+                execution
+            }
+            Err(error) => {
+                let done_event = ChatStreamEvent {
+                    stream_id: summary_stream_id,
+                    phase: ChatStreamPhase::Done,
+                    conversation_id: work_group.id.clone(),
+                    work_group_id: work_group.id.clone(),
+                    sender_id: agent.id.clone(),
+                    sender_name: agent.name.clone(),
+                    kind: MessageKind::Summary,
+                    visibility: Visibility::Main,
+                    task_card_id: Some(task.id.clone()),
+                    sequence: last_sequence + 1,
+                    delta: None,
+                    full_content: Some(streamed_summary),
+                    created_at: now(),
+                };
+                let _ = emit(&app, "chat:stream-done", &done_event);
+                return Err(error);
+            }
+        };
 
         if let Some(id) = tool_run_id {
             let mut tool_run = self.storage.get_tool_run(id)?;
@@ -494,16 +702,26 @@ impl AppService {
         }
 
         if let Some(tool_output) = execution.tool_output.clone() {
+            let tool_result_content = if let Some(tool) = approved_tool.as_ref() {
+                execution_payloads::structured_tool_result_content(
+                    tool,
+                    tool_call_id.as_deref(),
+                    &task.input_payload,
+                    &tool_output,
+                )
+            } else {
+                tool_output.clone()
+            };
             let tool_result_message = ConversationMessage {
                 id: new_id(),
                 conversation_id: work_group.id.clone(),
                 work_group_id: work_group.id.clone(),
-                sender_kind: SenderKind::System,
-                sender_id: "coordinator".into(),
-                sender_name: "Coordinator".into(),
+                sender_kind: SenderKind::Agent,
+                sender_id: agent.id.clone(),
+                sender_name: agent.name.clone(),
                 kind: MessageKind::ToolResult,
                 visibility: Visibility::Backstage,
-                content: tool_output.clone(),
+                content: tool_result_content,
                 mentions: vec![agent.id.clone()],
                 task_card_id: Some(task.id.clone()),
                 execution_mode: Some(execution.execution_mode.clone()),
@@ -520,7 +738,7 @@ impl AppService {
         }
 
         let summary_message = ConversationMessage {
-            id: new_id(),
+            id: summary_stream_id,
             conversation_id: work_group.id.clone(),
             work_group_id: work_group.id.clone(),
             sender_kind: SenderKind::Agent,
@@ -534,7 +752,6 @@ impl AppService {
             execution_mode: Some(execution.execution_mode.clone()),
             created_at: now(),
         };
-        self.emit_stream_events(&app, &summary_message)?;
         self.storage.insert_message(&summary_message)?;
         emit(&app, "chat:message-created", &summary_message)?;
 
@@ -579,7 +796,7 @@ impl AppService {
             task.status = TaskStatus::WaitingChildren;
             self.storage.update_task_card(&task)?;
             emit(&app, "task:status-changed", &task)?;
-            let waiting_message = ConversationMessage {
+            let mut waiting_message = ConversationMessage {
                 id: new_id(),
                 conversation_id: work_group.id.clone(),
                 work_group_id: work_group.id.clone(),
@@ -598,6 +815,7 @@ impl AppService {
                 execution_mode: None,
                 created_at: now(),
             };
+            self.assign_group_owner_sender(&mut waiting_message)?;
             self.storage.insert_message(&waiting_message)?;
             emit(&app, "chat:message-created", &waiting_message)?;
             self.record_audit(
@@ -646,69 +864,6 @@ impl AppService {
         Ok(())
     }
 
-    fn emit_stream_events<R: Runtime>(
-        &self,
-        app: &AppHandle<R>,
-        message: &ConversationMessage,
-    ) -> Result<()> {
-        let mut sequence: i64 = 0;
-        let start = ChatStreamEvent {
-            stream_id: message.id.clone(),
-            phase: ChatStreamPhase::Start,
-            conversation_id: message.conversation_id.clone(),
-            work_group_id: message.work_group_id.clone(),
-            sender_id: message.sender_id.clone(),
-            sender_name: message.sender_name.clone(),
-            kind: message.kind.clone(),
-            visibility: message.visibility.clone(),
-            task_card_id: message.task_card_id.clone(),
-            sequence,
-            delta: None,
-            full_content: None,
-            created_at: now(),
-        };
-        emit(app, "chat:stream-start", &start)?;
-
-        for chunk in stream_chunks(&message.content, 48) {
-            sequence += 1;
-            let delta = ChatStreamEvent {
-                stream_id: message.id.clone(),
-                phase: ChatStreamPhase::Delta,
-                conversation_id: message.conversation_id.clone(),
-                work_group_id: message.work_group_id.clone(),
-                sender_id: message.sender_id.clone(),
-                sender_name: message.sender_name.clone(),
-                kind: message.kind.clone(),
-                visibility: message.visibility.clone(),
-                task_card_id: message.task_card_id.clone(),
-                sequence,
-                delta: Some(chunk),
-                full_content: None,
-                created_at: now(),
-            };
-            emit(app, "chat:stream-delta", &delta)?;
-        }
-
-        sequence += 1;
-        let done = ChatStreamEvent {
-            stream_id: message.id.clone(),
-            phase: ChatStreamPhase::Done,
-            conversation_id: message.conversation_id.clone(),
-            work_group_id: message.work_group_id.clone(),
-            sender_id: message.sender_id.clone(),
-            sender_name: message.sender_name.clone(),
-            kind: message.kind.clone(),
-            visibility: message.visibility.clone(),
-            task_card_id: message.task_card_id.clone(),
-            sequence,
-            delta: None,
-            full_content: Some(message.content.clone()),
-            created_at: now(),
-        };
-        emit(app, "chat:stream-done", &done)?;
-        Ok(())
-    }
-
     pub(super) fn spawn_subtask<R: Runtime>(
         &self,
         app: &AppHandle<R>,
@@ -721,7 +876,9 @@ impl AppService {
         let members: Vec<AgentProfile> = all_agents
             .into_iter()
             .filter(|agent| {
-                work_group.member_agent_ids.contains(&agent.id) && agent.id != owner_agent.id
+                work_group.member_agent_ids.contains(&agent.id)
+                    && agent.id != owner_agent.id
+                    && !self.is_builtin_group_owner_profile(agent)
             })
             .collect();
         if members.is_empty() {
@@ -775,6 +932,7 @@ impl AppService {
                     &agent,
                     &tool,
                     &claim_plan.task_card.input_payload,
+                    &work_group.working_directory,
                 )?;
                 if !decision.allowed {
                     claim_plan.task_card.status = TaskStatus::NeedsReview;
@@ -799,8 +957,10 @@ impl AppService {
             emit(app, "claim:bid-submitted", bid)?;
         }
         for message in &claim_plan.coordinator_messages {
-            self.storage.insert_message(message)?;
-            emit(app, "chat:message-created", message)?;
+            let mut message = message.clone();
+            self.assign_group_owner_sender(&mut message)?;
+            self.storage.insert_message(&message)?;
+            emit(app, "chat:message-created", &message)?;
         }
         if let Some(ref lease) = claim_plan.lease {
             self.storage.insert_lease(lease)?;
@@ -847,7 +1007,7 @@ impl AppService {
                 };
                 self.storage.insert_tool_run(&tool_run)?;
                 if tool_run.approval_required {
-                    let approval_message = ConversationMessage {
+                    let mut approval_message = ConversationMessage {
                         id: new_id(),
                         conversation_id: work_group.id.clone(),
                         work_group_id: work_group.id.clone(),
@@ -862,6 +1022,7 @@ impl AppService {
                         execution_mode: None,
                         created_at: now(),
                     };
+                    self.assign_group_owner_sender(&mut approval_message)?;
                     self.storage.insert_message(&approval_message)?;
                     emit(app, "chat:message-created", &approval_message)?;
                     emit(app, "approval:requested", &tool_run)?;
@@ -906,7 +1067,7 @@ impl AppService {
             })
             .count();
 
-        let status_message = ConversationMessage {
+        let mut status_message = ConversationMessage {
             id: new_id(),
             conversation_id: parent_task.work_group_id.clone(),
             work_group_id: parent_task.work_group_id.clone(),
@@ -932,6 +1093,7 @@ impl AppService {
             execution_mode: None,
             created_at: now(),
         };
+        self.assign_group_owner_sender(&mut status_message)?;
         if parent_task_before.status != parent_task.status {
             self.storage.insert_message(&status_message)?;
             emit(app, "chat:message-created", &status_message)?;
@@ -998,26 +1160,4 @@ impl AppService {
 
         Ok(changed)
     }
-}
-
-fn stream_chunks(content: &str, max_chunk_chars: usize) -> Vec<String> {
-    if content.is_empty() || max_chunk_chars == 0 {
-        return Vec::new();
-    }
-
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    let mut count = 0usize;
-    for ch in content.chars() {
-        current.push(ch);
-        count += 1;
-        if count >= max_chunk_chars || ch == '\n' {
-            chunks.push(std::mem::take(&mut current));
-            count = 0;
-        }
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
 }

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
 pub fn new_id() -> String {
@@ -252,6 +253,7 @@ pub struct WorkGroup {
     pub kind: WorkGroupKind,
     pub name: String,
     pub goal: String,
+    pub working_directory: String,
     pub member_agent_ids: Vec<String>,
     pub default_visibility: String,
     pub auto_archive: bool,
@@ -423,6 +425,55 @@ pub struct SkillPack {
     pub install_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillFileEntry {
+    pub path: String,
+    pub size: i64,
+    pub is_binary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDetail {
+    pub skill_id: String,
+    pub enabled: bool,
+    pub source: String,
+    pub install_path: String,
+    pub name: String,
+    pub description: String,
+    pub argument_hint: Option<String>,
+    pub user_invocable: bool,
+    pub disable_model_invocation: bool,
+    pub allowed_tools: Option<String>,
+    pub model: Option<String>,
+    pub context: Option<String>,
+    pub agent: Option<String>,
+    pub hooks_json: Option<String>,
+    pub summary: Option<String>,
+    pub content: String,
+    pub files: Vec<SkillFileEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSkillDetailInput {
+    pub skill_id: String,
+    pub enabled: bool,
+    pub name: String,
+    pub description: String,
+    pub argument_hint: Option<String>,
+    pub user_invocable: bool,
+    pub disable_model_invocation: bool,
+    pub allowed_tools: Option<String>,
+    pub model: Option<String>,
+    pub context: Option<String>,
+    pub agent: Option<String>,
+    pub hooks_json: Option<String>,
+    pub summary: Option<String>,
+    pub content: String,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -539,15 +590,7 @@ impl Default for AIProviderConfig {
             rig_provider_type: "OpenAI".into(),
             api_key: "".into(),
             base_url: "https://api.openai.com/v1".into(),
-            models: vec![
-                "gpt-4o".into(),
-                "gpt-4o-mini".into(),
-                "gpt-4-turbo".into(),
-                "gpt-3.5-turbo".into(),
-                "o1".into(),
-                "o1-mini".into(),
-                "o3-mini".into(),
-            ],
+            models: vec![],
             default_model: "gpt-4o".into(),
             max_context_length: default_max_context_length(),
             custom_headers: default_custom_headers(),
@@ -585,8 +628,8 @@ impl Default for SystemSettings {
                     false,
                     "Anthropic",
                     "https://api.anthropic.com",
-                    &["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022"],
-                    "claude-3-5-sonnet-20241022",
+                    &[],
+                    "",
                     200_000,
                     "",
                 ),
@@ -597,8 +640,8 @@ impl Default for SystemSettings {
                     false,
                     "Gemini",
                     "https://generativelanguage.googleapis.com/v1beta",
-                    &["gemini-2.0-flash", "gemini-1.5-pro"],
-                    "gemini-2.0-flash",
+                    &[],
+                    "",
                     1_000_000,
                     "",
                 ),
@@ -609,8 +652,8 @@ impl Default for SystemSettings {
                     false,
                     "DeepSeek",
                     "https://api.deepseek.com",
-                    &["deepseek-chat", "deepseek-reasoner"],
-                    "deepseek-chat",
+                    &[],
+                    "",
                     128_000,
                     "",
                 ),
@@ -621,8 +664,8 @@ impl Default for SystemSettings {
                     false,
                     "Groq",
                     "https://api.groq.com/openai/v1",
-                    &["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
-                    "llama-3.3-70b-versatile",
+                    &[],
+                    "",
                     128_000,
                     "",
                 ),
@@ -633,8 +676,8 @@ impl Default for SystemSettings {
                     false,
                     "Cohere",
                     "https://api.cohere.ai",
-                    &["command-r-plus", "command-r"],
-                    "command-r-plus",
+                    &[],
+                    "",
                     128_000,
                     "",
                 ),
@@ -645,8 +688,8 @@ impl Default for SystemSettings {
                     false,
                     "xAI",
                     "https://api.x.ai/v1",
-                    &["grok-3-mini", "grok-3"],
-                    "grok-3-mini",
+                    &[],
+                    "",
                     128_000,
                     "",
                 ),
@@ -657,8 +700,8 @@ impl Default for SystemSettings {
                     false,
                     "Mistral",
                     "https://api.mistral.ai/v1",
-                    &["mistral-large-latest", "ministral-8b-latest"],
-                    "mistral-large-latest",
+                    &[],
+                    "",
                     128_000,
                     "",
                 ),
@@ -669,8 +712,8 @@ impl Default for SystemSettings {
                     false,
                     "Moonshot",
                     "https://api.moonshot.ai/v1",
-                    &["kimi-k2-0905-preview", "moonshot-v1-8k"],
-                    "kimi-k2-0905-preview",
+                    &[],
+                    "",
                     128_000,
                     "",
                 ),
@@ -681,8 +724,8 @@ impl Default for SystemSettings {
                     false,
                     "Hyperbolic",
                     "https://api.hyperbolic.xyz/v1",
-                    &["meta-llama/Meta-Llama-3-70B-Instruct"],
-                    "meta-llama/Meta-Llama-3-70B-Instruct",
+                    &[],
+                    "",
                     128_000,
                     "",
                 ),
@@ -705,8 +748,8 @@ impl Default for SystemSettings {
                     false,
                     "OpenRouter",
                     "https://openrouter.ai/api/v1",
-                    &["openai/gpt-4o-mini", "anthropic/claude-3.5-sonnet"],
-                    "openai/gpt-4o-mini",
+                    &[],
+                    "",
                     128_000,
                     "",
                 ),
@@ -717,8 +760,8 @@ impl Default for SystemSettings {
                     false,
                     "Perplexity",
                     "https://api.perplexity.ai",
-                    &["llama-3.1-sonar-small-128k-online"],
-                    "llama-3.1-sonar-small-128k-online",
+                    &[],
+                    "",
                     128_000,
                     "",
                 ),
@@ -729,8 +772,8 @@ impl Default for SystemSettings {
                     false,
                     "Together",
                     "https://api.together.xyz/v1",
-                    &["meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"],
-                    "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+                    &[],
+                    "",
                     128_000,
                     "",
                 ),
@@ -741,8 +784,8 @@ impl Default for SystemSettings {
                     false,
                     "HuggingFace",
                     "https://router.huggingface.co/v1",
-                    &["meta-llama/Meta-Llama-3-8B-Instruct"],
-                    "meta-llama/Meta-Llama-3-8B-Instruct",
+                    &[],
+                    "",
                     128_000,
                     "",
                 ),
@@ -753,8 +796,8 @@ impl Default for SystemSettings {
                     false,
                     "Ollama",
                     "http://localhost:11434",
-                    &["qwen2.5:14b", "llama3.1:8b"],
-                    "qwen2.5:14b",
+                    &[],
+                    "",
                     32_000,
                     "ollama",
                 ),
@@ -765,8 +808,8 @@ impl Default for SystemSettings {
                     false,
                     "Azure",
                     "https://<your-resource>.openai.azure.com",
-                    &["gpt-4o-mini"],
-                    "gpt-4o-mini",
+                    &[],
+                    "",
                     128_000,
                     "",
                 ),
@@ -777,8 +820,8 @@ impl Default for SystemSettings {
                     false,
                     "Galadriel",
                     "https://api.galadriel.com/v1/verified",
-                    &["gpt-4o"],
-                    "gpt-4o",
+                    &[],
+                    "",
                     128_000,
                     "",
                 ),
@@ -789,8 +832,8 @@ impl Default for SystemSettings {
                     false,
                     "VoyageAI",
                     "https://api.voyageai.com/v1",
-                    &["voyage-3-large"],
-                    "voyage-3-large",
+                    &[],
+                    "",
                     128_000,
                     "",
                 ),
@@ -859,9 +902,12 @@ pub struct UpdateAgentInput {
 pub struct CreateWorkGroupInput {
     pub name: String,
     pub goal: String,
+    pub working_directory: String,
     pub kind: WorkGroupKind,
     pub default_visibility: String,
     pub auto_archive: bool,
+    #[serde(default)]
+    pub member_agent_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -870,6 +916,7 @@ pub struct UpdateWorkGroupInput {
     pub id: String,
     pub name: String,
     pub goal: String,
+    pub working_directory: String,
     pub kind: WorkGroupKind,
     pub default_visibility: String,
     pub auto_archive: bool,
@@ -895,6 +942,10 @@ pub struct TaskExecutionContext {
     pub available_skills: Vec<SkillPack>,
     pub approved_tool: Option<ToolManifest>,
     pub settings: SystemSettings,
+    #[serde(skip)]
+    pub summary_stream: Option<UnboundedSender<String>>,
+    #[serde(skip)]
+    pub tool_stream: Option<UnboundedSender<ToolStreamChunk>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -906,6 +957,16 @@ pub struct ToolExecutionRequest {
     pub agent_id: String,
     pub agent: AgentProfile,
     pub approval_granted: bool,
+    pub working_directory: String,
+    #[serde(skip)]
+    pub tool_stream: Option<UnboundedSender<ToolStreamChunk>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolStreamChunk {
+    pub tool_id: String,
+    pub channel: String,
+    pub delta: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

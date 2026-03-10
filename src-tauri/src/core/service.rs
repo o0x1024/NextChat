@@ -1,16 +1,17 @@
+mod agent_generation;
+#[cfg(test)]
+mod clear_history_tests;
 mod collaboration;
+mod execution_payloads;
+#[cfg(test)]
+mod group_owner_memory_tests;
 mod memory;
 mod runtime;
 #[cfg(test)]
 mod tests;
-
-use std::sync::Arc;
-
-use anyhow::{anyhow, Context, Result};
-use serde::Serialize;
-use serde_json::json;
-use tauri::{AppHandle, Emitter, Runtime};
-
+#[cfg(test)]
+mod todo_fallback_tests;
+mod work_group_owner;
 use crate::core::{
     agent_runtime::AgentRuntime,
     coordinator::Coordinator,
@@ -25,6 +26,11 @@ use crate::core::{
     storage::Storage,
     tool_runtime::ToolRuntime,
 };
+use anyhow::{anyhow, Context, Result};
+use serde::Serialize;
+use serde_json::json;
+use std::{collections::HashSet, sync::Arc};
+use tauri::{AppHandle, Emitter, Runtime};
 
 #[derive(Clone)]
 pub struct AppService {
@@ -72,35 +78,39 @@ impl AppService {
     pub fn install_skill_from_local_path(
         &self,
         source_path: &str,
-    ) -> Result<crate::core::domain::SkillPack> {
-        let skill = self
+    ) -> Result<Vec<crate::core::domain::SkillPack>> {
+        let skills = self
             .tool_runtime
             .install_skill_from_local_path(source_path)?;
-        self.record_audit(
-            "skill.installed.local",
-            "skill",
-            &skill.id,
-            json!({ "sourcePath": source_path, "name": skill.name }),
-        )?;
-        Ok(skill)
+        for skill in &skills {
+            self.record_audit(
+                "skill.installed.local",
+                "skill",
+                &skill.id,
+                json!({ "sourcePath": source_path, "name": skill.name }),
+            )?;
+        }
+        Ok(skills)
     }
 
     pub async fn install_skill_from_github(
         &self,
         source: &str,
         skill_path: Option<&str>,
-    ) -> Result<crate::core::domain::SkillPack> {
-        let skill = self
+    ) -> Result<Vec<crate::core::domain::SkillPack>> {
+        let skills = self
             .tool_runtime
             .install_skill_from_github(source, skill_path)
             .await?;
-        self.record_audit(
-            "skill.installed.github",
-            "skill",
-            &skill.id,
-            json!({ "source": source, "path": skill_path, "name": skill.name }),
-        )?;
-        Ok(skill)
+        for skill in &skills {
+            self.record_audit(
+                "skill.installed.github",
+                "skill",
+                &skill.id,
+                json!({ "source": source, "path": skill_path, "name": skill.name }),
+            )?;
+        }
+        Ok(skills)
     }
 
     pub fn update_installed_skill(
@@ -141,6 +151,61 @@ impl AppService {
     pub fn delete_installed_skill(&self, skill_id: &str) -> Result<()> {
         self.tool_runtime.delete_installed_skill(skill_id)?;
         self.record_audit("skill.deleted", "skill", skill_id, json!({}))?;
+        Ok(())
+    }
+
+    pub fn get_installed_skill_detail(
+        &self,
+        skill_id: &str,
+    ) -> Result<crate::core::domain::SkillDetail> {
+        self.tool_runtime.get_installed_skill_detail(skill_id)
+    }
+
+    pub fn update_skill_detail(
+        &self,
+        input: crate::core::domain::UpdateSkillDetailInput,
+    ) -> Result<crate::core::domain::SkillDetail> {
+        let detail = self.tool_runtime.update_skill_detail(input)?;
+        self.record_audit(
+            "skill.detail.updated",
+            "skill",
+            &detail.skill_id,
+            json!({ "name": detail.name, "enabled": detail.enabled }),
+        )?;
+        Ok(detail)
+    }
+
+    pub fn read_installed_skill_file(&self, skill_id: &str, relative_path: &str) -> Result<String> {
+        self.tool_runtime
+            .read_installed_skill_file(skill_id, relative_path)
+    }
+
+    pub fn upsert_installed_skill_file(
+        &self,
+        skill_id: &str,
+        relative_path: &str,
+        content: &str,
+    ) -> Result<()> {
+        self.tool_runtime
+            .upsert_installed_skill_file(skill_id, relative_path, content)?;
+        self.record_audit(
+            "skill.file.upserted",
+            "skill",
+            skill_id,
+            json!({ "path": relative_path }),
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_installed_skill_file(&self, skill_id: &str, relative_path: &str) -> Result<()> {
+        self.tool_runtime
+            .delete_installed_skill_file(skill_id, relative_path)?;
+        self.record_audit(
+            "skill.file.deleted",
+            "skill",
+            skill_id,
+            json!({ "path": relative_path }),
+        )?;
         Ok(())
     }
 
@@ -203,6 +268,14 @@ impl AppService {
     }
 
     pub fn delete_agent_profile(&self, agent_id: &str) -> Result<()> {
+        let agent = self
+            .storage
+            .get_agent(agent_id)
+            .with_context(|| format!("agent not found: {}", agent_id))?;
+        if self.is_builtin_group_owner_profile(&agent) {
+            return Err(anyhow!("cannot delete builtin group owner agent"));
+        }
+
         let has_active_lease = self.storage.list_leases()?.into_iter().any(|lease| {
             lease.owner_agent_id == agent_id && !matches!(lease.state, LeaseState::Released)
         });
@@ -229,32 +302,100 @@ impl AppService {
     }
 
     pub fn create_work_group(&self, input: CreateWorkGroupInput) -> Result<WorkGroup> {
+        let CreateWorkGroupInput {
+            name,
+            goal,
+            working_directory,
+            kind,
+            default_visibility,
+            auto_archive,
+            member_agent_ids,
+        } = input;
+        let working_directory = self
+            .tool_runtime
+            .normalize_working_directory(&working_directory)?;
+        let known_agent_ids = self
+            .storage
+            .list_agents()?
+            .into_iter()
+            .map(|agent| agent.id)
+            .collect::<HashSet<_>>();
+        let mut member_agent_ids_normalized = Vec::new();
+        let mut seen = HashSet::new();
+        for agent_id in member_agent_ids.unwrap_or_default() {
+            if !known_agent_ids.contains(&agent_id) {
+                return Err(anyhow!("agent not found: {}", agent_id));
+            }
+            if seen.insert(agent_id.clone()) {
+                member_agent_ids_normalized.push(agent_id);
+            }
+        }
+        let owner_agent = self.ensure_builtin_group_owner()?;
+        member_agent_ids_normalized.insert(0, owner_agent.id.clone());
         let group = WorkGroup {
             id: new_id(),
-            kind: input.kind,
-            name: input.name,
-            goal: input.goal,
-            member_agent_ids: vec![],
-            default_visibility: input.default_visibility,
-            auto_archive: input.auto_archive,
+            kind,
+            name,
+            goal,
+            working_directory,
+            member_agent_ids: member_agent_ids_normalized,
+            default_visibility,
+            auto_archive,
             created_at: now(),
             archived_at: None,
         };
         self.storage.insert_work_group(&group)?;
+        self.storage
+            .set_work_group_owner(&group.id, &owner_agent.id)?;
+        self.seed_work_group_memory(&group, &owner_agent)?;
         self.record_audit(
             "work_group.created",
             "work_group",
             &group.id,
-            json!({ "name": group.name }),
+            json!({
+                "name": group.name,
+                "workingDirectory": group.working_directory,
+                "ownerAgentId": owner_agent.id,
+            }),
         )?;
         Ok(group)
     }
 
+    pub fn delete_work_group(&self, work_group_id: &str) -> Result<()> {
+        if self.storage.list_work_groups()?.len() <= 1 {
+            return Err(anyhow!("cannot delete the last work group"));
+        }
+        self.storage.delete_work_group(work_group_id)?;
+        self.record_audit("work_group.deleted", "work_group", work_group_id, json!({}))?;
+        Ok(())
+    }
+
+    pub fn clear_work_group_history(&self, work_group_id: &str) -> Result<()> {
+        let active_leases = self.storage.list_active_leases_for_group(work_group_id)?;
+        if !active_leases.is_empty() {
+            return Err(anyhow!(
+                "cannot clear history while active tasks are running"
+            ));
+        }
+        self.storage.clear_work_group_history(work_group_id)?;
+        self.record_audit(
+            "work_group.history_cleared",
+            "work_group",
+            work_group_id,
+            json!({}),
+        )?;
+        Ok(())
+    }
+
     pub fn update_work_group(&self, input: UpdateWorkGroupInput) -> Result<WorkGroup> {
+        let working_directory = self
+            .tool_runtime
+            .normalize_working_directory(&input.working_directory)?;
         let mut group = self.storage.get_work_group(&input.id)?;
         group.kind = input.kind;
         group.name = input.name;
         group.goal = input.goal;
+        group.working_directory = working_directory;
         group.default_visibility = input.default_visibility;
         group.auto_archive = input.auto_archive;
         self.storage.insert_work_group(&group)?;
@@ -262,7 +403,7 @@ impl AppService {
             "work_group.updated",
             "work_group",
             &group.id,
-            json!({ "name": group.name }),
+            json!({ "name": group.name, "workingDirectory": group.working_directory }),
         )?;
         Ok(group)
     }
@@ -389,8 +530,8 @@ impl AppService {
         agent: &AgentProfile,
         tool: &crate::core::domain::ToolManifest,
         reason: &str,
-    ) -> ConversationMessage {
-        ConversationMessage {
+    ) -> Result<ConversationMessage> {
+        let mut message = ConversationMessage {
             id: new_id(),
             conversation_id: work_group_id.to_string(),
             work_group_id: work_group_id.to_string(),
@@ -407,7 +548,9 @@ impl AppService {
             task_card_id: Some(task_id.to_string()),
             execution_mode: None,
             created_at: now(),
-        }
+        };
+        self.assign_group_owner_sender(&mut message)?;
+        Ok(message)
     }
 
     fn handle_permission_denial<R: Runtime>(
@@ -432,7 +575,7 @@ impl AppService {
         }
 
         let message =
-            self.build_permission_denied_message(work_group_id, &task.id, agent, tool, reason);
+            self.build_permission_denied_message(work_group_id, &task.id, agent, tool, reason)?;
         self.storage.insert_message(&message)?;
         emit(app, "chat:message-created", &message)?;
         self.record_audit(
@@ -472,6 +615,8 @@ impl AppService {
             .collect();
 
         let mentions = Coordinator::extract_mentions(&input.content, &members);
+        let routing_members =
+            self.routing_members_for_message(&work_group.id, &members, &mentions)?;
         let human_message = ConversationMessage {
             id: new_id(),
             conversation_id: work_group.id.clone(),
@@ -488,14 +633,15 @@ impl AppService {
             created_at: now(),
         };
         self.storage.insert_message(&human_message)?;
+        self.remember_human_directive(&app, &human_message)?;
         emit(&app, "chat:message-created", &human_message)?;
 
         self.preempt_active_leases(&app, &work_group.id)?;
 
-        let scored_members = scored_candidates(&self.tool_runtime, &members);
-        let requested_tool = self.tool_runtime.select_tool_for_text(
+        let scored_members = scored_candidates(&self.tool_runtime, &routing_members);
+        let mut requested_tool = self.tool_runtime.select_tool_for_text(
             &input.content,
-            &collect_allowed_tools(&self.tool_runtime, &members),
+            &collect_allowed_tools(&self.tool_runtime, &routing_members),
         );
         let active_loads = self
             .storage
@@ -529,30 +675,43 @@ impl AppService {
         let mut denied_request: Option<(AgentProfile, crate::core::domain::ToolManifest, String)> =
             None;
         let mut requested_tool_requires_approval = false;
-        if let (Some(tool), Some(lease)) = (requested_tool.clone(), claim_plan.lease.as_ref()) {
-            if let Some(agent) = members
+        if let Some(lease) = claim_plan.lease.as_ref() {
+            if let Some(agent) = routing_members
                 .iter()
                 .find(|candidate| candidate.id == lease.owner_agent_id)
                 .cloned()
             {
-                let decision = self.tool_runtime.authorize_tool_call(
-                    &agent,
-                    &tool,
-                    &claim_plan.task_card.input_payload,
-                )?;
-                if !decision.allowed {
-                    claim_plan.task_card.status = TaskStatus::NeedsReview;
-                    denied_request = Some((
-                        agent,
-                        tool,
-                        decision
-                            .reason
-                            .unwrap_or_else(|| "tool access rejected".to_string()),
-                    ));
-                    claim_plan.lease = None;
-                } else if decision.approval_required {
-                    claim_plan.task_card.status = TaskStatus::WaitingApproval;
-                    requested_tool_requires_approval = true;
+                if let Some(tool) = requested_tool.clone() {
+                    if should_skip_implicit_todowrite_fallback(
+                        &self.tool_runtime,
+                        &agent,
+                        &input.content,
+                        &tool,
+                    ) {
+                        requested_tool = None;
+                    }
+                }
+                if let Some(tool) = requested_tool.clone() {
+                    let decision = self.tool_runtime.authorize_tool_call(
+                        &agent,
+                        &tool,
+                        &claim_plan.task_card.input_payload,
+                        &work_group.working_directory,
+                    )?;
+                    if !decision.allowed {
+                        claim_plan.task_card.status = TaskStatus::NeedsReview;
+                        denied_request = Some((
+                            agent,
+                            tool,
+                            decision
+                                .reason
+                                .unwrap_or_else(|| "tool access rejected".to_string()),
+                        ));
+                        claim_plan.lease = None;
+                    } else if decision.approval_required {
+                        claim_plan.task_card.status = TaskStatus::WaitingApproval;
+                        requested_tool_requires_approval = true;
+                    }
                 }
             }
         }
@@ -572,8 +731,10 @@ impl AppService {
         }
 
         for message in &claim_plan.coordinator_messages {
-            self.storage.insert_message(message)?;
-            emit(&app, "chat:message-created", message)?;
+            let mut message = message.clone();
+            self.assign_group_owner_sender(&mut message)?;
+            self.storage.insert_message(&message)?;
+            emit(&app, "chat:message-created", &message)?;
         }
 
         if let Some(ref lease) = claim_plan.lease {
@@ -616,7 +777,7 @@ impl AppService {
                 };
                 self.storage.insert_tool_run(&tool_run)?;
                 if tool_run.approval_required {
-                    let approval_message = ConversationMessage {
+                    let mut approval_message = ConversationMessage {
                         id: new_id(),
                         conversation_id: work_group.id.clone(),
                         work_group_id: work_group.id.clone(),
@@ -631,6 +792,7 @@ impl AppService {
                         execution_mode: None,
                         created_at: now(),
                     };
+                    self.assign_group_owner_sender(&mut approval_message)?;
                     self.storage.insert_message(&approval_message)?;
                     emit(&app, "chat:message-created", &approval_message)?;
                     emit(&app, "approval:requested", &tool_run)?;
@@ -797,6 +959,28 @@ fn collect_allowed_tools(tool_runtime: &ToolRuntime, agents: &[AgentProfile]) ->
         }
     }
     ids
+}
+
+fn should_skip_implicit_todowrite_fallback(
+    tool_runtime: &ToolRuntime,
+    agent: &AgentProfile,
+    content: &str,
+    tool: &crate::core::domain::ToolManifest,
+) -> bool {
+    if tool.id != "TodoWrite" {
+        return false;
+    }
+    let lowered = content.to_lowercase();
+    let explicit_todo_request = ["todo", "task list", "待办"]
+        .iter()
+        .any(|keyword| lowered.contains(keyword));
+    if explicit_todo_request {
+        return false;
+    }
+    !tool_runtime
+        .available_tools_for_agent(agent)
+        .into_iter()
+        .any(|available| available.id == tool.id)
 }
 
 fn scored_candidates(tool_runtime: &ToolRuntime, agents: &[AgentProfile]) -> Vec<AgentProfile> {

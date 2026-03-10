@@ -1,14 +1,17 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use futures::StreamExt;
 use reqwest::Client;
 use rig::{
     agent::{HookAction, PromptHook, ToolCallHookAction},
     client::CompletionClient,
     completion::{CompletionModel, CompletionResponse, Message, Prompt},
     providers::{anthropic, gemini, openai},
+    streaming::{StreamedAssistantContent, StreamingPrompt},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
 use crate::core::{
@@ -234,6 +237,48 @@ fn openai_compatible_client(config: &AIProviderConfig) -> Result<openai::Complet
         .map_err(Into::into)
 }
 
+fn normalized_anthropic_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        "https://api.anthropic.com".to_string()
+    } else if let Some(prefix) = trimmed.strip_suffix("/v1") {
+        prefix.trim_end_matches('/').to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn anthropic_client(config: &AIProviderConfig) -> Result<anthropic::Client> {
+    anthropic::Client::builder()
+        .api_key(config.api_key.trim())
+        .base_url(normalized_anthropic_base_url(&config.base_url))
+        .build()
+        .map_err(Into::into)
+}
+
+fn normalized_gemini_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        "https://generativelanguage.googleapis.com".to_string()
+    } else if let Some(prefix) = trimmed.strip_suffix("/v1beta") {
+        prefix.trim_end_matches('/').to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn gemini_api_base_url(base_url: &str) -> String {
+    format!("{}/v1beta", normalized_gemini_base_url(base_url))
+}
+
+fn gemini_client(config: &AIProviderConfig) -> Result<gemini::Client> {
+    gemini::Client::builder()
+        .api_key(config.api_key.trim())
+        .base_url(normalized_gemini_base_url(&config.base_url))
+        .build()
+        .map_err(Into::into)
+}
+
 fn normalized_api_base_url(base_url: &str, default_base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -251,15 +296,33 @@ fn join_api_path(base_url: &str, path: &str) -> String {
     )
 }
 
-fn openai_compatible_api_base_url(base_url: &str) -> String {
+fn push_unique_url(urls: &mut Vec<String>, candidate: String) {
+    if !candidate.is_empty() && !urls.iter().any(|url| url == &candidate) {
+        urls.push(candidate);
+    }
+}
+
+fn openai_compatible_api_base_urls(base_url: &str) -> Vec<String> {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
-        "https://api.openai.com/v1".to_string()
-    } else if trimmed.ends_with("/v1") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/v1")
+        return vec!["https://api.openai.com/v1".to_string()];
     }
+
+    let mut candidates = Vec::new();
+    let prefers_v1 = trimmed.contains("api.openai.com");
+    if prefers_v1 && !trimmed.ends_with("/v1") {
+        push_unique_url(&mut candidates, format!("{trimmed}/v1"));
+    }
+
+    push_unique_url(&mut candidates, trimmed.to_string());
+
+    if !trimmed.ends_with("/v1") {
+        push_unique_url(&mut candidates, format!("{trimmed}/v1"));
+    } else if let Some(prefix) = trimmed.strip_suffix("/v1") {
+        push_unique_url(&mut candidates, prefix.trim_end_matches('/').to_string());
+    }
+
+    candidates
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,6 +362,20 @@ where
         }
     }
     unique
+}
+
+fn fallback_models_from_config(config: &AIProviderConfig) -> Vec<String> {
+    dedupe_models(
+        config
+            .models
+            .iter()
+            .cloned()
+            .chain(std::iter::once(config.default_model.clone())),
+    )
+}
+
+fn is_http_unauthorized_or_forbidden(message: &str) -> bool {
+    message.contains("HTTP 401") || message.contains("HTTP 403")
 }
 
 fn max_turns_for_config(config: &AIProviderConfig) -> usize {
@@ -497,24 +574,73 @@ fn apply_custom_headers_to_request(
 
 async fn fetch_openai_compatible_models(config: &AIProviderConfig) -> Result<Vec<String>> {
     let client = Client::new();
-    let mut request = client.get(join_api_path(
-        &openai_compatible_api_base_url(&config.base_url),
-        "models",
-    ));
-    if !config.api_key.trim().is_empty() {
-        request = request.bearer_auth(config.api_key.trim());
-    }
-    request = apply_custom_headers_to_request(request, config)?;
+    let mut last_error: Option<anyhow::Error> = None;
 
-    let payload: Value = parse_json_response(
-        request
-            .send()
+    for api_base_url in openai_compatible_api_base_urls(&config.base_url) {
+        let endpoint = join_api_path(&api_base_url, "models");
+        let mut request = client.get(&endpoint);
+        if !config.api_key.trim().is_empty() {
+            request = request.bearer_auth(config.api_key.trim());
+        }
+        request = apply_custom_headers_to_request(request, config)?;
+
+        let response = request.send().await.with_context(|| {
+            format!("Failed to request model list from OpenAI-compatible provider: {endpoint}")
+        })?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            continue;
+        }
+
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let detail = body.trim();
+            let message = if detail.is_empty() {
+                format!("HTTP {}", status)
+            } else {
+                format!(
+                    "HTTP {}: {}",
+                    status,
+                    detail.chars().take(200).collect::<String>()
+                )
+            };
+
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(anyhow!(message));
+            }
+
+            last_error = Some(anyhow!(message));
+            continue;
+        }
+
+        let payload = response
+            .json::<Value>()
             .await
-            .context("Failed to request model list from OpenAI-compatible provider")?,
-    )
-    .await?;
+            .context("Failed to parse model list response body")?;
+        let models = parse_model_ids(&payload);
+        if !models.is_empty() {
+            return Ok(models);
+        }
 
-    Ok(parse_model_ids(&payload))
+        last_error = Some(anyhow!(
+            "No models were returned by endpoint '{}'",
+            endpoint
+        ));
+    }
+
+    let fallback_models = fallback_models_from_config(config);
+    if !fallback_models.is_empty() {
+        return Ok(fallback_models);
+    }
+
+    if let Some(error) = last_error {
+        return Err(error);
+    }
+
+    Err(anyhow!("No models were returned by the provider"))
 }
 
 async fn fetch_anthropic_models(config: &AIProviderConfig) -> Result<Vec<String>> {
@@ -555,10 +681,7 @@ async fn fetch_gemini_models(config: &AIProviderConfig) -> Result<Vec<String>> {
     }
 
     let client = Client::new();
-    let base_url = normalized_api_base_url(
-        &config.base_url,
-        "https://generativelanguage.googleapis.com/v1beta",
-    );
+    let base_url = gemini_api_base_url(&config.base_url);
     let payload: GeminiModelListResponse = parse_json_response(
         apply_custom_headers_to_request(
             client
@@ -623,7 +746,25 @@ pub async fn refresh_models(config: &AIProviderConfig) -> Result<Vec<String>> {
                     fetch_openai_compatible_models(config).await
                 }
             }
-            "Anthropic" => fetch_anthropic_models(config).await,
+            "Anthropic" => match fetch_anthropic_models(config).await {
+                Ok(models) => Ok(models),
+                Err(error) => {
+                    let message = error.to_string();
+                    let fallback = fallback_models_from_config(config);
+                    if is_http_unauthorized_or_forbidden(&message) && !fallback.is_empty() {
+                        logging::warn(
+                            "llm.refresh_models",
+                            format!(
+                                "Anthropic model listing returned auth error; using locally configured models for provider '{}'",
+                                config.id
+                            ),
+                        );
+                        Ok(fallback)
+                    } else {
+                        Err(error)
+                    }
+                }
+            },
             "Gemini" => fetch_gemini_models(config).await,
             _ => Err(anyhow!(
                 "Unsupported provider type for model refresh: {}",
@@ -684,6 +825,7 @@ pub async fn complete_task_with_tools<TTool>(
     tool_handler: std::sync::Arc<TTool>,
     preamble: &str,
     prompt: &str,
+    summary_stream: Option<UnboundedSender<String>>,
 ) -> Result<Option<RigAgentResponse>>
 where
     TTool: ToolHandler + 'static,
@@ -753,13 +895,34 @@ where
                     .tools(tools)
                     .build();
 
+                let mut stream = agent.stream_prompt(prompt).with_hook(hook.clone()).await;
+                let mut streamed_summary = String::new();
+                let mut final_summary: Option<String> = None;
+
+                while let Some(chunk) = stream.next().await {
+                    match chunk? {
+                        rig::agent::MultiTurnStreamItem::StreamAssistantItem(
+                            StreamedAssistantContent::Text(text),
+                        ) => {
+                            streamed_summary.push_str(&text.text);
+                            if let Some(stream) = summary_stream.as_ref() {
+                                let _ = stream.send(text.text);
+                            }
+                        }
+                        rig::agent::MultiTurnStreamItem::FinalResponse(response) => {
+                            final_summary = Some(response.response().to_string());
+                        }
+                        _ => {}
+                    }
+                }
+
                 Ok::<_, anyhow::Error>((
-                    agent.prompt(prompt).with_hook(hook.clone()).await?,
+                    final_summary.unwrap_or(streamed_summary),
                     call_log.snapshot(),
                 ))
             }
             "Anthropic" => {
-                let client = anthropic::Client::new(&config.api_key)?;
+                let client = anthropic_client(config)?;
                 let agent = client
                     .agent(&context.agent.model_policy.model)
                     .preamble(preamble)
@@ -768,13 +931,34 @@ where
                     .max_tokens(config.max_tokens as u64)
                     .tools(tools)
                     .build();
+                let mut stream = agent.stream_prompt(prompt).with_hook(hook.clone()).await;
+                let mut streamed_summary = String::new();
+                let mut final_summary: Option<String> = None;
+
+                while let Some(chunk) = stream.next().await {
+                    match chunk? {
+                        rig::agent::MultiTurnStreamItem::StreamAssistantItem(
+                            StreamedAssistantContent::Text(text),
+                        ) => {
+                            streamed_summary.push_str(&text.text);
+                            if let Some(stream) = summary_stream.as_ref() {
+                                let _ = stream.send(text.text);
+                            }
+                        }
+                        rig::agent::MultiTurnStreamItem::FinalResponse(response) => {
+                            final_summary = Some(response.response().to_string());
+                        }
+                        _ => {}
+                    }
+                }
+
                 Ok::<_, anyhow::Error>((
-                    agent.prompt(prompt).with_hook(hook.clone()).await?,
+                    final_summary.unwrap_or(streamed_summary),
                     call_log.snapshot(),
                 ))
             }
             "Gemini" => {
-                let client = gemini::Client::new(&config.api_key)?;
+                let client = gemini_client(config)?;
                 let agent = client
                     .agent(&context.agent.model_policy.model)
                     .preamble(preamble)
@@ -783,8 +967,29 @@ where
                     .max_tokens(config.max_tokens as u64)
                     .tools(tools)
                     .build();
+                let mut stream = agent.stream_prompt(prompt).with_hook(hook).await;
+                let mut streamed_summary = String::new();
+                let mut final_summary: Option<String> = None;
+
+                while let Some(chunk) = stream.next().await {
+                    match chunk? {
+                        rig::agent::MultiTurnStreamItem::StreamAssistantItem(
+                            StreamedAssistantContent::Text(text),
+                        ) => {
+                            streamed_summary.push_str(&text.text);
+                            if let Some(stream) = summary_stream.as_ref() {
+                                let _ = stream.send(text.text);
+                            }
+                        }
+                        rig::agent::MultiTurnStreamItem::FinalResponse(response) => {
+                            final_summary = Some(response.response().to_string());
+                        }
+                        _ => {}
+                    }
+                }
+
                 Ok::<_, anyhow::Error>((
-                    agent.prompt(prompt).with_hook(hook).await?,
+                    final_summary.unwrap_or(streamed_summary),
                     call_log.snapshot(),
                 ))
             }
@@ -886,7 +1091,7 @@ impl ModelProviderAdapter for RigModelAdapter {
                     Ok::<_, anyhow::Error>(agent.prompt(prompt).with_hook(hook.clone()).await?)
                 }
                 "Anthropic" => {
-                    let client = anthropic::Client::new(&config.api_key)?;
+                    let client = anthropic_client(config)?;
                     let agent = client
                         .agent(&policy.model)
                         .preamble(preamble)
@@ -897,7 +1102,7 @@ impl ModelProviderAdapter for RigModelAdapter {
                     Ok::<_, anyhow::Error>(agent.prompt(prompt).with_hook(hook.clone()).await?)
                 }
                 "Gemini" => {
-                    let client = gemini::Client::new(&config.api_key)?;
+                    let client = gemini_client(config)?;
                     let agent = client
                         .agent(&policy.model)
                         .preamble(preamble)
@@ -970,7 +1175,7 @@ pub async fn test_connection(config: &AIProviderConfig) -> Result<()> {
                 )
             }
             "Anthropic" => {
-                let client = anthropic::Client::new(&config.api_key)?;
+                let client = anthropic_client(config)?;
                 let agent = client.agent(&config.default_model).max_tokens(1).build();
                 Ok::<_, anyhow::Error>(
                     agent
@@ -981,7 +1186,7 @@ pub async fn test_connection(config: &AIProviderConfig) -> Result<()> {
                 )
             }
             "Gemini" => {
-                let client = gemini::Client::new(&config.api_key)?;
+                let client = gemini_client(config)?;
                 let agent = client.agent(&config.default_model).max_tokens(1).build();
                 Ok::<_, anyhow::Error>(agent.prompt("ping").with_hook(hook).await.map(|_| ())?)
             }
@@ -1014,7 +1219,9 @@ pub async fn test_connection(config: &AIProviderConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        max_turns_for_config, normalized_openai_compatible_base_url, openai_compatible_api_base_url,
+        gemini_api_base_url, is_http_unauthorized_or_forbidden, max_turns_for_config,
+        normalized_anthropic_base_url, normalized_gemini_base_url,
+        normalized_openai_compatible_base_url, openai_compatible_api_base_urls,
     };
     use crate::core::domain::AIProviderConfig;
 
@@ -1039,14 +1246,72 @@ mod tests {
     }
 
     #[test]
-    fn keeps_v1_suffix_for_model_listing_endpoints() {
+    fn normalizes_anthropic_base_url_without_duplicate_v1() {
         assert_eq!(
-            openai_compatible_api_base_url("https://api.deepseek.com"),
-            "https://api.deepseek.com/v1"
+            normalized_anthropic_base_url("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com"
         );
         assert_eq!(
-            openai_compatible_api_base_url("https://api.groq.com/openai/v1"),
-            "https://api.groq.com/openai/v1"
+            normalized_anthropic_base_url("https://ark.cn-beijing.volces.com/api/coding/"),
+            "https://ark.cn-beijing.volces.com/api/coding"
+        );
+    }
+
+    #[test]
+    fn normalizes_gemini_base_url_and_api_base_url() {
+        assert_eq!(
+            normalized_gemini_base_url("https://generativelanguage.googleapis.com/v1beta"),
+            "https://generativelanguage.googleapis.com"
+        );
+        assert_eq!(
+            normalized_gemini_base_url("https://generativelanguage.googleapis.com"),
+            "https://generativelanguage.googleapis.com"
+        );
+        assert_eq!(
+            gemini_api_base_url("https://generativelanguage.googleapis.com"),
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert_eq!(
+            gemini_api_base_url("https://generativelanguage.googleapis.com/v1beta"),
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+    }
+
+    #[test]
+    fn detects_auth_status_errors() {
+        assert!(is_http_unauthorized_or_forbidden(
+            "HTTP 401 Unauthorized: something"
+        ));
+        assert!(is_http_unauthorized_or_forbidden(
+            "HTTP 403 Forbidden: something"
+        ));
+        assert!(!is_http_unauthorized_or_forbidden(
+            "HTTP 404 Not Found: something"
+        ));
+    }
+
+    #[test]
+    fn builds_openai_compatible_model_listing_candidates() {
+        assert_eq!(
+            openai_compatible_api_base_urls("https://api.deepseek.com"),
+            vec![
+                "https://api.deepseek.com".to_string(),
+                "https://api.deepseek.com/v1".to_string(),
+            ]
+        );
+        assert_eq!(
+            openai_compatible_api_base_urls("https://api.groq.com/openai/v1"),
+            vec![
+                "https://api.groq.com/openai/v1".to_string(),
+                "https://api.groq.com/openai".to_string(),
+            ]
+        );
+        assert_eq!(
+            openai_compatible_api_base_urls("https://api.openai.com"),
+            vec![
+                "https://api.openai.com/v1".to_string(),
+                "https://api.openai.com".to_string(),
+            ]
         );
     }
 

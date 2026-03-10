@@ -25,7 +25,8 @@ use tokio::{
 use walkdir::WalkDir;
 
 use crate::core::domain::{
-    AgentProfile, SkillPack, ToolExecutionRequest, ToolExecutionResult, ToolHandler, ToolManifest,
+    AgentProfile, SkillDetail, SkillFileEntry, SkillPack, ToolExecutionRequest,
+    ToolExecutionResult, ToolHandler, ToolManifest, ToolStreamChunk, UpdateSkillDetailInput,
 };
 use crate::core::permissions::{APPROVAL_REQUIRED_PREFIX, PERMISSION_DENIED_PREFIX};
 use crate::core::skill_policy::{effective_tools_for_agent, selected_skills_for_agent};
@@ -40,49 +41,6 @@ pub struct ToolRuntime {
     bash_runs: Arc<AsyncMutex<HashMap<String, BackgroundBashRun>>>,
     bash_tasks: Arc<AsyncMutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     todo_state: Arc<AsyncMutex<Vec<TodoItem>>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FileToolInput {
-    path: String,
-    mode: Option<String>,
-    content: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ShellToolInput {
-    command: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct HttpToolInput {
-    url: String,
-    method: Option<String>,
-    body: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SearchToolInput {
-    query: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct BrowserToolInput {
-    url: String,
-    actions: Option<Vec<String>>,
-    headed: Option<bool>,
-    screenshot_name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SkillsToolInput {
-    action: String,
-    source: Option<String>,
-    path: Option<String>,
-    skill_id: Option<String>,
-    name: Option<String>,
-    prompt_template: Option<String>,
-    enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,50 +250,6 @@ impl ToolRuntime {
         let lowered = text.to_lowercase();
         let keywords: HashMap<&str, &[&str]> = HashMap::from([
             (
-                "shell.exec",
-                &[
-                    "shell",
-                    "bash",
-                    "terminal",
-                    "command",
-                    "rm ",
-                    "delete",
-                    "执行命令",
-                ][..],
-            ),
-            (
-                "browser.automation",
-                &["browser", "website", "web page", "网页", "site"][..],
-            ),
-            (
-                "http.request",
-                &[
-                    "http", "api", "request", "fetch", "接口", "https://", "http://",
-                ][..],
-            ),
-            (
-                "file.readwrite",
-                &[
-                    "file", "write", "document", "保存", "文件", ".md", ".rs", ".ts",
-                ][..],
-            ),
-            (
-                "project.search",
-                &["search", "find", "grep", "scan", "搜索", "查找"][..],
-            ),
-            (
-                "markdown.compose",
-                &["markdown", "report", "doc", "文档", "总结"][..],
-            ),
-            (
-                "plan.summarize",
-                &["summary", "summarize", "plan", "拆解", "计划"][..],
-            ),
-            (
-                "skills.manage",
-                &["skill", "skills", "安装", "github", "拖拽", "local"][..],
-            ),
-            (
                 "Task",
                 &["agent", "delegate", "subtask", "子任务", "委派"][..],
             ),
@@ -379,7 +293,10 @@ impl ToolRuntime {
         selected.or_else(|| {
             BUILTIN_TOOLS
                 .iter()
-                .find(|tool| tool.id == "plan.summarize")
+                .find(|tool| {
+                    tool.id == "TodoWrite"
+                        && (allowed_tool_ids.is_empty() || allowed_tool_ids.contains(&tool.id))
+                })
                 .cloned()
         })
     }
@@ -452,7 +369,102 @@ impl ToolRuntime {
         Ok(())
     }
 
-    pub fn install_skill_from_local_path(&self, source_path: &str) -> Result<SkillPack> {
+    pub fn get_installed_skill_detail(&self, skill_id: &str) -> Result<SkillDetail> {
+        let skill_dir = self.resolve_installed_skill_dir(skill_id)?;
+        let skill_pack = self.skill_pack_from_dir(&skill_dir)?;
+        let raw = fs::read_to_string(skill_dir.join("SKILL.md"))
+            .with_context(|| format!("failed reading {}", skill_dir.join("SKILL.md").display()))?;
+        let document = parse_skill_document(&raw);
+        Ok(SkillDetail {
+            skill_id: skill_id.to_string(),
+            enabled: skill_pack.enabled,
+            source: skill_pack.source,
+            install_path: skill_dir.display().to_string(),
+            name: skill_pack.name,
+            description: skill_pack.prompt_template,
+            argument_hint: document.argument_hint,
+            user_invocable: document.user_invocable,
+            disable_model_invocation: document.disable_model_invocation,
+            allowed_tools: document.allowed_tools,
+            model: document.model,
+            context: document.context,
+            agent: document.agent,
+            hooks_json: document.hooks_json,
+            summary: document.summary,
+            content: document.content,
+            files: self.list_skill_files(&skill_dir)?,
+        })
+    }
+
+    pub fn update_skill_detail(&self, input: UpdateSkillDetailInput) -> Result<SkillDetail> {
+        let skill_dir = self.resolve_installed_skill_dir(&input.skill_id)?;
+        let mut meta = self.load_skill_meta(&skill_dir)?;
+        meta.enabled = input.enabled;
+        meta.name = Some(input.name.trim().to_string());
+        meta.prompt_template = Some(input.description.trim().to_string());
+        self.save_skill_meta(&skill_dir, &meta)?;
+
+        let document = SkillDocument {
+            name: input.name,
+            description: input.description,
+            argument_hint: input.argument_hint,
+            user_invocable: input.user_invocable,
+            disable_model_invocation: input.disable_model_invocation,
+            allowed_tools: input.allowed_tools,
+            model: input.model,
+            context: input.context,
+            agent: input.agent,
+            hooks_json: input.hooks_json,
+            summary: input.summary,
+            content: input.content,
+        };
+        fs::write(skill_dir.join("SKILL.md"), build_skill_document(&document))?;
+        self.get_installed_skill_detail(&input.skill_id)
+    }
+
+    pub fn read_installed_skill_file(&self, skill_id: &str, relative_path: &str) -> Result<String> {
+        let skill_dir = self.resolve_installed_skill_dir(skill_id)?;
+        let file = self.resolve_skill_file_path(&skill_dir, relative_path)?;
+        if !file.exists() || !file.is_file() {
+            bail!("file not found: {}", relative_path);
+        }
+        let bytes = fs::read(&file)?;
+        if std::str::from_utf8(&bytes).is_err() {
+            bail!("file is binary and cannot be edited as text");
+        }
+        Ok(String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    pub fn upsert_installed_skill_file(
+        &self,
+        skill_id: &str,
+        relative_path: &str,
+        content: &str,
+    ) -> Result<()> {
+        let skill_dir = self.resolve_installed_skill_dir(skill_id)?;
+        let file = self.resolve_skill_file_path(&skill_dir, relative_path)?;
+        if let Some(parent) = file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(file, content.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn delete_installed_skill_file(&self, skill_id: &str, relative_path: &str) -> Result<()> {
+        let skill_dir = self.resolve_installed_skill_dir(skill_id)?;
+        let file = self.resolve_skill_file_path(&skill_dir, relative_path)?;
+        if !file.exists() {
+            bail!("file not found: {}", relative_path);
+        }
+        if file.is_dir() {
+            fs::remove_dir_all(file)?;
+        } else {
+            fs::remove_file(file)?;
+        }
+        Ok(())
+    }
+
+    pub fn install_skill_from_local_path(&self, source_path: &str) -> Result<Vec<SkillPack>> {
         let source = PathBuf::from(source_path.trim());
         if source.as_os_str().is_empty() {
             bail!("local skill path is empty");
@@ -475,14 +487,18 @@ impl ToolRuntime {
         } else {
             source
         };
-        self.install_skill_from_dir(&source_dir, InstalledSkillMeta::default())
+        self.install_skills_from_root(
+            &source_dir,
+            InstalledSkillMeta::default(),
+            Some("local source"),
+        )
     }
 
     pub async fn install_skill_from_github(
         &self,
         source: &str,
         skill_path: Option<&str>,
-    ) -> Result<SkillPack> {
+    ) -> Result<Vec<SkillPack>> {
         let (repo_url, embedded_path) = parse_github_source(source)?;
         let relative_path = skill_path
             .map(str::trim)
@@ -521,9 +537,12 @@ impl ToolRuntime {
         } else {
             clone_dir.clone()
         };
-        let install_source = resolve_skill_source_dir(&candidate)?;
-        let result = self.install_skill_from_dir(
-            &install_source,
+        if !candidate.exists() {
+            let _ = fs::remove_dir_all(&clone_dir);
+            bail!("provided skill path does not exist in repository");
+        }
+        let result = self.install_skills_from_root(
+            &candidate,
             InstalledSkillMeta {
                 source: "github".into(),
                 source_ref: Some(source.to_string()),
@@ -531,14 +550,51 @@ impl ToolRuntime {
                 name: None,
                 prompt_template: None,
             },
+            Some("github source"),
         );
         let _ = fs::remove_dir_all(&clone_dir);
         result
     }
 
+    fn install_skills_from_root(
+        &self,
+        root: &Path,
+        meta: InstalledSkillMeta,
+        source_label: Option<&str>,
+    ) -> Result<Vec<SkillPack>> {
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("invalid root path: {}", root.display()))?;
+        let slug_base = if root.is_file() {
+            root.parent()
+                .ok_or_else(|| anyhow!("invalid source file path"))?
+                .to_path_buf()
+        } else {
+            root.clone()
+        };
+        let skill_dirs = discover_skill_dirs(&root)?;
+        if skill_dirs.is_empty() {
+            bail!(
+                "no skills found in {}: {}",
+                source_label.unwrap_or("source"),
+                root.display()
+            );
+        }
+
+        let mut installed = Vec::new();
+        for skill_dir in skill_dirs {
+            let slug = skill_slug_from_root_and_dir(&slug_base, &skill_dir)?;
+            let skill = self.install_skill_from_dir(&skill_dir, &slug, meta.clone())?;
+            installed.push(skill);
+        }
+        installed.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(installed)
+    }
+
     fn install_skill_from_dir(
         &self,
         source_dir: &Path,
+        slug: &str,
         meta: InstalledSkillMeta,
     ) -> Result<SkillPack> {
         let source_dir = source_dir
@@ -552,7 +608,6 @@ impl ToolRuntime {
         let skills_root = self.skills_root();
         fs::create_dir_all(&skills_root)?;
 
-        let slug = skill_slug_from_path(&source_dir)?;
         let destination = skills_root.join(slug);
         if destination.exists() {
             fs::remove_dir_all(&destination).with_context(|| {
@@ -635,17 +690,73 @@ impl ToolRuntime {
         Ok(dir)
     }
 
-    fn is_allowed_path(&self, path: &Path) -> bool {
-        path.starts_with(&self.workspace_root) || path.starts_with(&self.app_data_dir)
+    fn list_skill_files(&self, skill_dir: &Path) -> Result<Vec<SkillFileEntry>> {
+        let mut files = Vec::new();
+        let iter = WalkDir::new(skill_dir).into_iter().filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            !matches!(name.as_ref(), ".git")
+        });
+        for entry in iter.filter_map(Result::ok) {
+            let path = entry.path();
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("");
+            if matches!(name, "SKILL.md" | ".nextchat-skill.json") {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(skill_dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            let bytes = fs::read(path).unwrap_or_default();
+            files.push(SkillFileEntry {
+                path: relative,
+                size: bytes.len() as i64,
+                is_binary: std::str::from_utf8(&bytes).is_err(),
+            });
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(files)
     }
 
-    fn resolve_permission_root(&self, raw: &str) -> PathBuf {
-        let trimmed = raw.trim();
-        if trimmed.eq_ignore_ascii_case("app_data") || trimmed.eq_ignore_ascii_case("$APP_DATA") {
-            return self.app_data_dir.clone();
+    fn resolve_skill_file_path(&self, skill_dir: &Path, relative_path: &str) -> Result<PathBuf> {
+        let trimmed = relative_path.trim().trim_start_matches('/');
+        if trimmed.is_empty() {
+            bail!("relative file path is empty");
         }
+        if matches!(trimmed, "SKILL.md" | ".nextchat-skill.json") {
+            bail!("protected file cannot be edited from file list");
+        }
+        let candidate = skill_dir.join(trimmed);
+        let normalized = if candidate.exists() {
+            candidate.canonicalize().unwrap_or(candidate)
+        } else {
+            candidate
+        };
+        if !normalized.starts_with(skill_dir) {
+            bail!("path escapes skill directory");
+        }
+        Ok(normalized)
+    }
+
+    fn is_path_within_execution_scope(&self, path: &Path, execution_root: &Path) -> bool {
+        path.starts_with(execution_root) || path.starts_with(&self.app_data_dir)
+    }
+
+    pub fn normalize_working_directory(&self, raw: &str) -> Result<String> {
+        let execution_root = self.resolve_execution_root(raw)?;
+        Ok(execution_root.display().to_string())
+    }
+
+    fn resolve_execution_root(&self, raw: &str) -> Result<PathBuf> {
+        let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed == "." {
-            return self.workspace_root.clone();
+            return Ok(self.workspace_root.clone());
         }
 
         let candidate = PathBuf::from(trimmed);
@@ -654,15 +765,47 @@ impl ToolRuntime {
         } else {
             self.workspace_root.join(candidate)
         };
+        let normalized = absolute
+            .canonicalize()
+            .with_context(|| format!("working directory not found: {}", absolute.display()))?;
+        if !normalized.is_dir() {
+            bail!(
+                "working directory is not a directory: {}",
+                normalized.display()
+            );
+        }
+        Ok(normalized)
+    }
+
+    fn resolve_permission_root(&self, raw: &str, execution_root: &Path) -> PathBuf {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("app_data") || trimmed.eq_ignore_ascii_case("$APP_DATA") {
+            return self.app_data_dir.clone();
+        }
+        if trimmed.is_empty() || trimmed == "." {
+            return execution_root.to_path_buf();
+        }
+
+        let candidate = PathBuf::from(trimmed);
+        let absolute = if candidate.is_absolute() {
+            candidate
+        } else {
+            execution_root.join(candidate)
+        };
         absolute.canonicalize().unwrap_or(absolute)
     }
 
-    fn resolve_path(&self, raw: &str, create_parent: bool) -> Result<PathBuf> {
+    fn resolve_path(
+        &self,
+        raw: &str,
+        create_parent: bool,
+        execution_root: &Path,
+    ) -> Result<PathBuf> {
         let candidate = PathBuf::from(raw.trim());
         let absolute = if candidate.is_absolute() {
             candidate
         } else {
-            self.workspace_root.join(candidate)
+            execution_root.join(candidate)
         };
 
         let normalized = if create_parent {
@@ -684,149 +827,15 @@ impl ToolRuntime {
                 .with_context(|| format!("file not found: {}", absolute.display()))?
         };
 
-        if !self.is_allowed_path(&normalized) {
+        if !self.is_path_within_execution_scope(&normalized, execution_root) {
             bail!(
-                "path '{}' is outside allowed roots '{}', '{}'",
+                "path '{}' is outside working directory '{}' and app data '{}'",
                 normalized.display(),
-                self.workspace_root.display(),
+                execution_root.display(),
                 self.app_data_dir.display()
             );
         }
         Ok(normalized)
-    }
-
-    fn parse_file_input(&self, input: &str) -> Result<FileToolInput> {
-        if let Ok(parsed) = serde_json::from_str::<FileToolInput>(input) {
-            return Ok(parsed);
-        }
-
-        let path_regex = Regex::new(
-            r#"([./~A-Za-z0-9_\-]+(?:/[A-Za-z0-9._\-]+)+|[A-Za-z0-9._\-]+\.[A-Za-z0-9]+)"#,
-        )
-        .expect("file regex");
-        let path = path_regex
-            .captures(input)
-            .and_then(|capture| capture.get(1).map(|m| m.as_str().to_string()))
-            .ok_or_else(|| anyhow!("could not infer a file path from input"))?;
-        let lowered = input.to_lowercase();
-        let mode = if lowered.contains("write")
-            || lowered.contains("save")
-            || lowered.contains("保存")
-            || lowered.contains("写入")
-        {
-            "write".to_string()
-        } else {
-            "read".to_string()
-        };
-        let content = if mode == "write" {
-            input
-                .split_once("content:")
-                .map(|(_, value)| value.trim().to_string())
-        } else {
-            None
-        };
-        Ok(FileToolInput {
-            path,
-            mode: Some(mode),
-            content,
-        })
-    }
-
-    fn parse_shell_input(&self, input: &str) -> Result<ShellToolInput> {
-        if let Ok(parsed) = serde_json::from_str::<ShellToolInput>(input) {
-            return Ok(parsed);
-        }
-        let command = if let Some((_, body)) = input.split_once("command:") {
-            body.trim().to_string()
-        } else if let Some(capture) = Regex::new(r"`([^`]+)`")
-            .expect("command regex")
-            .captures(input)
-            .and_then(|capture| capture.get(1).map(|m| m.as_str().to_string()))
-        {
-            capture
-        } else {
-            input.trim().to_string()
-        };
-        if command.is_empty() {
-            bail!("shell command is empty");
-        }
-        Ok(ShellToolInput { command })
-    }
-
-    fn parse_http_input(&self, input: &str) -> Result<HttpToolInput> {
-        if let Ok(parsed) = serde_json::from_str::<HttpToolInput>(input) {
-            return Ok(parsed);
-        }
-        let url = Regex::new(r#"https?://[^\s"']+"#)
-            .expect("url regex")
-            .find(input)
-            .map(|m| m.as_str().to_string())
-            .ok_or_else(|| anyhow!("could not infer a URL from input"))?;
-        let method = if input.to_lowercase().contains("post") {
-            Some("POST".to_string())
-        } else {
-            Some("GET".to_string())
-        };
-        Ok(HttpToolInput {
-            url,
-            method,
-            body: None,
-        })
-    }
-
-    fn parse_search_input(&self, input: &str) -> SearchToolInput {
-        if let Ok(parsed) = serde_json::from_str::<SearchToolInput>(input) {
-            return parsed;
-        }
-        let query = input
-            .replace("search", "")
-            .replace("find", "")
-            .replace("grep", "")
-            .replace("搜索", "")
-            .trim()
-            .to_string();
-        SearchToolInput {
-            query: if query.is_empty() {
-                input.trim().to_string()
-            } else {
-                query
-            },
-        }
-    }
-
-    fn parse_browser_input(&self, input: &str) -> Result<BrowserToolInput> {
-        if let Ok(parsed) = serde_json::from_str::<BrowserToolInput>(input) {
-            return Ok(parsed);
-        }
-        let url = Regex::new(r#"https?://[^\s"']+"#)
-            .expect("browser url regex")
-            .find(input)
-            .map(|m| m.as_str().to_string())
-            .ok_or_else(|| anyhow!("could not infer a browser URL from input"))?;
-        Ok(BrowserToolInput {
-            url,
-            actions: None,
-            headed: Some(false),
-            screenshot_name: None,
-        })
-    }
-
-    fn parse_skills_input(&self, input: &str) -> Result<SkillsToolInput> {
-        if let Ok(parsed) = serde_json::from_str::<SkillsToolInput>(input) {
-            if parsed.action.trim().is_empty() {
-                bail!("skills.manage action is required");
-            }
-            return Ok(parsed);
-        }
-        Ok(SkillsToolInput {
-            action: input.trim().to_string(),
-            source: None,
-            path: None,
-            skill_id: None,
-            name: None,
-            prompt_template: None,
-            enabled: None,
-        })
     }
 
     fn parse_json_input<T>(&self, input: &str, tool_name: &str) -> Result<T>
@@ -841,17 +850,18 @@ impl ToolRuntime {
         &self,
         command_text: String,
         timeout_ms: u64,
+        execution_root: &Path,
     ) -> Result<(i32, String, String)> {
         let worker_binary = resolve_worker_binary()?;
         let payload = serde_json::to_vec(&ShellWorkerRequest {
-            workspace_root: self.workspace_root.display().to_string(),
+            workspace_root: execution_root.display().to_string(),
             command: command_text,
         })?;
 
         let mut command = Command::new(worker_binary);
         command.arg("--tool-worker").arg("shell-exec");
         command
-            .current_dir(&self.workspace_root)
+            .current_dir(execution_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -920,437 +930,103 @@ impl ToolRuntime {
         Ok((response.status, response.stdout, response.stderr))
     }
 
-    async fn run_file_tool(&self, request: &ToolExecutionRequest) -> Result<ToolExecutionResult> {
-        let input = self.parse_file_input(&request.input)?;
-        let mode = input
-            .mode
-            .unwrap_or_else(|| "read".to_string())
-            .to_lowercase();
-        match mode.as_str() {
-            "read" => {
-                let path = self.resolve_path(&input.path, false)?;
-                let mut file = tokio_fs::File::open(&path).await?;
-                let mut buffer = Vec::new();
-                file.read_to_end(&mut buffer).await?;
-                let content = String::from_utf8_lossy(&buffer).to_string();
-                let output = json!({
-                    "path": path.display().to_string(),
-                    "saved": false,
-                    "content": truncate(&content, 16_000),
-                })
-                .to_string();
-                Ok(ToolExecutionResult {
-                    output: output.clone(),
-                    result_ref: Some(path.display().to_string()),
-                })
-            }
-            "write" => {
-                let path = self.resolve_path(&input.path, true)?;
-                let content = input
-                    .content
-                    .ok_or_else(|| anyhow!("file write requires content"))?;
-                tokio_fs::write(&path, content.as_bytes()).await?;
-                let output = json!({
-                    "path": path.display().to_string(),
-                    "saved": true,
-                    "content": truncate(&content, 8_000),
-                })
-                .to_string();
-                Ok(ToolExecutionResult {
-                    output: output.clone(),
-                    result_ref: Some(path.display().to_string()),
-                })
-            }
-            other => bail!("unsupported file mode '{other}'"),
-        }
-    }
-
-    async fn run_search_tool(&self, request: &ToolExecutionRequest) -> Result<ToolExecutionResult> {
-        let input = self.parse_search_input(&request.input);
-        if input.query.trim().is_empty() {
-            bail!("search query is empty");
-        }
-        let query_lower = input.query.to_lowercase();
-        let matches = tokio::task::spawn_blocking({
-            let root = self.workspace_root.clone();
-            move || -> Result<Vec<String>> {
-                let mut results = Vec::new();
-                let iter = WalkDir::new(&root)
-                    .into_iter()
-                    .filter_entry(|entry| !should_skip_dir(entry.path()));
-                for entry in iter.filter_map(Result::ok) {
-                    if results.len() >= 40 {
-                        break;
-                    }
-                    let path = entry.path();
-                    if !entry.file_type().is_file() || should_skip_file(path) {
-                        continue;
-                    }
-                    let bytes = fs::read(path).unwrap_or_default();
-                    if bytes.is_empty() {
-                        continue;
-                    }
-                    let haystack = String::from_utf8_lossy(&bytes);
-                    for (index, line) in haystack.lines().enumerate() {
-                        if line.to_lowercase().contains(&query_lower) {
-                            let relative = path
-                                .strip_prefix(&root)
-                                .unwrap_or(path)
-                                .display()
-                                .to_string();
-                            results.push(format!(
-                                "{}:{}:{}",
-                                relative,
-                                index + 1,
-                                truncate(line.trim(), 180)
-                            ));
-                            if results.len() >= 40 {
-                                break;
-                            }
-                        }
-                    }
-                }
-                Ok(results)
-            }
-        })
-        .await??;
-
-        let output = json!({
-            "query": input.query,
-            "matchCount": matches.len(),
-            "matches": matches,
-        })
-        .to_string();
-        Ok(ToolExecutionResult {
-            output: output.clone(),
-            result_ref: Some(output),
-        })
-    }
-
-    async fn run_shell_tool(&self, request: &ToolExecutionRequest) -> Result<ToolExecutionResult> {
-        let input = self.parse_shell_input(&request.input)?;
-        let (status, stdout_raw, stderr_raw) = self
-            .run_shell_command_with_worker(input.command.clone(), 45_000)
-            .await?;
-        let stdout = truncate(&stdout_raw, 16_000);
-        let stderr = truncate(&stderr_raw, 8_000);
-        let result = json!({
-            "command": input.command,
-            "status": status,
-            "stdout": stdout,
-            "stderr": stderr,
-            "worker": "external_process",
-        })
-        .to_string();
-        Ok(ToolExecutionResult {
-            output: result.clone(),
-            result_ref: Some(result),
-        })
-    }
-
-    async fn run_http_tool(&self, request: &ToolExecutionRequest) -> Result<ToolExecutionResult> {
-        let input = self.parse_http_input(&request.input)?;
-        let method = input
-            .method
-            .unwrap_or_else(|| "GET".to_string())
-            .to_uppercase();
-        let response = match method.as_str() {
-            "POST" => {
-                let body = input.body.unwrap_or_default();
-                self.http_client.post(&input.url).body(body).send().await?
-            }
-            "PUT" => {
-                let body = input.body.unwrap_or_default();
-                self.http_client.put(&input.url).body(body).send().await?
-            }
-            "DELETE" => self.http_client.delete(&input.url).send().await?,
-            _ => self.http_client.get(&input.url).send().await?,
+    async fn run_shell_command_streaming(
+        &self,
+        command_text: String,
+        timeout_ms: u64,
+        execution_root: &Path,
+        tool_id: &str,
+        tool_stream: Option<tokio::sync::mpsc::UnboundedSender<ToolStreamChunk>>,
+    ) -> Result<(i32, String, String)> {
+        let mut command = if cfg!(target_os = "windows") {
+            let mut cmd = Command::new("cmd");
+            cmd.arg("/C").arg(&command_text);
+            cmd
+        } else {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-lc").arg(&command_text);
+            cmd
         };
-        let status = response.status().as_u16();
-        let body = truncate(&response.text().await.unwrap_or_default(), 16_000);
-        let output = json!({
-            "url": input.url,
-            "method": method,
-            "status": status,
-            "body": body,
-        })
-        .to_string();
-        Ok(ToolExecutionResult {
-            output: output.clone(),
-            result_ref: Some(output),
-        })
-    }
-
-    async fn run_browser_tool(
-        &self,
-        request: &ToolExecutionRequest,
-    ) -> Result<ToolExecutionResult> {
-        let input = self.parse_browser_input(&request.input)?;
-        let wrapper =
-            PathBuf::from("/Users/a1024/.codex/skills/playwright/scripts/playwright_cli.sh");
-        if !wrapper.exists() {
-            bail!("playwright wrapper not found at {}", wrapper.display());
-        }
-
-        let session =
-            sanitize_session_name(&format!("{}-{}", request.task_card_id, request.agent_id));
-        let output_dir = self.workspace_root.join("output/playwright").join(&session);
-        fs::create_dir_all(&output_dir)?;
-        let mut logs = Vec::new();
-
-        let mut open_args = vec!["open".to_string(), input.url.clone()];
-        if input.headed.unwrap_or(false) {
-            open_args.push("--headed".to_string());
-        }
-        logs.push(
-            self.run_playwright_command(&wrapper, &output_dir, &session, &open_args, 60)
-                .await
-                .context("failed to open browser page")?,
-        );
-        logs.push(
-            self.run_playwright_command(
-                &wrapper,
-                &output_dir,
-                &session,
-                &[String::from("snapshot")],
-                60,
-            )
-            .await
-            .context("failed to snapshot browser page")?,
-        );
-
-        if let Some(actions) = input.actions.clone() {
-            for action in actions {
-                let args = shell_words(&action);
-                if args.is_empty() {
-                    continue;
-                }
-                let is_navigation_like = matches!(
-                    args.first().map(String::as_str),
-                    Some("click" | "fill" | "type" | "press" | "tab-new" | "tab-select" | "open")
-                );
-                logs.push(
-                    self.run_playwright_command(&wrapper, &output_dir, &session, &args, 90)
-                        .await
-                        .with_context(|| format!("playwright action failed: {action}"))?,
-                );
-                if is_navigation_like {
-                    logs.push(
-                        self.run_playwright_command(
-                            &wrapper,
-                            &output_dir,
-                            &session,
-                            &[String::from("snapshot")],
-                            60,
-                        )
-                        .await
-                        .context("failed to refresh snapshot after browser action")?,
-                    );
-                }
-            }
-        }
-
-        let screenshot_name = input
-            .screenshot_name
-            .unwrap_or_else(|| "screenshot.png".to_string());
-        let screenshot_path = output_dir.join(&screenshot_name);
-        logs.push(
-            self.run_playwright_command(
-                &wrapper,
-                &output_dir,
-                &session,
-                &[String::from("screenshot")],
-                90,
-            )
-            .await
-            .context("failed to capture Playwright screenshot")?,
-        );
-
-        let output = json!({
-            "session": session,
-            "url": input.url,
-            "screenshot": screenshot_path.display().to_string(),
-            "logs": logs,
-        })
-        .to_string();
-        Ok(ToolExecutionResult {
-            output: output.clone(),
-            result_ref: Some(screenshot_path.display().to_string()),
-        })
-    }
-
-    async fn run_playwright_command(
-        &self,
-        wrapper: &Path,
-        command_dir: &Path,
-        session: &str,
-        args: &[String],
-        timeout_secs: u64,
-    ) -> Result<String> {
-        let mut command = Command::new(wrapper);
         command
-            .env("PLAYWRIGHT_CLI_SESSION", session)
-            .current_dir(command_dir)
+            .current_dir(execution_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for arg in args {
-            command.arg(arg);
-        }
 
-        let output = timeout(Duration::from_secs(timeout_secs), command.output())
+        let mut child = command.spawn().context("failed to spawn shell command")?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("shell command stdout unavailable"))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("shell command stderr unavailable"))?;
+
+        let stdout_stream = tool_stream.clone();
+        let stderr_stream = tool_stream;
+        let stdout_tool_id = tool_id.to_string();
+        let stderr_tool_id = tool_id.to_string();
+
+        let stdout_task = tokio::spawn(async move {
+            let mut output = String::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stdout.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
+                output.push_str(&chunk);
+                if let Some(stream) = stdout_stream.as_ref() {
+                    let _ = stream.send(ToolStreamChunk {
+                        tool_id: stdout_tool_id.clone(),
+                        channel: "stdout".to_string(),
+                        delta: chunk,
+                    });
+                }
+            }
+            Result::<String>::Ok(output)
+        });
+
+        let stderr_task = tokio::spawn(async move {
+            let mut output = String::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stderr.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
+                output.push_str(&chunk);
+                if let Some(stream) = stderr_stream.as_ref() {
+                    let _ = stream.send(ToolStreamChunk {
+                        tool_id: stderr_tool_id.clone(),
+                        channel: "stderr".to_string(),
+                        delta: chunk,
+                    });
+                }
+            }
+            Result::<String>::Ok(output)
+        });
+
+        let status = match timeout(Duration::from_millis(timeout_ms), child.wait()).await {
+            Ok(result) => result.context("shell command wait failed")?,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                bail!("shell command timed out");
+            }
+        };
+
+        let stdout = stdout_task
             .await
-            .map_err(|_| anyhow!("playwright command timed out"))??;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("Executable doesn't exist") || stderr.contains("install") {
-                bail!(
-                    "Playwright browser is not installed. Run `PLAYWRIGHT_BROWSERS_PATH=0 npx playwright install chromium` first."
-                );
-            }
-            bail!("playwright command failed: {}", stderr.trim());
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stdout.is_empty() && stderr.is_empty() {
-            Ok(format!("{} ok", args.join(" ")))
-        } else if stderr.is_empty() {
-            Ok(truncate(&stdout, 12_000))
-        } else {
-            Ok(truncate(&format!("{stdout}\n{stderr}"), 12_000))
-        }
-    }
-
-    fn run_markdown_tool(&self, request: &ToolExecutionRequest) -> ToolExecutionResult {
-        let output = format!("# Draft\n\n{}", request.input.trim());
-        ToolExecutionResult {
-            output: output.clone(),
-            result_ref: Some(output),
-        }
-    }
-
-    fn run_plan_tool(&self, request: &ToolExecutionRequest) -> ToolExecutionResult {
-        let cleaned = request.input.trim();
-        let output = json!({
-            "summary": format!("Execution plan ready: {}", truncate(cleaned, 600)),
-            "taskCardId": request.task_card_id,
-            "agentId": request.agent_id,
-        })
-        .to_string();
-        ToolExecutionResult {
-            output: output.clone(),
-            result_ref: Some(output),
-        }
-    }
-
-    async fn run_skills_tool(&self, request: &ToolExecutionRequest) -> Result<ToolExecutionResult> {
-        let input = self.parse_skills_input(&request.input)?;
-        match input.action.trim() {
-            "list" => {
-                let skills = self.all_skills();
-                let output = json!({
-                    "action": "list",
-                    "status": "ok",
-                    "count": skills.len(),
-                    "skills": skills,
-                })
-                .to_string();
-                Ok(ToolExecutionResult {
-                    output: output.clone(),
-                    result_ref: Some(output),
-                })
-            }
-            "install_local" => {
-                let source = input
-                    .source
-                    .ok_or_else(|| anyhow!("install_local requires source path"))?;
-                let skill = self.install_skill_from_local_path(&source)?;
-                let output = json!({
-                    "action": "install_local",
-                    "status": "ok",
-                    "skill": skill,
-                })
-                .to_string();
-                Ok(ToolExecutionResult {
-                    output: output.clone(),
-                    result_ref: Some(output),
-                })
-            }
-            "install_github" => {
-                let source = input
-                    .source
-                    .ok_or_else(|| anyhow!("install_github requires source URL"))?;
-                let skill = self
-                    .install_skill_from_github(&source, input.path.as_deref())
-                    .await?;
-                let output = json!({
-                    "action": "install_github",
-                    "status": "ok",
-                    "skill": skill,
-                })
-                .to_string();
-                Ok(ToolExecutionResult {
-                    output: output.clone(),
-                    result_ref: Some(output),
-                })
-            }
-            "update" => {
-                let skill_id = input
-                    .skill_id
-                    .ok_or_else(|| anyhow!("update requires skill_id"))?;
-                let skill = self.update_installed_skill(
-                    &skill_id,
-                    input.name.clone(),
-                    input.prompt_template.clone(),
-                )?;
-                let output = json!({
-                    "action": "update",
-                    "status": "ok",
-                    "skill": skill,
-                })
-                .to_string();
-                Ok(ToolExecutionResult {
-                    output: output.clone(),
-                    result_ref: Some(output),
-                })
-            }
-            "toggle" => {
-                let skill_id = input
-                    .skill_id
-                    .ok_or_else(|| anyhow!("toggle requires skill_id"))?;
-                let enabled = input
-                    .enabled
-                    .ok_or_else(|| anyhow!("toggle requires enabled"))?;
-                let skill = self.set_installed_skill_enabled(&skill_id, enabled)?;
-                let output = json!({
-                    "action": "toggle",
-                    "status": "ok",
-                    "skill": skill,
-                })
-                .to_string();
-                Ok(ToolExecutionResult {
-                    output: output.clone(),
-                    result_ref: Some(output),
-                })
-            }
-            "delete" => {
-                let skill_id = input
-                    .skill_id
-                    .ok_or_else(|| anyhow!("delete requires skill_id"))?;
-                self.delete_installed_skill(&skill_id)?;
-                let output = json!({
-                    "action": "delete",
-                    "status": "ok",
-                    "skillId": skill_id,
-                })
-                .to_string();
-                Ok(ToolExecutionResult {
-                    output: output.clone(),
-                    result_ref: Some(output),
-                })
-            }
-            other => bail!("unsupported skills.manage action '{other}'"),
-        }
+            .context("shell command stdout join failed")??;
+        let stderr = stderr_task
+            .await
+            .context("shell command stderr join failed")??;
+        Ok((status.code().unwrap_or_default(), stdout, stderr))
     }
 
     async fn run_task_compat_tool(
@@ -1381,6 +1057,7 @@ impl ToolRuntime {
         request: &ToolExecutionRequest,
     ) -> Result<ToolExecutionResult> {
         let input = self.parse_json_input::<BashCompatInput>(&request.input, "Bash")?;
+        let execution_root = self.resolve_execution_root(&request.working_directory)?;
         if input.command.trim().is_empty() {
             bail!("Bash command is empty");
         }
@@ -1397,7 +1074,7 @@ impl ToolRuntime {
             let bash_id_for_task = bash_id.clone();
             let task = tokio::spawn(async move {
                 let result = runtime
-                    .run_shell_command_with_worker(command.clone(), timeout_ms)
+                    .run_shell_command_with_worker(command.clone(), timeout_ms, &execution_root)
                     .await;
                 let mut runs = runtime.bash_runs.lock().await;
                 if let Some(run) = runs.get_mut(&bash_id_for_task) {
@@ -1435,7 +1112,13 @@ impl ToolRuntime {
         }
 
         let (status, stdout, stderr) = self
-            .run_shell_command_with_worker(input.command.clone(), timeout_ms)
+            .run_shell_command_streaming(
+                input.command.clone(),
+                timeout_ms,
+                &execution_root,
+                &request.tool.id,
+                request.tool_stream.clone(),
+            )
             .await?;
         let output = json!({
             "command": input.command,
@@ -1456,13 +1139,14 @@ impl ToolRuntime {
         request: &ToolExecutionRequest,
     ) -> Result<ToolExecutionResult> {
         let input = self.parse_json_input::<GlobToolInput>(&request.input, "Glob")?;
+        let execution_root = self.resolve_execution_root(&request.working_directory)?;
         if input.pattern.trim().is_empty() {
             bail!("glob pattern is required");
         }
         let root = if let Some(path) = input.path {
-            self.resolve_path(path.trim(), false)?
+            self.resolve_path(path.trim(), false, &execution_root)?
         } else {
-            self.workspace_root.clone()
+            execution_root
         };
         if !root.exists() || !root.is_dir() {
             bail!("glob path does not exist or is not a directory");
@@ -1503,13 +1187,14 @@ impl ToolRuntime {
         request: &ToolExecutionRequest,
     ) -> Result<ToolExecutionResult> {
         let input = self.parse_json_input::<GrepToolInput>(&request.input, "Grep")?;
+        let execution_root = self.resolve_execution_root(&request.working_directory)?;
         if input.pattern.trim().is_empty() {
             bail!("grep pattern is required");
         }
         let root = if let Some(path) = input.path.clone() {
-            self.resolve_path(path.trim(), false)?
+            self.resolve_path(path.trim(), false, &execution_root)?
         } else {
-            self.workspace_root.clone()
+            execution_root.clone()
         };
         let mode = input
             .output_mode
@@ -1549,7 +1234,7 @@ impl ToolRuntime {
                 }
             }
             let rel = path
-                .strip_prefix(&self.workspace_root)
+                .strip_prefix(&execution_root)
                 .unwrap_or(path.as_path())
                 .to_string_lossy()
                 .replace('\\', "/");
@@ -1648,10 +1333,8 @@ impl ToolRuntime {
         request: &ToolExecutionRequest,
     ) -> Result<ToolExecutionResult> {
         let input = self.parse_json_input::<LsToolInput>(&request.input, "LS")?;
-        let path = PathBuf::from(input.path.trim());
-        if !path.is_absolute() {
-            bail!("LS path must be absolute");
-        }
+        let execution_root = self.resolve_execution_root(&request.working_directory)?;
+        let path = self.resolve_path(input.path.trim(), false, &execution_root)?;
         if !path.exists() || !path.is_dir() {
             bail!("LS path does not exist or is not a directory");
         }
@@ -1707,7 +1390,8 @@ impl ToolRuntime {
         request: &ToolExecutionRequest,
     ) -> Result<ToolExecutionResult> {
         let input = self.parse_json_input::<ReadToolInput>(&request.input, "Read")?;
-        let path = self.resolve_path(&input.file_path, false)?;
+        let execution_root = self.resolve_execution_root(&request.working_directory)?;
+        let path = self.resolve_path(&input.file_path, false, &execution_root)?;
         let content = tokio_fs::read_to_string(&path).await?;
         let all_lines = content.lines().collect::<Vec<_>>();
         let start_line = input.offset.unwrap_or(1).max(1);
@@ -1738,10 +1422,11 @@ impl ToolRuntime {
         request: &ToolExecutionRequest,
     ) -> Result<ToolExecutionResult> {
         let input = self.parse_json_input::<EditToolInput>(&request.input, "Edit")?;
+        let execution_root = self.resolve_execution_root(&request.working_directory)?;
         if input.old_string == input.new_string {
             bail!("old_string and new_string cannot be the same");
         }
-        let path = self.resolve_path(&input.file_path, false)?;
+        let path = self.resolve_path(&input.file_path, false, &execution_root)?;
         let content = tokio_fs::read_to_string(&path).await?;
         let occurrences = content.matches(&input.old_string).count();
         if occurrences == 0 {
@@ -1774,10 +1459,11 @@ impl ToolRuntime {
         request: &ToolExecutionRequest,
     ) -> Result<ToolExecutionResult> {
         let input = self.parse_json_input::<MultiEditToolInput>(&request.input, "MultiEdit")?;
+        let execution_root = self.resolve_execution_root(&request.working_directory)?;
         if input.edits.is_empty() {
             bail!("MultiEdit requires at least one edit");
         }
-        let path = self.resolve_path(&input.file_path, false)?;
+        let path = self.resolve_path(&input.file_path, false, &execution_root)?;
         let mut content = tokio_fs::read_to_string(&path).await?;
         let mut replacements = 0usize;
         for edit in &input.edits {
@@ -1818,7 +1504,8 @@ impl ToolRuntime {
         request: &ToolExecutionRequest,
     ) -> Result<ToolExecutionResult> {
         let input = self.parse_json_input::<WriteToolInput>(&request.input, "Write")?;
-        let path = self.resolve_path(&input.file_path, true)?;
+        let execution_root = self.resolve_execution_root(&request.working_directory)?;
+        let path = self.resolve_path(&input.file_path, true, &execution_root)?;
         tokio_fs::write(&path, input.content.as_bytes()).await?;
         let output = json!({
             "status": "ok",
@@ -1838,7 +1525,8 @@ impl ToolRuntime {
     ) -> Result<ToolExecutionResult> {
         let input =
             self.parse_json_input::<NotebookEditToolInput>(&request.input, "NotebookEdit")?;
-        let path = self.resolve_path(&input.notebook_path, false)?;
+        let execution_root = self.resolve_execution_root(&request.working_directory)?;
+        let path = self.resolve_path(&input.notebook_path, false, &execution_root)?;
         let raw = tokio_fs::read_to_string(&path).await?;
         let mut notebook: Value =
             serde_json::from_str(&raw).context("invalid notebook JSON content")?;
@@ -2156,7 +1844,12 @@ impl ToolRuntime {
 #[async_trait]
 impl ToolHandler for ToolRuntime {
     async fn execute(&self, request: ToolExecutionRequest) -> Result<ToolExecutionResult> {
-        let decision = self.authorize_tool_call(&request.agent, &request.tool, &request.input)?;
+        let decision = self.authorize_tool_call(
+            &request.agent,
+            &request.tool,
+            &request.input,
+            &request.working_directory,
+        )?;
         if !decision.allowed {
             bail!(
                 "{PERMISSION_DENIED_PREFIX} {}",
@@ -2174,14 +1867,6 @@ impl ToolHandler for ToolRuntime {
         }
 
         match request.tool.id.as_str() {
-            "file.readwrite" => self.run_file_tool(&request).await,
-            "project.search" => self.run_search_tool(&request).await,
-            "shell.exec" => self.run_shell_tool(&request).await,
-            "http.request" => self.run_http_tool(&request).await,
-            "browser.automation" => self.run_browser_tool(&request).await,
-            "markdown.compose" => Ok(self.run_markdown_tool(&request)),
-            "plan.summarize" => Ok(self.run_plan_tool(&request)),
-            "skills.manage" => self.run_skills_tool(&request).await,
             "Task" => self.run_task_compat_tool(&request).await,
             "Bash" => self.run_bash_compat_tool(&request).await,
             "Glob" => self.run_glob_compat_tool(&request).await,
@@ -2208,6 +1893,22 @@ struct SkillMarkdownMeta {
     name: Option<String>,
     description: Option<String>,
     tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SkillDocument {
+    name: String,
+    description: String,
+    argument_hint: Option<String>,
+    user_invocable: bool,
+    disable_model_invocation: bool,
+    allowed_tools: Option<String>,
+    model: Option<String>,
+    context: Option<String>,
+    agent: Option<String>,
+    hooks_json: Option<String>,
+    summary: Option<String>,
+    content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2290,63 +1991,121 @@ fn parse_github_source(source: &str) -> Result<(String, Option<String>)> {
     bail!("unsupported github source format");
 }
 
-fn resolve_skill_source_dir(path: &Path) -> Result<PathBuf> {
-    if path.is_dir() && path.join("SKILL.md").exists() {
-        return Ok(path.to_path_buf());
+fn discover_skill_dirs(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    if root.is_file() {
+        let is_skill_md = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.eq_ignore_ascii_case("SKILL.md"))
+            .unwrap_or(false);
+        if is_skill_md {
+            if let Some(parent) = root.parent() {
+                found.push(parent.to_path_buf());
+            }
+        }
+        return Ok(found);
     }
-    if !path.is_dir() {
-        bail!("skill path does not exist: {}", path.display());
+
+    if !root.is_dir() {
+        bail!("skill source not found: {}", root.display());
     }
-    let mut candidates = Vec::new();
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let child = entry.path();
-        if child.is_dir() && child.join("SKILL.md").exists() {
-            candidates.push(child);
+
+    let iter = WalkDir::new(root).into_iter().filter_entry(|entry| {
+        let name = entry.file_name().to_string_lossy();
+        !matches!(name.as_ref(), ".git" | "node_modules" | "target" | "dist")
+    });
+    for entry in iter.filter_map(Result::ok) {
+        let path = entry.path();
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        if path.join("SKILL.md").exists() {
+            found.push(path.to_path_buf());
         }
     }
-    match candidates.len() {
-        1 => Ok(candidates.remove(0)),
-        0 => bail!("SKILL.md not found at {}", path.display()),
-        _ => bail!(
-            "multiple skill folders found under {}, specify the exact skill path",
-            path.display()
-        ),
-    }
+    found.sort();
+    Ok(found)
 }
 
 fn parse_skill_markdown(content: &str) -> SkillMarkdownMeta {
     let mut meta = SkillMarkdownMeta::default();
-    let frontmatter = extract_frontmatter(content);
-    if let Some(frontmatter) = frontmatter {
+    let document = parse_skill_document(content);
+    if !document.name.trim().is_empty() {
+        meta.name = Some(document.name);
+    }
+    if !document.description.trim().is_empty() {
+        meta.description = Some(document.description);
+    }
+    if let Some(frontmatter) = extract_frontmatter(content) {
+        for line in frontmatter.lines() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with("tags:") {
+                continue;
+            }
+            if let Some((_, raw_value)) = trimmed.split_once(':') {
+                let cleaned = raw_value
+                    .trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']');
+                let tags = cleaned
+                    .split(',')
+                    .map(|part| part.trim().trim_matches('"').trim_matches('\''))
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_string);
+                meta.tags.extend(tags);
+            }
+        }
+    }
+    meta
+}
+
+fn parse_skill_document(markdown: &str) -> SkillDocument {
+    let mut document = SkillDocument {
+        user_invocable: true,
+        disable_model_invocation: false,
+        ..SkillDocument::default()
+    };
+
+    if let Some(frontmatter) = extract_frontmatter(markdown) {
         for line in frontmatter.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with('#') || trimmed.is_empty() {
                 continue;
             }
-            if let Some((key, raw_value)) = trimmed.split_once(':') {
-                let key = key.trim().to_lowercase();
-                let value = raw_value.trim().trim_matches('"').trim_matches('\'');
-                match key.as_str() {
-                    "name" => meta.name = Some(value.to_string()),
-                    "description" => meta.description = Some(value.to_string()),
-                    "tags" => {
-                        let cleaned = value.trim().trim_start_matches('[').trim_end_matches(']');
-                        let tags = cleaned
-                            .split(',')
-                            .map(|part| part.trim().trim_matches('"').trim_matches('\''))
-                            .filter(|part| !part.is_empty())
-                            .map(str::to_string);
-                        meta.tags.extend(tags);
-                    }
-                    _ => {}
+            let Some((key, raw_value)) = trimmed.split_once(':') else {
+                continue;
+            };
+            let key = key.trim().to_lowercase();
+            let value = raw_value.trim().trim_matches('"').trim_matches('\'');
+            match key.as_str() {
+                "name" => document.name = value.to_string(),
+                "description" => document.description = value.to_string(),
+                "argument_hint" | "argument-hint" => {
+                    document.argument_hint = non_empty(value);
                 }
+                "user_invocable" | "user-invocable" => {
+                    document.user_invocable = parse_bool(value, true);
+                }
+                "disable_model_invocation" | "disable-model-invocation" => {
+                    document.disable_model_invocation = parse_bool(value, false);
+                }
+                "allowed_tools" | "allowed-tools" => {
+                    document.allowed_tools = non_empty(value);
+                }
+                "model" => document.model = non_empty(value),
+                "context" => document.context = non_empty(value),
+                "agent" => document.agent = non_empty(value),
+                "hooks" => document.hooks_json = non_empty(value),
+                "summary" => document.summary = non_empty(value),
+                _ => {}
             }
         }
     }
 
-    if meta.name.is_none() {
-        meta.name = content
+    let body = strip_frontmatter(markdown);
+    if document.name.is_empty() {
+        document.name = body
             .lines()
             .find(|line| line.trim_start().starts_with("# "))
             .map(|line| {
@@ -2354,16 +2113,96 @@ fn parse_skill_markdown(content: &str) -> SkillMarkdownMeta {
                     .trim_start_matches("# ")
                     .trim()
                     .to_string()
-            });
+            })
+            .unwrap_or_default();
     }
-    if meta.description.is_none() {
-        meta.description = content
+    if document.description.is_empty() {
+        document.description = body
             .lines()
             .map(str::trim)
             .find(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('-'))
-            .map(str::to_string);
+            .map(str::to_string)
+            .unwrap_or_default();
     }
-    meta
+    document.content = body.trim().to_string();
+    document
+}
+
+fn build_skill_document(document: &SkillDocument) -> String {
+    let mut lines = vec![
+        "---".to_string(),
+        format!("name: {}", document.name.trim()),
+        format!("description: {}", document.description.trim()),
+        format!("user-invocable: {}", document.user_invocable),
+        format!(
+            "disable-model-invocation: {}",
+            document.disable_model_invocation
+        ),
+    ];
+
+    if let Some(value) = non_empty(document.argument_hint.as_deref().unwrap_or("")) {
+        lines.push(format!("argument-hint: {}", value));
+    }
+    if let Some(value) = non_empty(document.allowed_tools.as_deref().unwrap_or("")) {
+        lines.push(format!("allowed-tools: {}", value));
+    }
+    if let Some(value) = non_empty(document.model.as_deref().unwrap_or("")) {
+        lines.push(format!("model: {}", value));
+    }
+    if let Some(value) = non_empty(document.context.as_deref().unwrap_or("")) {
+        lines.push(format!("context: {}", value));
+    }
+    if let Some(value) = non_empty(document.agent.as_deref().unwrap_or("")) {
+        lines.push(format!("agent: {}", value));
+    }
+    if let Some(value) = non_empty(document.hooks_json.as_deref().unwrap_or("")) {
+        lines.push(format!("hooks: {}", value));
+    }
+    if let Some(value) = non_empty(document.summary.as_deref().unwrap_or("")) {
+        lines.push(format!("summary: {}", value));
+    }
+    lines.push("---".to_string());
+    lines.push(String::new());
+    if !document.content.trim().is_empty() {
+        lines.push(document.content.trim().to_string());
+    }
+    lines.join("\n")
+}
+
+fn strip_frontmatter(markdown: &str) -> String {
+    let mut lines = markdown.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return markdown.to_string();
+    }
+    let mut output = Vec::new();
+    let mut in_frontmatter = true;
+    for line in markdown.lines().skip(1) {
+        if in_frontmatter && line.trim() == "---" {
+            in_frontmatter = false;
+            continue;
+        }
+        if !in_frontmatter {
+            output.push(line);
+        }
+    }
+    output.join("\n")
+}
+
+fn parse_bool(value: &str, default: bool) -> bool {
+    match value.trim().to_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => true,
+        "false" | "0" | "no" | "off" => false,
+        _ => default,
+    }
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn extract_frontmatter(content: &str) -> Option<&str> {
@@ -2403,12 +2242,26 @@ fn sanitize_skill_id(input: &str) -> String {
     }
 }
 
-fn skill_slug_from_path(path: &Path) -> Result<String> {
-    let folder = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("invalid skill directory name"))?;
-    Ok(sanitize_skill_id(folder))
+fn skill_slug_from_root_and_dir(root: &Path, skill_dir: &Path) -> Result<String> {
+    if root == skill_dir {
+        let folder = skill_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("installed-skill");
+        return Ok(sanitize_skill_id(folder));
+    }
+    let relative = skill_dir.strip_prefix(root).with_context(|| {
+        format!(
+            "failed to resolve relative path for {}",
+            skill_dir.display()
+        )
+    })?;
+    let relative_text = relative
+        .components()
+        .map(|item| item.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join("-");
+    Ok(sanitize_skill_id(&relative_text))
 }
 
 fn copy_dir_recursively(source: &Path, destination: &Path) -> Result<()> {
@@ -2453,21 +2306,6 @@ fn truncate(input: &str, max_chars: usize) -> String {
     }
     value = value.chars().take(max_chars).collect::<String>();
     format!("{value}\n...[truncated]")
-}
-
-fn shell_words(input: &str) -> Vec<String> {
-    input
-        .split_whitespace()
-        .map(|part| part.trim().trim_matches('"').trim_matches('\'').to_string())
-        .filter(|part| !part.is_empty())
-        .collect()
-}
-
-fn sanitize_session_name(input: &str) -> String {
-    input
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-        .collect()
 }
 
 fn glob_match(pattern: &str, candidate: &str) -> bool {
@@ -2545,9 +2383,10 @@ mod tests {
             model_policy: ModelPolicy::default(),
             skill_ids: vec![],
             tool_ids: vec![
-                "file.readwrite".into(),
-                "project.search".into(),
-                "http.request".into(),
+                "Read".into(),
+                "Write".into(),
+                "Grep".into(),
+                "WebFetch".into(),
             ],
             max_parallel_runs: 1,
             can_spawn_subtasks: true,
@@ -2557,35 +2396,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_tool_reads_and_writes() {
+    async fn read_and_write_tools_work() {
         let workspace_root = unique_root("workspace");
         let data_root = unique_root("data");
         fs::create_dir_all(&workspace_root).expect("workspace");
         fs::create_dir_all(&data_root).expect("data");
         let runtime = ToolRuntime::new(workspace_root.clone(), data_root).expect("runtime");
-        let tool = runtime.tool_by_id("file.readwrite").expect("tool");
+        let write_tool = runtime.tool_by_id("Write").expect("tool");
+        let read_tool = runtime.tool_by_id("Read").expect("tool");
 
         let write_result = runtime
             .execute(ToolExecutionRequest {
-                tool: tool.clone(),
-                input: r#"{"path":"notes/spec.md","mode":"write","content":"hello"}"#.into(),
+                tool: write_tool,
+                input: r#"{"file_path":"notes/spec.md","content":"hello"}"#.into(),
                 task_card_id: "task-1".into(),
                 agent_id: "agent-1".into(),
                 agent: agent(),
                 approval_granted: true,
+                working_directory: ".".into(),
+                tool_stream: None,
             })
             .await
             .expect("write");
-        assert!(write_result.output.contains("\"saved\":true"));
+        assert!(write_result.output.contains("\"status\":\"ok\""));
 
         let read_result = runtime
             .execute(ToolExecutionRequest {
-                tool,
-                input: r#"{"path":"notes/spec.md","mode":"read"}"#.into(),
+                tool: read_tool,
+                input: r#"{"file_path":"notes/spec.md"}"#.into(),
                 task_card_id: "task-1".into(),
                 agent_id: "agent-1".into(),
                 agent: agent(),
                 approval_granted: true,
+                working_directory: ".".into(),
+                tool_stream: None,
             })
             .await
             .expect("read");
@@ -2593,7 +2437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_search_returns_matches() {
+    async fn grep_returns_matches() {
         let workspace_root = unique_root("search-workspace");
         let data_root = unique_root("search-data");
         fs::create_dir_all(workspace_root.join("src")).expect("workspace");
@@ -2606,12 +2450,14 @@ mod tests {
         let runtime = ToolRuntime::new(workspace_root, data_root).expect("runtime");
         let result = runtime
             .execute(ToolExecutionRequest {
-                tool: runtime.tool_by_id("project.search").expect("tool"),
-                input: r#"{"query":"Scout"}"#.into(),
+                tool: runtime.tool_by_id("Grep").expect("tool"),
+                input: r#"{"pattern":"Scout","output_mode":"content"}"#.into(),
                 task_card_id: "task-1".into(),
                 agent_id: "agent-1".into(),
                 agent: agent(),
                 approval_granted: true,
+                working_directory: ".".into(),
+                tool_stream: None,
             })
             .await
             .expect("search");
@@ -2626,7 +2472,7 @@ mod tests {
         fs::create_dir_all(&workspace_root).expect("workspace");
         fs::create_dir_all(&data_root).expect("data");
         let runtime = ToolRuntime::new(workspace_root, data_root).expect("runtime");
-        let tool = runtime.tool_by_id("http.request").expect("tool");
+        let tool = runtime.tool_by_id("WebFetch").expect("tool");
         let mut restricted_agent = agent();
         restricted_agent.skill_ids = vec!["skill.builder".into()];
 
@@ -2634,7 +2480,8 @@ mod tests {
             .authorize_tool_call(
                 &restricted_agent,
                 &tool,
-                r#"{"url":"https://example.com","method":"GET"}"#,
+                r#"{"url":"https://example.com","prompt":"summarize"}"#,
+                ".",
             )
             .expect("decision");
 
@@ -2646,7 +2493,33 @@ mod tests {
         assert!(runtime
             .available_tools_for_agent(&restricted_agent)
             .into_iter()
-            .all(|candidate| candidate.id != "http.request"));
+            .all(|candidate| candidate.id != "WebFetch"));
+    }
+
+    #[test]
+    fn tool_selection_does_not_fallback_to_todowrite_when_not_allowed() {
+        let workspace_root = unique_root("selection-workspace");
+        let data_root = unique_root("selection-data");
+        fs::create_dir_all(&workspace_root).expect("workspace");
+        fs::create_dir_all(&data_root).expect("data");
+        let runtime = ToolRuntime::new(workspace_root, data_root).expect("runtime");
+
+        let selected = runtime.select_tool_for_text("please handle this request", &["Read".into()]);
+        assert!(selected.is_none(), "unexpected fallback tool selected");
+    }
+
+    #[test]
+    fn tool_selection_falls_back_to_todowrite_when_allowed() {
+        let workspace_root = unique_root("selection-workspace-allowed");
+        let data_root = unique_root("selection-data-allowed");
+        fs::create_dir_all(&workspace_root).expect("workspace");
+        fs::create_dir_all(&data_root).expect("data");
+        let runtime = ToolRuntime::new(workspace_root, data_root).expect("runtime");
+
+        let selected = runtime
+            .select_tool_for_text("please handle this request", &["TodoWrite".into()])
+            .expect("fallback tool");
+        assert_eq!(selected.id, "TodoWrite");
     }
 
     #[tokio::test]
@@ -2656,18 +2529,20 @@ mod tests {
         fs::create_dir_all(workspace_root.join("allowed")).expect("workspace");
         fs::create_dir_all(&data_root).expect("data");
         let runtime = ToolRuntime::new(workspace_root, data_root).expect("runtime");
-        let tool = runtime.tool_by_id("file.readwrite").expect("tool");
+        let tool = runtime.tool_by_id("Write").expect("tool");
         let mut restricted_agent = agent();
         restricted_agent.permission_policy.allow_fs_roots = vec!["allowed".into()];
 
         let error = runtime
             .execute(ToolExecutionRequest {
                 tool: tool.clone(),
-                input: r#"{"path":"blocked/spec.md","mode":"write","content":"hello"}"#.into(),
+                input: r#"{"file_path":"blocked/spec.md","content":"hello"}"#.into(),
                 task_card_id: "task-1".into(),
                 agent_id: "agent-1".into(),
                 agent: restricted_agent.clone(),
                 approval_granted: true,
+                working_directory: ".".into(),
+                tool_stream: None,
             })
             .await
             .expect_err("blocked path should fail");
@@ -2676,14 +2551,74 @@ mod tests {
         let result = runtime
             .execute(ToolExecutionRequest {
                 tool,
-                input: r#"{"path":"allowed/spec.md","mode":"write","content":"hello"}"#.into(),
+                input: r#"{"file_path":"allowed/spec.md","content":"hello"}"#.into(),
                 task_card_id: "task-1".into(),
                 agent_id: "agent-1".into(),
                 agent: restricted_agent,
                 approval_granted: true,
+                working_directory: ".".into(),
+                tool_stream: None,
             })
             .await
             .expect("allowed path");
-        assert!(result.output.contains("\"saved\":true"));
+        assert!(result.output.contains("\"status\":\"ok\""));
+    }
+
+    #[tokio::test]
+    async fn tools_support_working_directories_outside_workspace_root() {
+        let workspace_root = unique_root("workspace-root");
+        let external_root = unique_root("external-root");
+        let data_root = unique_root("external-data");
+        fs::create_dir_all(&workspace_root).expect("workspace");
+        fs::create_dir_all(&external_root).expect("external");
+        fs::create_dir_all(&data_root).expect("data");
+        let runtime = ToolRuntime::new(workspace_root, data_root).expect("runtime");
+
+        let result = runtime
+            .execute(ToolExecutionRequest {
+                tool: runtime.tool_by_id("Write").expect("tool"),
+                input: r#"{"file_path":"notes/from_external.md","content":"hello external"}"#
+                    .into(),
+                task_card_id: "task-1".into(),
+                agent_id: "agent-1".into(),
+                agent: agent(),
+                approval_granted: true,
+                working_directory: external_root.display().to_string(),
+                tool_stream: None,
+            })
+            .await
+            .expect("write in external working directory");
+        assert!(result.output.contains("\"status\":\"ok\""));
+        assert!(external_root.join("notes/from_external.md").exists());
+    }
+
+    #[tokio::test]
+    async fn file_paths_cannot_escape_working_directory_scope() {
+        let workspace_root = unique_root("escape-workspace");
+        let external_root = unique_root("escape-external");
+        let data_root = unique_root("escape-data");
+        fs::create_dir_all(&workspace_root).expect("workspace");
+        fs::create_dir_all(&external_root).expect("external");
+        fs::create_dir_all(&data_root).expect("data");
+        let runtime = ToolRuntime::new(workspace_root, data_root).expect("runtime");
+
+        let error = runtime
+            .execute(ToolExecutionRequest {
+                tool: runtime.tool_by_id("Write").expect("tool"),
+                input: r#"{"file_path":"../outside.md","content":"nope"}"#.into(),
+                task_card_id: "task-1".into(),
+                agent_id: "agent-1".into(),
+                agent: agent(),
+                approval_granted: true,
+                working_directory: external_root.display().to_string(),
+                tool_stream: None,
+            })
+            .await
+            .expect_err("escape should fail");
+        assert!(
+            error.to_string().contains("outside working directory"),
+            "unexpected error: {}",
+            error
+        );
     }
 }

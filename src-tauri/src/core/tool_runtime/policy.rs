@@ -14,7 +14,9 @@ impl ToolRuntime {
         agent: &AgentProfile,
         tool: &ToolManifest,
         input: &str,
+        working_directory: &str,
     ) -> Result<ToolAuthorizationDecision> {
+        let execution_root = self.resolve_execution_root(working_directory)?;
         let selected_skills = selected_skills_for_agent(agent, &self.all_skills());
         if matches!(
             tool_exposure_reason(agent, tool, &selected_skills),
@@ -32,23 +34,6 @@ impl ToolRuntime {
         }
 
         match tool.id.as_str() {
-            "file.readwrite" => {
-                let parsed = self.parse_file_input(input)?;
-                let create_parent = parsed.mode.as_deref() == Some("write");
-                let path = self.resolve_path(&parsed.path, create_parent)?;
-                let allowed_roots = &agent.permission_policy.allow_fs_roots;
-                if !allowed_roots.is_empty()
-                    && !allowed_roots
-                        .iter()
-                        .map(|root| self.resolve_permission_root(root))
-                        .any(|root| path.starts_with(root))
-                {
-                    decision = ToolAuthorizationDecision::denied(format!(
-                        "path '{}' is outside allowFsRoots",
-                        path.display()
-                    ));
-                }
-            }
             "Read" | "Edit" | "MultiEdit" | "Write" | "NotebookEdit" | "LS" => {
                 let parsed = serde_json::from_str::<serde_json::Value>(input).ok();
                 let path = match tool.id.as_str() {
@@ -66,49 +51,17 @@ impl ToolRuntime {
                 };
                 if !path.is_empty() {
                     let create_parent = matches!(tool.id.as_str(), "Write");
-                    let path = self.resolve_path(path, create_parent)?;
+                    let path = self.resolve_path(path, create_parent, &execution_root)?;
                     let allowed_roots = &agent.permission_policy.allow_fs_roots;
                     if !allowed_roots.is_empty()
                         && !allowed_roots
                             .iter()
-                            .map(|root| self.resolve_permission_root(root))
+                            .map(|root| self.resolve_permission_root(root, &execution_root))
                             .any(|root| path.starts_with(root))
                     {
                         decision = ToolAuthorizationDecision::denied(format!(
                             "path '{}' is outside allowFsRoots",
                             path.display()
-                        ));
-                    }
-                }
-            }
-            "http.request" | "browser.automation" => {
-                let url = if tool.id == "http.request" {
-                    self.parse_http_input(input)?.url
-                } else {
-                    self.parse_browser_input(input)?.url
-                };
-                let allowed_domains = &agent.permission_policy.allow_network_domains;
-                if !allowed_domains.is_empty() {
-                    let host = Url::parse(&url)
-                        .ok()
-                        .and_then(|value| value.host_str().map(str::to_string))
-                        .unwrap_or_default();
-                    let host_allowed = allowed_domains.iter().any(|candidate| {
-                        let normalized = candidate
-                            .trim()
-                            .trim_start_matches("http://")
-                            .trim_start_matches("https://")
-                            .trim_start_matches('*')
-                            .trim_start_matches('.')
-                            .trim_end_matches('/')
-                            .to_lowercase();
-                        let host = host.to_lowercase();
-                        host == normalized || host.ends_with(&format!(".{normalized}"))
-                    });
-                    if !host_allowed {
-                        decision = ToolAuthorizationDecision::denied(format!(
-                            "domain '{}' is outside allowNetworkDomains",
-                            host
                         ));
                     }
                 }

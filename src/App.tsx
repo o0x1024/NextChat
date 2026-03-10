@@ -30,6 +30,7 @@ function App() {
     workGroups,
     agents,
     messages,
+    chatStreamTracks,
     taskCards,
     leases,
     claimBids,
@@ -37,12 +38,17 @@ function App() {
     tools,
     skills,
     selectedWorkGroupId,
-    backstageOpen,
     settings,
   } = store;
 
   const [activeView, setActiveView] = useState<ViewType>("agents");
   const [settingsTab, setSettingsTab] = useState<SettingsTabType>("ai");
+  const [mountedViews, setMountedViews] = useState<Record<ViewType, boolean>>({
+    agents: true,
+    chats: false,
+    tools: false,
+    settings: false,
+  });
 
   const fontSize = usePreferencesStore((state) => state.fontSize);
   const componentSpacing = usePreferencesStore((state) => state.componentSpacing);
@@ -59,6 +65,15 @@ function App() {
     document.documentElement.lang = language;
     void i18n.changeLanguage(language);
   }, [i18n, language]);
+
+  useEffect(() => {
+    setMountedViews((current) => {
+      if (current[activeView]) {
+        return current;
+      }
+      return { ...current, [activeView]: true };
+    });
+  }, [activeView]);
 
   const viewIcons: Record<ViewType, string> = {
     agents: "fas fa-robot",
@@ -150,80 +165,120 @@ function App() {
           )}
 
           <div className="h-full overflow-hidden bg-base-100 rounded-[2rem] border border-base-content/5 shadow-2xl shadow-black/10 transition-all duration-500">
-            {activeView === "agents" && (
-              <AgentManagement
-                agents={agents}
-                skills={skills}
-                tools={tools}
-                settings={settings}
-                onCreateAgent={async (input: CreateAgentInput) => { await store.createAgent(input); }}
-                onUpdateAgent={async (input: UpdateAgentInput) => { await store.updateAgent(input); }}
-                onDeleteAgent={async (id: string) => { await store.deleteAgent(id); }}
-              />
+            {mountedViews.agents && (
+              <section
+                className={`h-full ${activeView === "agents" ? "block" : "hidden"}`}
+                aria-hidden={activeView !== "agents"}
+              >
+                <AgentManagement
+                  agents={agents}
+                  skills={skills}
+                  tools={tools}
+                  settings={settings}
+                  onCreateAgent={async (input: CreateAgentInput) => { await store.createAgent(input); }}
+                  onUpdateAgent={async (input: UpdateAgentInput) => { await store.updateAgent(input); }}
+                  onDeleteAgent={async (id: string) => { await store.deleteAgent(id); }}
+                />
+              </section>
             )}
 
-            {activeView === "chats" && (
-              <ChatManagement
-                workGroups={workGroups}
-                agents={agents}
-                messages={messages}
-                taskCards={taskCards}
-                leases={leases}
-                claimBids={claimBids}
-                toolRuns={toolRuns}
-                tools={tools}
-                settings={settings}
-                selectedWorkGroupId={selectedWorkGroupId}
-                language={language as Language}
-                backstageOpen={backstageOpen}
-                onSelectWorkGroup={(id: string) => store.setSelectedWorkGroupId(id)}
-                onCreateGroup={async (input: CreateWorkGroupInput) => { await store.createGroup(input); }}
-                onUpdateGroup={async (input: UpdateWorkGroupInput) => { await store.updateGroup(input); }}
-                onSendMessage={async (workGroupId: string, content: string) => {
-                  await store.sendMessage({ workGroupId, content });
-                }}
-                onAddAgent={async (workGroupId: string, agentId: string) => {
-                  await store.addAgent(workGroupId, agentId);
-                }}
-                onRemoveAgent={async (workGroupId: string, agentId: string) => {
-                  await store.removeAgent(workGroupId, agentId);
-                }}
-                onApproveRun={async (id: string, ok: boolean) => {
-                  await store.approveRun(id, ok);
-                }}
-                onToggleBackstage={() => store.toggleBackstage()}
-              />
+            {mountedViews.chats && (
+              <section
+                className={`h-full ${activeView === "chats" ? "block" : "hidden"}`}
+                aria-hidden={activeView !== "chats"}
+              >
+                <ChatManagement
+                  workGroups={workGroups}
+                  agents={agents}
+                  messages={messages}
+                  chatStreamTracks={chatStreamTracks}
+                  taskCards={taskCards}
+                  leases={leases}
+                  claimBids={claimBids}
+                  toolRuns={toolRuns}
+                  tools={tools}
+                  settings={settings}
+                  selectedWorkGroupId={selectedWorkGroupId}
+                  language={language as Language}
+                  onSelectWorkGroup={(id: string) => store.setSelectedWorkGroupId(id)}
+                  onCreateGroup={async (input: CreateWorkGroupInput) => { await store.createGroup(input); }}
+                  onDeleteGroup={async (workGroupId: string) => { await store.deleteGroup(workGroupId); }}
+                  onClearGroupHistory={async (workGroupId: string) => { await store.clearGroupHistory(workGroupId); }}
+                  onUpdateGroup={async (input: UpdateWorkGroupInput) => { await store.updateGroup(input); }}
+                  onSendMessage={async (workGroupId: string, content: string) => {
+                    await store.sendMessage({ workGroupId, content });
+                  }}
+                  onAddAgent={async (workGroupId: string, agentId: string) => {
+                    await store.addAgent(workGroupId, agentId);
+                  }}
+                  onRemoveAgent={async (workGroupId: string, agentId: string) => {
+                    await store.removeAgent(workGroupId, agentId);
+                  }}
+                  onApproveRun={async (id: string, ok: boolean) => {
+                    await store.approveRun(id, ok);
+                  }}
+                />
+              </section>
             )}
 
-            {activeView === "tools" && (
-              <ToolWorkspace
-                tools={tools}
-                skills={skills}
-                toolRuns={toolRuns}
-                agents={agents}
-                onInstallSkillFromGithub={async (source: string, skillPath?: string) => {
-                  await store.installSkillFromGithub(source, skillPath);
-                }}
-                onInstallSkillFromLocal={async (sourcePath: string) => {
-                  await store.installSkillFromLocal(sourcePath);
-                }}
-                onUpdateInstalledSkill={async (skillId: string, name?: string, promptTemplate?: string) => {
-                  await store.updateInstalledSkill(skillId, name, promptTemplate);
-                }}
-                onSetInstalledSkillEnabled={async (skillId: string, enabled: boolean) => {
-                  await store.setInstalledSkillEnabled(skillId, enabled);
-                }}
-                onDeleteInstalledSkill={async (skillId: string) => {
-                  await store.deleteInstalledSkill(skillId);
-                }}
-              />
+            {mountedViews.tools && (
+              <section
+                className={`h-full ${activeView === "tools" ? "block" : "hidden"}`}
+                aria-hidden={activeView !== "tools"}
+              >
+                <ToolWorkspace
+                  tools={tools}
+                  skills={skills}
+                  toolRuns={toolRuns}
+                  agents={agents}
+                  onInstallSkillFromGithub={async (source: string, skillPath?: string) => {
+                    return store.installSkillFromGithub(source, skillPath);
+                  }}
+                  onInstallSkillFromLocal={async (sourcePath: string) => {
+                    return store.installSkillFromLocal(sourcePath);
+                  }}
+                  onUpdateInstalledSkill={async (skillId: string, name?: string, promptTemplate?: string) => {
+                    await store.updateInstalledSkill(skillId, name, promptTemplate);
+                  }}
+                  onSetInstalledSkillEnabled={async (skillId: string, enabled: boolean) => {
+                    await store.setInstalledSkillEnabled(skillId, enabled);
+                  }}
+                  onDeleteInstalledSkill={async (skillId: string) => {
+                    await store.deleteInstalledSkill(skillId);
+                  }}
+                  onGetInstalledSkillDetail={async (skillId: string) => {
+                    return store.getInstalledSkillDetail(skillId);
+                  }}
+                  onUpdateSkillDetail={async (input) => {
+                    return store.updateSkillDetail(input);
+                  }}
+                  onReadInstalledSkillFile={async (skillId: string, relativePath: string) => {
+                    return store.readInstalledSkillFile(skillId, relativePath);
+                  }}
+                  onUpsertInstalledSkillFile={async (
+                    skillId: string,
+                    relativePath: string,
+                    content: string,
+                  ) => {
+                    await store.upsertInstalledSkillFile(skillId, relativePath, content);
+                  }}
+                  onDeleteInstalledSkillFile={async (skillId: string, relativePath: string) => {
+                    await store.deleteInstalledSkillFile(skillId, relativePath);
+                  }}
+                />
+              </section>
             )}
 
-            {activeView === "settings" && (
-              <SettingsWorkspace
-                settingsTab={settingsTab}
-                onSettingsTabChange={setSettingsTab}
-              />
+            {mountedViews.settings && (
+              <section
+                className={`h-full ${activeView === "settings" ? "block" : "hidden"}`}
+                aria-hidden={activeView !== "settings"}
+              >
+                <SettingsWorkspace
+                  settingsTab={settingsTab}
+                  onSettingsTabChange={setSettingsTab}
+                />
+              </section>
             )}
           </div>
         </main>

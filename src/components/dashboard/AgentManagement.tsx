@@ -16,6 +16,7 @@ import {
     splitPolicyList,
 } from "./agentPermissions";
 import { runtimeSupportedRigProviderTypes } from "../../constants/providers";
+import { generateAgentProfile } from "../../lib/tauri";
 
 interface AgentManagementProps {
     agents: AgentProfile[];
@@ -25,17 +26,6 @@ interface AgentManagementProps {
     onCreateAgent: (input: CreateAgentInput) => Promise<void>;
     onUpdateAgent: (input: UpdateAgentInput) => Promise<void>;
     onDeleteAgent: (id: string) => Promise<void>;
-}
-
-interface CtfAgentPreset {
-    name: string;
-    avatar: string;
-    role: string;
-    objective: string;
-    canSpawnSubtasks: boolean;
-    maxParallelRuns: number;
-    toolKeywords: string[];
-    skillKeywords: string[];
 }
 
 const emptyForm: CreateAgentInput = {
@@ -89,11 +79,16 @@ function findProviderMatch(providers: AIProviderConfig[], rawProvider: string): 
     });
 }
 
-function resolveProviderModel(provider: AIProviderConfig | undefined, rawModel: string | null | undefined): string {
+function resolveProviderModel(
+    provider: AIProviderConfig | undefined,
+    rawModel: string | null | undefined,
+    globalDefaultModel: string
+): string {
     const model = typeof rawModel === "string" ? rawModel.trim() : "";
+    const normalizedGlobalDefaultModel = globalDefaultModel.trim();
 
     if (!provider) {
-        return model;
+        return model || normalizedGlobalDefaultModel;
     }
 
     if (provider.models.includes(model)) {
@@ -101,7 +96,13 @@ function resolveProviderModel(provider: AIProviderConfig | undefined, rawModel: 
     }
 
     if (!model || normalizeProviderValue(model) === "simulation") {
-        return provider.defaultModel || provider.models[0] || "";
+        if (
+            normalizedGlobalDefaultModel &&
+            provider.models.includes(normalizedGlobalDefaultModel)
+        ) {
+            return normalizedGlobalDefaultModel;
+        }
+        return provider.defaultModel || provider.models[0] || normalizedGlobalDefaultModel || "";
     }
 
     return model;
@@ -111,10 +112,12 @@ function normalizeModelForm(
     settings: SystemSettings,
     overrides: Partial<Pick<CreateAgentInput, "provider" | "model" | "temperature">> = {}
 ): Pick<CreateAgentInput, "provider" | "model" | "temperature"> {
+    const globalDefaultProvider = settings.globalConfig?.defaultLLMProvider ?? "";
+    const globalDefaultModel = settings.globalConfig?.defaultLLMModel ?? "";
     const availableProviders = settings.providers.filter(isProviderAvailable);
     const preferredProvider =
-        findProviderMatch(settings.providers, overrides.provider ?? settings.globalConfig.defaultLLMProvider) ??
-        settings.providers.find((provider) => normalizeProviderValue(provider.id) === normalizeProviderValue(settings.globalConfig.defaultLLMProvider));
+        findProviderMatch(settings.providers, overrides.provider ?? globalDefaultProvider) ??
+        settings.providers.find((provider) => normalizeProviderValue(provider.id) === normalizeProviderValue(globalDefaultProvider));
 
     const selectedProvider = [preferredProvider, ...availableProviders].find(
         (provider): provider is AIProviderConfig => Boolean(provider && isProviderAvailable(provider))
@@ -122,7 +125,11 @@ function normalizeModelForm(
 
     const fallbackProvider = selectedProvider ?? availableProviders[0];
     const provider = fallbackProvider?.id ?? "";
-    const model = resolveProviderModel(fallbackProvider, overrides.model ?? "");
+    const model = resolveProviderModel(
+        fallbackProvider,
+        overrides.model ?? "",
+        globalDefaultModel
+    );
     const temperature = overrides.temperature ?? fallbackProvider?.temperature ?? emptyForm.temperature;
 
     return { provider, model, temperature };
@@ -137,91 +144,9 @@ function buildCreateForm(settings: SystemSettings): CreateAgentInput {
     };
 }
 
-const ctfAgentPresets: CtfAgentPreset[] = [
-    {
-        name: "Web Exploit Hunter",
-        avatar: "WE",
-        role: "CTF Web Exploitation",
-        objective: "Audit web attack surface, enumerate injection paths, and produce reproducible exploit payloads with clear assumptions.",
-        canSpawnSubtasks: false,
-        maxParallelRuns: 2,
-        toolKeywords: ["http", "web", "browser", "request", "curl", "playwright", "sql", "xss"],
-        skillKeywords: ["playwright", "web", "http"],
-    },
-    {
-        name: "Pwn Binary Breaker",
-        avatar: "PW",
-        role: "CTF Pwn Exploitation",
-        objective: "Analyze binary protections, derive memory corruption primitives, and craft exploitation strategy with test steps.",
-        canSpawnSubtasks: false,
-        maxParallelRuns: 2,
-        toolKeywords: ["binary", "elf", "gdb", "debug", "rop", "process", "pwn"],
-        skillKeywords: ["pwn", "binary", "debug"],
-    },
-    {
-        name: "Reverse Engineering Scout",
-        avatar: "RE",
-        role: "CTF Reverse Engineering",
-        objective: "Reverse unknown binaries or scripts, recover core logic, and extract flags or key constants with evidence.",
-        canSpawnSubtasks: false,
-        maxParallelRuns: 2,
-        toolKeywords: ["disasm", "reverse", "binary", "strings", "analysis"],
-        skillKeywords: ["reverse", "re", "analysis"],
-    },
-    {
-        name: "Crypto Solver",
-        avatar: "CR",
-        role: "CTF Cryptanalysis",
-        objective: "Identify cipher or protocol weaknesses, test hypotheses quickly, and document the shortest path to recover plaintext or keys.",
-        canSpawnSubtasks: false,
-        maxParallelRuns: 2,
-        toolKeywords: ["crypto", "hash", "encode", "decode", "math", "python"],
-        skillKeywords: ["crypto", "math"],
-    },
-    {
-        name: "Forensics Investigator",
-        avatar: "FO",
-        role: "CTF Forensics",
-        objective: "Process artifacts from disk, memory, network, and logs to build timeline and isolate embedded flag material.",
-        canSpawnSubtasks: false,
-        maxParallelRuns: 2,
-        toolKeywords: ["forensic", "pcap", "log", "file", "extract", "memory", "archive"],
-        skillKeywords: ["forensic", "analysis"],
-    },
-    {
-        name: "CTF Mission Lead",
-        avatar: "ML",
-        role: "CTF Coordinator",
-        objective: "Decompose challenge scope, assign tasks to specialist agents, and produce final answer with confidence notes and unresolved risks.",
-        canSpawnSubtasks: true,
-        maxParallelRuns: 3,
-        toolKeywords: ["http", "shell", "file", "search", "browser"],
-        skillKeywords: ["playwright", "planning", "analysis"],
-    },
-];
-
-function includesKeyword(haystack: string, keywords: string[]) {
-    const normalized = haystack.toLowerCase();
-    return keywords.some((keyword) => normalized.includes(keyword.toLowerCase()));
-}
-
-function pickToolIds(tools: ToolManifest[], keywords: string[]) {
-    return tools
-        .filter((tool) =>
-            includesKeyword(
-                `${tool.id} ${tool.name} ${tool.description} ${tool.category}`,
-                keywords
-            )
-        )
-        .map((tool) => tool.id);
-}
-
-function pickSkillIds(skills: SkillPack[], keywords: string[]) {
-    return skills
-        .filter((skill) =>
-            includesKeyword(`${skill.id} ${skill.name} ${skill.promptTemplate}`, keywords)
-        )
-        .map((skill) => skill.id);
+function isBuiltinGroupOwner(agent: AgentProfile): boolean {
+    const role = agent.role.trim().toLowerCase();
+    return role === "group owner" || agent.name === "群主";
 }
 
 export function AgentManagement({
@@ -239,7 +164,10 @@ export function AgentManagement({
     const [editingAgent, setEditingAgent] = useState<AgentProfile | null>(null);
     const [form, setForm] = useState<CreateAgentInput>(emptyForm);
     const [search, setSearch] = useState("");
-    const [seedingCtfAgents, setSeedingCtfAgents] = useState(false);
+    const [creatingAiAgent, setCreatingAiAgent] = useState(false);
+    const [aiCreateModalOpen, setAiCreateModalOpen] = useState(false);
+    const [aiPrompt, setAiPrompt] = useState("");
+    const [aiPromptError, setAiPromptError] = useState<string | null>(null);
 
     const providerAvailability = useMemo<ProviderAvailability[]>(
         () =>
@@ -292,11 +220,51 @@ export function AgentManagement({
                 a.objective.toLowerCase().includes(q)
         );
     }, [agents, search]);
+    const confirmDeleteAgent = useMemo(
+        () => agents.find((agent) => agent.id === confirmDeleteId) ?? null,
+        [agents, confirmDeleteId]
+    );
 
     function openCreate() {
         setEditingAgent(null);
         setForm(buildCreateForm(settings));
         setModalOpen(true);
+    }
+
+    function openCreateWithAI() {
+        setAiPrompt("");
+        setAiPromptError(null);
+        setAiCreateModalOpen(true);
+    }
+
+    async function handleGenerateAiAgent() {
+        const prompt = aiPrompt.trim();
+        if (!prompt) {
+            setAiPromptError(t("aiCreateAgentEmptyPrompt"));
+            return;
+        }
+        setCreatingAiAgent(true);
+        setAiPromptError(null);
+        try {
+            const generated = await generateAgentProfile(prompt);
+            const normalizedModel = normalizeModelForm(settings, {
+                provider: generated.provider,
+                model: generated.model,
+                temperature: generated.temperature,
+            });
+            setEditingAgent(null);
+            setForm({
+                ...generated,
+                ...normalizedModel,
+            });
+            setAiCreateModalOpen(false);
+            setModalOpen(true);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            setAiPromptError(t("aiCreateAgentFailed", { message }));
+        } finally {
+            setCreatingAiAgent(false);
+        }
     }
 
     function openEdit(agent: AgentProfile) {
@@ -349,50 +317,15 @@ export function AgentManagement({
 
     async function handleDelete() {
         if (confirmDeleteId) {
+            if (confirmDeleteAgent && isBuiltinGroupOwner(confirmDeleteAgent)) {
+                setConfirmDeleteId(null);
+                return;
+            }
             await onDeleteAgent(confirmDeleteId);
             setConfirmDeleteId(null);
         }
     }
 
-    async function handleCreateCtfAgents() {
-        if (seedingCtfAgents) {
-            return;
-        }
-        setSeedingCtfAgents(true);
-        try {
-            const modelForm = normalizeModelForm(settings);
-            const existingNames = new Set(
-                agents.map((agent) => agent.name.trim().toLowerCase())
-            );
-            for (const preset of ctfAgentPresets) {
-                if (existingNames.has(preset.name.toLowerCase())) {
-                    continue;
-                }
-                const toolIds = pickToolIds(tools, preset.toolKeywords);
-                const skillIds = pickSkillIds(skills, preset.skillKeywords);
-                await onCreateAgent({
-                    ...emptyForm,
-                    ...modelForm,
-                    name: preset.name,
-                    avatar: preset.avatar,
-                    role: preset.role,
-                    objective: preset.objective,
-                    canSpawnSubtasks: preset.canSpawnSubtasks,
-                    maxParallelRuns: preset.maxParallelRuns,
-                    toolIds,
-                    skillIds,
-                    memoryPolicy: {
-                        readScope: ["user", "work_group", "agent", "task"],
-                        writeScope: ["work_group", "agent", "task"],
-                        pinnedMemoryIds: [],
-                    },
-                });
-                existingNames.add(preset.name.toLowerCase());
-            }
-        } finally {
-            setSeedingCtfAgents(false);
-        }
-    }
 
     function toggleArrayItem(arr: string[], item: string): string[] {
         return arr.includes(item) ? arr.filter((i) => i !== item) : [...arr, item];
@@ -455,16 +388,16 @@ export function AgentManagement({
                             onChange={(e: ChangeEvent<HTMLInputElement>) => setSearch(e.target.value)}
                         />
                     </div>
+                    <button
+                        className="btn btn-secondary btn-sm gap-2 shadow-sm"
+                        onClick={openCreateWithAI}
+                        disabled={creatingAiAgent}
+                    >
+                        <i className={`fas ${creatingAiAgent ? "fa-spinner fa-spin" : "fa-wand-magic-sparkles"} text-xs`} />
+                        {creatingAiAgent ? t("aiCreatingAgent") : t("aiCreateAgent")}
+                    </button>
                     <button className="btn btn-primary btn-sm gap-2 shadow-sm shadow-primary/20" onClick={openCreate}>
                         <i className="fas fa-plus text-xs" /> {t("createAgent")}
-                    </button>
-                    <button
-                        className="btn btn-secondary btn-sm gap-2"
-                        onClick={() => void handleCreateCtfAgents()}
-                        disabled={seedingCtfAgents}
-                    >
-                        <i className="fas fa-flag text-xs" />
-                        {seedingCtfAgents ? t("creatingCtfAgents") : t("createCtfAgents")}
                     </button>
                 </div>
             </div>
@@ -532,9 +465,18 @@ export function AgentManagement({
                                                 <i className="fas fa-pen text-[10px]" />
                                             </button>
                                             <button
-                                                className="btn btn-ghost btn-xs w-8 h-8 rounded-lg hover:bg-error/10 hover:text-error transition-all p-0"
-                                                onClick={() => setConfirmDeleteId(agent.id)}
-                                                title={t("delete")}
+                                                className={`btn btn-ghost btn-xs h-8 w-8 rounded-lg p-0 transition-all ${
+                                                    isBuiltinGroupOwner(agent)
+                                                        ? "cursor-not-allowed text-base-content/30"
+                                                        : "hover:bg-error/10 hover:text-error"
+                                                    }`}
+                                                onClick={() => {
+                                                    if (!isBuiltinGroupOwner(agent)) {
+                                                        setConfirmDeleteId(agent.id);
+                                                    }
+                                                }}
+                                                title={isBuiltinGroupOwner(agent) ? t("groupOwnerLocked") : t("delete")}
+                                                disabled={isBuiltinGroupOwner(agent)}
                                             >
                                                 <i className="fas fa-trash-alt text-[10px]" />
                                             </button>
@@ -556,6 +498,57 @@ export function AgentManagement({
                     </table>
                 </div>
             </div>
+
+            {/* AI Create Modal */}
+            {aiCreateModalOpen && (
+                <dialog
+                    className="modal modal-open bg-base-300/40 backdrop-blur-md"
+                    onClick={() => {
+                        if (!creatingAiAgent) {
+                            setAiCreateModalOpen(false);
+                        }
+                    }}
+                >
+                    <div
+                        className="modal-box max-w-xl rounded-2xl border border-base-content/10 shadow-2xl"
+                        onClick={(e) => e.stopPropagation()}
+                    >
+                        <h3 className="text-lg font-bold">{t("aiCreateAgent")}</h3>
+                        <p className="mt-2 text-sm text-base-content/60">{t("aiCreateAgentPrompt")}</p>
+                        <textarea
+                            rows={6}
+                            className="textarea textarea-bordered mt-4 w-full bg-base-200/50"
+                            placeholder={t("aiCreateAgentInputPlaceholder")}
+                            value={aiPrompt}
+                            onChange={(e: ChangeEvent<HTMLTextAreaElement>) => setAiPrompt(e.target.value)}
+                        />
+                        {aiPromptError && (
+                            <div className="mt-3 rounded-lg border border-error/20 bg-error/10 px-3 py-2 text-xs text-error">
+                                {aiPromptError}
+                            </div>
+                        )}
+                        <div className="modal-action">
+                            <button
+                                className="btn btn-ghost"
+                                type="button"
+                                disabled={creatingAiAgent}
+                                onClick={() => setAiCreateModalOpen(false)}
+                            >
+                                {t("cancel")}
+                            </button>
+                            <button
+                                className="btn btn-secondary"
+                                type="button"
+                                disabled={creatingAiAgent}
+                                onClick={() => void handleGenerateAiAgent()}
+                            >
+                                <i className={`fas ${creatingAiAgent ? "fa-spinner fa-spin" : "fa-wand-magic-sparkles"} text-xs`} />
+                                {creatingAiAgent ? t("aiCreatingAgent") : t("aiCreateAgent")}
+                            </button>
+                        </div>
+                    </div>
+                </dialog>
+            )}
 
             {/* Create/Edit Modal */}
             {modalOpen && (

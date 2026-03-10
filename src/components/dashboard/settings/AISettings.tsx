@@ -1,4 +1,4 @@
-import { type ChangeEvent, useMemo, useState } from "react";
+import { type ChangeEvent, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { refreshProviderModels, testProviderConnection } from "../../../lib/tauri";
 import { useAppStore } from "../../../store/appStore";
@@ -88,6 +88,19 @@ export function AISettings() {
   } = useAppStore();
 
   const { providers } = settings;
+  const fallbackGlobalConfig = {
+    defaultLLMProvider: "",
+    defaultLLMModel: "",
+    defaultVLMProvider: "",
+    defaultVLMModel: "",
+    maskApiKeys: true,
+    enableAuditLog: true,
+    proxyUrl: "",
+  };
+  const globalConfig = {
+    ...fallbackGlobalConfig,
+    ...(settings.globalConfig ?? {}),
+  };
   const activeProvider = providers.find((p) => p.id === selectedProviderId);
   const rawMaxContextLength = activeProvider?.maxContextLength;
   const activeProviderMaxContextLength: number =
@@ -104,13 +117,67 @@ export function AISettings() {
   const [refreshMessage, setRefreshMessage] = useState("");
   const [formMessage, setFormMessage] = useState("");
   const [newProviderForm, setNewProviderForm] = useState<NewProviderForm>(emptyNewProviderForm);
+  const [isModelListExpanded, setIsModelListExpanded] = useState(false);
+
+  const updateGlobalConfig = (updates: Partial<typeof settings.globalConfig>) => {
+    void updateSettings({
+      ...settings,
+      globalConfig: {
+        ...globalConfig,
+        ...updates,
+      },
+    });
+  };
 
   const updateProvider = (id: string, updates: Partial<AIProviderConfig>) => {
     const nextProviders = providers.map((p) => (p.id === id ? { ...p, ...updates } : p));
     void updateSettings({ ...settings, providers: nextProviders });
   };
 
-  const sortedModels = useMemo(() => activeProvider?.models ?? [], [activeProvider]);
+  const updateProviderDefaultModel = (provider: AIProviderConfig, inputValue: string) => {
+    const nextDefaultModel = inputValue.trim();
+    updateProvider(provider.id, {
+      defaultModel: nextDefaultModel,
+    });
+  };
+
+  const enabledProviders = useMemo(
+    () => providers.filter((provider) => provider.enabled),
+    [providers],
+  );
+
+  const selectedGlobalProvider = useMemo(
+    () =>
+      enabledProviders.find((provider) => provider.id === globalConfig.defaultLLMProvider) ??
+      enabledProviders[0],
+    [enabledProviders, globalConfig.defaultLLMProvider],
+  );
+
+  const globalProviderModels = useMemo(() => {
+    if (!selectedGlobalProvider) {
+      return [];
+    }
+    return selectedGlobalProvider.models
+      .map((model) => model.trim())
+      .filter((model, index, arr) => model.length > 0 && arr.indexOf(model) === index);
+  }, [selectedGlobalProvider]);
+
+  const selectedGlobalProviderId = selectedGlobalProvider?.id ?? "";
+  const selectedGlobalModel =
+    globalProviderModels.find((model) => model === globalConfig.defaultLLMModel) ?? "";
+
+  const activeProviderModelOptions = useMemo(() => {
+    if (!activeProvider) {
+      return [];
+    }
+    return activeProvider.models
+      .map((model) => model.trim())
+      .filter((model, index, models) => model.length > 0 && models.indexOf(model) === index);
+  }, [activeProvider]);
+
+  useEffect(() => {
+    setIsModelListExpanded(false);
+  }, [activeProvider?.id]);
 
   async function handleTestConnection() {
     if (!activeProvider) return;
@@ -209,106 +276,80 @@ export function AISettings() {
       <div className="card card-border bg-base-100 shadow-sm">
         <div className="card-body gap-4 p-4">
           <div className="flex items-center gap-2">
-            <i className="fas fa-circle-plus text-primary" />
-            <h3 className="text-base font-bold">{t("addCustomProvider")}</h3>
+            <i className="fas fa-gear text-secondary" />
+            <h3 className="text-base font-bold">{t("defaultConfiguration")}</h3>
           </div>
-          <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
             <div>
-              <label className="label">
-                <span className="label-text text-xs">{t("providerId")}</span>
-              </label>
-              <input
-                className="input input-bordered input-sm w-full"
-                value={newProviderForm.id}
-                placeholder="my-custom-provider"
-                onChange={(event) =>
-                  setNewProviderForm((current) => ({ ...current, id: event.target.value }))
-                }
-              />
-            </div>
-            <div>
-              <label className="label">
-                <span className="label-text text-xs">{t("displayName")}</span>
-              </label>
-              <input
-                className="input input-bordered input-sm w-full"
-                value={newProviderForm.name}
-                placeholder="My Custom Provider"
-                onChange={(event) =>
-                  setNewProviderForm((current) => ({ ...current, name: event.target.value }))
-                }
-              />
-            </div>
-            <div>
-              <label className="label">
-                <span className="label-text text-xs">{t("rigProviderType")}</span>
+              <label className="label mb-1">
+                <span className="inline-flex items-center gap-2 text-base font-semibold">
+                  <i className="fas fa-star text-warning" />
+                  {t("defaultLLMProvider")}
+                </span>
               </label>
               <select
-                className="select select-bordered select-sm w-full"
-                value={newProviderForm.rigProviderType}
+                className="select select-bordered w-full"
+                value={selectedGlobalProviderId}
+                disabled={enabledProviders.length === 0}
                 onChange={(event) => {
-                  const nextType = event.target.value;
-                  const defaults = providerTypeDefaults[nextType] ?? providerTypeDefaults.OpenAI;
-                  setNewProviderForm((current) => ({
-                    ...current,
-                    rigProviderType: nextType,
-                    baseUrl: defaults.baseUrl,
-                    defaultModel: defaults.defaultModel,
-                  }));
+                  const nextProvider = enabledProviders.find(
+                    (provider) => provider.id === event.target.value,
+                  );
+                  if (!nextProvider) {
+                    return;
+                  }
+                  const nextModels = nextProvider.models
+                    .map((model) => model.trim())
+                    .filter((model, index, arr) => model.length > 0 && arr.indexOf(model) === index);
+                  const currentModel = (globalConfig.defaultLLMModel ?? "").trim();
+                  let nextModel = currentModel;
+                  if (!nextModels.includes(nextModel)) {
+                    nextModel = nextProvider.defaultModel.trim();
+                  }
+                  if (!nextModels.includes(nextModel)) {
+                    nextModel = nextModels[0] ?? nextModel;
+                  }
+                  updateGlobalConfig({
+                    defaultLLMProvider: nextProvider.id,
+                    defaultLLMModel: nextModel,
+                  });
                 }}
               >
-                {rigProviderTypeOptions.map((type) => (
-                  <option key={type} value={type}>
-                    {type}
+                <option value="">{t("selectProvider")}</option>
+                {enabledProviders.map((provider) => (
+                  <option key={provider.id} value={provider.id}>
+                    {provider.name}
                   </option>
                 ))}
               </select>
-              <div className="mt-1 text-xs text-base-content/50">{t("rigProviderTypeHint")}</div>
             </div>
             <div>
-              <label className="label">
-                <span className="label-text text-xs">{t("apiBaseUrl")}</span>
+              <label className="label mb-1">
+                <span className="inline-flex items-center gap-2 text-base font-semibold">
+                  <i className="fas fa-comment-dots text-primary" />
+                  {t("defaultLLMModel")}
+                  <span className="badge badge-ghost badge-sm">{t("defaultModel")}</span>
+                </span>
               </label>
-              <input
-                className="input input-bordered input-sm w-full"
-                value={newProviderForm.baseUrl}
+              <select
+                className="select select-bordered w-full"
+                value={selectedGlobalModel}
+                disabled={!selectedGlobalProviderId || globalProviderModels.length === 0}
                 onChange={(event) =>
-                  setNewProviderForm((current) => ({ ...current, baseUrl: event.target.value }))
+                  updateGlobalConfig({
+                    defaultLLMProvider: selectedGlobalProviderId,
+                    defaultLLMModel: event.target.value,
+                  })
                 }
-              />
+              >
+                <option value="">{t("defaultLLMModel")}</option>
+                {globalProviderModels.map((model) => (
+                  <option key={model} value={model}>
+                    {model}
+                  </option>
+                ))}
+              </select>
             </div>
-            <div>
-              <label className="label">
-                <span className="label-text text-xs">{t("apiKey")}</span>
-              </label>
-              <input
-                className="input input-bordered input-sm w-full"
-                value={newProviderForm.apiKey}
-                placeholder="sk-..."
-                onChange={(event) =>
-                  setNewProviderForm((current) => ({ ...current, apiKey: event.target.value }))
-                }
-              />
-            </div>
-            <div>
-              <label className="label">
-                <span className="label-text text-xs">{t("defaultModel")}</span>
-              </label>
-              <input
-                className="input input-bordered input-sm w-full"
-                value={newProviderForm.defaultModel}
-                onChange={(event) =>
-                  setNewProviderForm((current) => ({ ...current, defaultModel: event.target.value }))
-                }
-              />
-            </div>
-          </div>
-          {formMessage ? <div className="alert alert-error py-2 text-sm">{formMessage}</div> : null}
-          <div className="flex justify-end">
-            <button className="btn btn-primary btn-sm" type="button" onClick={handleAddProvider}>
-              <i className="fas fa-plus" />
-              {t("addProvider")}
-            </button>
           </div>
         </div>
       </div>
@@ -427,27 +468,20 @@ export function AISettings() {
                       {t("refreshModels")}
                     </button>
                   </label>
-                  <select
-                    className="select select-bordered select-sm w-full"
-                    value={activeProvider.defaultModel}
-                    onChange={(event: ChangeEvent<HTMLSelectElement>) =>
-                      updateProvider(activeProvider.id, { defaultModel: event.target.value })
-                    }
-                  >
-                    {activeProvider.models.map((model) => (
-                      <option key={model} value={model}>
-                        {model}
-                      </option>
-                    ))}
-                  </select>
                   <input
-                    className="input input-bordered input-sm mt-2 w-full"
+                    className="input input-bordered input-sm w-full"
+                    list={`provider-models-${activeProvider.id}`}
                     value={activeProvider.defaultModel}
                     onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                      updateProvider(activeProvider.id, { defaultModel: event.target.value })
+                      updateProviderDefaultModel(activeProvider, event.target.value)
                     }
                     placeholder={t("defaultModel")}
                   />
+                  <datalist id={`provider-models-${activeProvider.id}`}>
+                    {activeProviderModelOptions.map((model) => (
+                      <option key={model} value={model} />
+                    ))}
+                  </datalist>
                   {refreshMessage ? (
                     <div
                       className={`mt-2 text-xs ${refreshStatus === "error" ? "text-error" : "text-base-content/60"}`}
@@ -598,34 +632,156 @@ export function AISettings() {
         ) : null}
       </div>
 
+      <div className="card card-border bg-base-100 shadow-sm">
+        <div className="card-body gap-4 p-4">
+          <div className="flex items-center gap-2">
+            <i className="fas fa-circle-plus text-primary" />
+            <h3 className="text-base font-bold">{t("addCustomProvider")}</h3>
+          </div>
+          <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+            <div>
+              <label className="label">
+                <span className="label-text text-xs">{t("providerId")}</span>
+              </label>
+              <input
+                className="input input-bordered input-sm w-full"
+                value={newProviderForm.id}
+                placeholder="my-custom-provider"
+                onChange={(event) =>
+                  setNewProviderForm((current) => ({ ...current, id: event.target.value }))
+                }
+              />
+            </div>
+            <div>
+              <label className="label">
+                <span className="label-text text-xs">{t("displayName")}</span>
+              </label>
+              <input
+                className="input input-bordered input-sm w-full"
+                value={newProviderForm.name}
+                placeholder="My Custom Provider"
+                onChange={(event) =>
+                  setNewProviderForm((current) => ({ ...current, name: event.target.value }))
+                }
+              />
+            </div>
+            <div>
+              <label className="label">
+                <span className="label-text text-xs">{t("rigProviderType")}</span>
+              </label>
+              <select
+                className="select select-bordered select-sm w-full"
+                value={newProviderForm.rigProviderType}
+                onChange={(event) => {
+                  const nextType = event.target.value;
+                  const defaults = providerTypeDefaults[nextType] ?? providerTypeDefaults.OpenAI;
+                  setNewProviderForm((current) => ({
+                    ...current,
+                    rigProviderType: nextType,
+                    baseUrl: defaults.baseUrl,
+                    defaultModel: defaults.defaultModel,
+                  }));
+                }}
+              >
+                {rigProviderTypeOptions.map((type) => (
+                  <option key={type} value={type}>
+                    {type}
+                  </option>
+                ))}
+              </select>
+              <div className="mt-1 text-xs text-base-content/50">{t("rigProviderTypeHint")}</div>
+            </div>
+            <div>
+              <label className="label">
+                <span className="label-text text-xs">{t("apiBaseUrl")}</span>
+              </label>
+              <input
+                className="input input-bordered input-sm w-full"
+                value={newProviderForm.baseUrl}
+                onChange={(event) =>
+                  setNewProviderForm((current) => ({ ...current, baseUrl: event.target.value }))
+                }
+              />
+            </div>
+            <div>
+              <label className="label">
+                <span className="label-text text-xs">{t("apiKey")}</span>
+              </label>
+              <input
+                className="input input-bordered input-sm w-full"
+                value={newProviderForm.apiKey}
+                placeholder="sk-..."
+                onChange={(event) =>
+                  setNewProviderForm((current) => ({ ...current, apiKey: event.target.value }))
+                }
+              />
+            </div>
+            <div>
+              <label className="label">
+                <span className="label-text text-xs">{t("defaultModel")}</span>
+              </label>
+              <input
+                className="input input-bordered input-sm w-full"
+                value={newProviderForm.defaultModel}
+                onChange={(event) =>
+                  setNewProviderForm((current) => ({ ...current, defaultModel: event.target.value }))
+                }
+              />
+            </div>
+          </div>
+          {formMessage ? <div className="alert alert-error py-2 text-sm">{formMessage}</div> : null}
+          <div className="flex justify-end">
+            <button className="btn btn-primary btn-sm" type="button" onClick={handleAddProvider}>
+              <i className="fas fa-plus" />
+              {t("addProvider")}
+            </button>
+          </div>
+        </div>
+      </div>
+
       {activeProvider ? (
         <div className="card card-border bg-base-100 shadow-sm">
           <div className="card-body p-4">
-            <div className="mb-3 flex items-center gap-2">
-              <h3 className="text-base font-bold">{t("availableModels")}</h3>
-              <span className="badge badge-ghost badge-sm">{sortedModels.length}</span>
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <h3 className="text-sm font-semibold">{t("availableModels")}</h3>
+                <span className="badge badge-ghost badge-sm">{activeProviderModelOptions.length}</span>
+              </div>
+              <button
+                type="button"
+                className="btn btn-ghost btn-xs"
+                onClick={() => setIsModelListExpanded((current) => !current)}
+                aria-label={isModelListExpanded ? "Collapse models" : "Expand models"}
+                title={isModelListExpanded ? "Collapse models" : "Expand models"}
+              >
+                <i
+                  className={`fas ${isModelListExpanded ? "fa-chevron-up" : "fa-chevron-down"}`}
+                />
+              </button>
             </div>
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-              {sortedModels.map((model) => (
-                <div key={model} className="rounded-xl border border-base-content/10 p-3">
-                  <div className="mb-2 flex items-center justify-between gap-2">
-                    <div className="truncate text-sm font-semibold">{model}</div>
-                    <span className="badge badge-success badge-xs">{t("available")}</span>
+            {isModelListExpanded ? (
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+                {activeProviderModelOptions.map((model) => (
+                  <div key={model} className="rounded-xl border border-base-content/10 p-3">
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <div className="truncate text-xs font-medium">{model}</div>
+                      <span className="badge badge-success badge-xs">{t("available")}</span>
+                    </div>
+                    <div className="text-xs text-base-content/60">{activeProvider.rigProviderType}</div>
+                    <div className="mt-2 text-xs text-base-content/70">
+                      {t("maxContextLength")}: {activeProviderMaxContextLength.toLocaleString()}
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      {providerModules(activeProvider.rigProviderType).map((tag) => (
+                        <span key={`${model}-${tag}`} className="badge badge-primary badge-xs">
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
                   </div>
-                  <div className="text-xs text-base-content/60">{activeProvider.rigProviderType}</div>
-                  <div className="mt-2 text-xs text-base-content/70">
-                    {t("maxContextLength")}: {activeProviderMaxContextLength.toLocaleString()}
-                  </div>
-                  <div className="mt-2 flex flex-wrap gap-1">
-                    {providerModules(activeProvider.rigProviderType).map((tag) => (
-                      <span key={`${model}-${tag}`} className="badge badge-primary badge-xs">
-                        {tag}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            ) : null}
           </div>
         </div>
       ) : null}

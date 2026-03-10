@@ -216,6 +216,7 @@ mod tests {
             kind: WorkGroupKind::Persistent,
             name: "WG".into(),
             goal: "Goal".into(),
+            working_directory: ".".into(),
             member_agent_ids: vec!["a1".into(), "a2".into()],
             default_visibility: "summary".into(),
             auto_archive: false,

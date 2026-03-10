@@ -75,9 +75,11 @@ fn minimal_group_flow_creates_task_lease_and_agent_summary() {
         .create_work_group(CreateWorkGroupInput {
             name: "Smoke Group".into(),
             goal: "Validate the minimal task flow.".into(),
+            working_directory: ".".into(),
             kind: WorkGroupKind::Persistent,
             default_visibility: "summary".into(),
             auto_archive: false,
+            member_agent_ids: None,
         })
         .expect("group");
     service
@@ -197,9 +199,11 @@ fn permission_denial_moves_task_to_review_and_records_audit() {
         .create_work_group(CreateWorkGroupInput {
             name: "Permissions Group".into(),
             goal: "Verify permission denials.".into(),
+            working_directory: ".".into(),
             kind: WorkGroupKind::Persistent,
             default_visibility: "summary".into(),
             auto_archive: false,
+            member_agent_ids: None,
         })
         .expect("group");
     service
@@ -286,9 +290,11 @@ fn memory_policy_injects_snapshot_and_respects_write_scope() {
         .create_work_group(CreateWorkGroupInput {
             name: "Memory Group".into(),
             goal: "Verify memory policies.".into(),
+            working_directory: ".".into(),
             kind: WorkGroupKind::Persistent,
             default_visibility: "summary".into(),
             auto_archive: false,
+            member_agent_ids: None,
         })
         .expect("group");
     service
@@ -600,9 +606,11 @@ fn child_task_emits_collaboration_request_and_result_messages() {
         .create_work_group(CreateWorkGroupInput {
             name: "Collaboration Group".into(),
             goal: "Trace explicit agent collaboration.".into(),
+            working_directory: ".".into(),
             kind: WorkGroupKind::Persistent,
             default_visibility: "summary".into(),
             auto_archive: false,
+            member_agent_ids: None,
         })
         .expect("group");
     service

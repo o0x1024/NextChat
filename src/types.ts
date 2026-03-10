@@ -9,6 +9,8 @@ export type MessageKind =
   | "status";
 export type Visibility = "main" | "backstage";
 export type ExecutionMode = "real_model" | "fallback";
+export type ChatStreamPhase = "start" | "delta" | "done";
+export type ChatStreamStatus = "streaming" | "completed";
 export type WorkGroupKind = "persistent" | "ephemeral";
 export type TaskStatus =
   | "pending"
@@ -70,6 +72,7 @@ export interface WorkGroup {
   kind: WorkGroupKind;
   name: string;
   goal: string;
+  workingDirectory: string;
   memberAgentIds: string[];
   defaultVisibility: "verbose" | "summary";
   autoArchive: boolean;
@@ -91,6 +94,37 @@ export interface ConversationMessage {
   taskCardId?: string | null;
   executionMode?: ExecutionMode | null;
   createdAt: string;
+}
+
+export interface ChatStreamEvent {
+  streamId: string;
+  phase: ChatStreamPhase;
+  conversationId: string;
+  workGroupId: string;
+  senderId: string;
+  senderName: string;
+  kind: MessageKind;
+  visibility: Visibility;
+  taskCardId?: string | null;
+  sequence: number;
+  delta?: string | null;
+  fullContent?: string | null;
+  createdAt: string;
+}
+
+export interface ChatStreamTrack {
+  streamId: string;
+  conversationId: string;
+  workGroupId: string;
+  senderId: string;
+  senderName: string;
+  kind: MessageKind;
+  visibility: Visibility;
+  taskCardId?: string | null;
+  status: ChatStreamStatus;
+  content: string;
+  startedAt: string;
+  updatedAt: string;
 }
 
 export interface TaskCard {
@@ -190,6 +224,49 @@ export interface SkillPack {
   installPath?: string | null;
 }
 
+export interface SkillFileEntry {
+  path: string;
+  size: number;
+  isBinary: boolean;
+}
+
+export interface SkillDetail {
+  skillId: string;
+  enabled: boolean;
+  source: string;
+  installPath: string;
+  name: string;
+  description: string;
+  argumentHint?: string | null;
+  userInvocable: boolean;
+  disableModelInvocation: boolean;
+  allowedTools?: string | null;
+  model?: string | null;
+  context?: string | null;
+  agent?: string | null;
+  hooksJson?: string | null;
+  summary?: string | null;
+  content: string;
+  files: SkillFileEntry[];
+}
+
+export interface UpdateSkillDetailInput {
+  skillId: string;
+  enabled: boolean;
+  name: string;
+  description: string;
+  argumentHint?: string | null;
+  userInvocable: boolean;
+  disableModelInvocation: boolean;
+  allowedTools?: string | null;
+  model?: string | null;
+  context?: string | null;
+  agent?: string | null;
+  hooksJson?: string | null;
+  summary?: string | null;
+  content: string;
+}
+
 export interface MemoryItem {
   id: string;
   scope: "user" | "work_group" | "agent" | "task";
@@ -281,9 +358,11 @@ export interface UpdateAgentInput extends CreateAgentInput {
 export interface CreateWorkGroupInput {
   name: string;
   goal: string;
+  workingDirectory: string;
   kind: WorkGroupKind;
   defaultVisibility: "verbose" | "summary";
   autoArchive: boolean;
+  memberAgentIds?: string[];
 }
 
 export interface UpdateWorkGroupInput extends CreateWorkGroupInput {

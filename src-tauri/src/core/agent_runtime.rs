@@ -123,9 +123,14 @@ where
             }
         );
 
-        let rig_execution =
-            complete_task_with_tools(&context, self.tool_handler.clone(), &preamble, &prompt)
-                .await?;
+        let rig_execution = complete_task_with_tools(
+            &context,
+            self.tool_handler.clone(),
+            &preamble,
+            &prompt,
+            context.summary_stream.clone(),
+        )
+        .await?;
 
         let legacy_tool_output = if rig_execution.is_none() {
             if let Some(tool) = context.approved_tool.clone() {
@@ -138,6 +143,8 @@ where
                             agent_id: context.agent.id.clone(),
                             agent: context.agent.clone(),
                             approval_granted: true,
+                            working_directory: context.work_group.working_directory.clone(),
+                            tool_stream: context.tool_stream.clone(),
                         })
                         .await?
                         .output,
@@ -421,6 +428,7 @@ mod tests {
                 kind: WorkGroupKind::Persistent,
                 name: "WG".into(),
                 goal: "Goal".into(),
+                working_directory: ".".into(),
                 member_agent_ids: vec![scout.id.clone(), reviewer.id.clone()],
                 default_visibility: "summary".into(),
                 auto_archive: false,
@@ -459,6 +467,8 @@ mod tests {
             available_skills: vec![],
             approved_tool: None,
             settings: crate::core::domain::SystemSettings::default(),
+            summary_stream: None,
+            tool_stream: None,
         }
     }
 
