@@ -277,6 +277,32 @@ pub struct ConversationMessage {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatStreamPhase {
+    Start,
+    Delta,
+    Done,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatStreamEvent {
+    pub stream_id: String,
+    pub phase: ChatStreamPhase,
+    pub conversation_id: String,
+    pub work_group_id: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub kind: MessageKind,
+    pub visibility: Visibility,
+    pub task_card_id: Option<String>,
+    pub sequence: i64,
+    pub delta: Option<String>,
+    pub full_content: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskCard {
@@ -387,6 +413,18 @@ pub struct SkillPack {
     pub planning_rules: Vec<String>,
     pub allowed_tool_tags: Vec<String>,
     pub done_criteria: Vec<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub editable: bool,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub install_path: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,6 +464,10 @@ pub struct AIProviderConfig {
     pub base_url: String,
     pub models: Vec<String>,
     pub default_model: String,
+    #[serde(default = "default_max_context_length")]
+    pub max_context_length: i64,
+    #[serde(default = "default_custom_headers")]
+    pub custom_headers: String,
     pub temperature: f64,
     pub max_tokens: i64,
     pub output_token_limit: i64,
@@ -451,6 +493,42 @@ pub struct SystemSettings {
     pub global_config: AIGlobalConfig,
 }
 
+fn default_max_context_length() -> i64 {
+    128_000
+}
+
+fn default_custom_headers() -> String {
+    "{}".to_string()
+}
+
+fn provider_config(
+    id: &str,
+    name: &str,
+    icon: &str,
+    enabled: bool,
+    rig_provider_type: &str,
+    base_url: &str,
+    models: &[&str],
+    default_model: &str,
+    max_context_length: i64,
+    api_key: &str,
+) -> AIProviderConfig {
+    AIProviderConfig {
+        id: id.into(),
+        name: name.into(),
+        icon: icon.into(),
+        enabled,
+        rig_provider_type: rig_provider_type.into(),
+        api_key: api_key.into(),
+        base_url: base_url.into(),
+        models: models.iter().map(|model| (*model).into()).collect(),
+        default_model: default_model.into(),
+        max_context_length,
+        custom_headers: default_custom_headers(),
+        ..AIProviderConfig::default()
+    }
+}
+
 impl Default for AIProviderConfig {
     fn default() -> Self {
         Self {
@@ -471,6 +549,8 @@ impl Default for AIProviderConfig {
                 "o3-mini".into(),
             ],
             default_model: "gpt-4o".into(),
+            max_context_length: default_max_context_length(),
+            custom_headers: default_custom_headers(),
             temperature: 0.7,
             max_tokens: 2000,
             output_token_limit: 16384,
@@ -498,54 +578,222 @@ impl Default for SystemSettings {
         Self {
             providers: vec![
                 AIProviderConfig::default(),
-                AIProviderConfig {
-                    id: "anthropic".into(),
-                    name: "Anthropic".into(),
-                    icon: "fas fa-comment-dots".into(),
-                    enabled: false,
-                    rig_provider_type: "Anthropic".into(),
-                    api_key: "".into(),
-                    base_url: "https://api.anthropic.com".into(),
-                    models: vec![
-                        "claude-3-5-sonnet-20241022".into(),
-                        "claude-3-5-haiku-20241022".into(),
-                        "claude-3-opus-20240229".into(),
-                    ],
-                    default_model: "claude-3-5-sonnet-20241022".into(),
-                    ..AIProviderConfig::default()
-                },
-                AIProviderConfig {
-                    id: "gemini".into(),
-                    name: "Gemini".into(),
-                    icon: "fab fa-google".into(),
-                    enabled: false,
-                    rig_provider_type: "Gemini".into(),
-                    api_key: "".into(),
-                    base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
-                    models: vec![
-                        "gemini-2.0-flash".into(),
-                        "gemini-2.0-pro-exp-02-05".into(),
-                        "gemini-1.5-pro".into(),
-                    ],
-                    default_model: "gemini-2.0-flash".into(),
-                    ..AIProviderConfig::default()
-                },
-                AIProviderConfig {
-                    id: "deepseek".into(),
-                    name: "DeepSeek".into(),
-                    icon: "fas fa-water".into(),
-                    enabled: false,
-                    rig_provider_type: "DeepSeek".into(),
-                    api_key: "".into(),
-                    base_url: "https://api.deepseek.com".into(),
-                    models: vec![
-                        "deepseek-chat".into(),
-                        "deepseek-coder".into(),
-                        "deepseek-reasoner".into(),
-                    ],
-                    default_model: "deepseek-chat".into(),
-                    ..AIProviderConfig::default()
-                },
+                provider_config(
+                    "anthropic",
+                    "Anthropic",
+                    "fas fa-comment-dots",
+                    false,
+                    "Anthropic",
+                    "https://api.anthropic.com",
+                    &["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022"],
+                    "claude-3-5-sonnet-20241022",
+                    200_000,
+                    "",
+                ),
+                provider_config(
+                    "gemini",
+                    "Gemini",
+                    "fab fa-google",
+                    false,
+                    "Gemini",
+                    "https://generativelanguage.googleapis.com/v1beta",
+                    &["gemini-2.0-flash", "gemini-1.5-pro"],
+                    "gemini-2.0-flash",
+                    1_000_000,
+                    "",
+                ),
+                provider_config(
+                    "deepseek",
+                    "DeepSeek",
+                    "fas fa-water",
+                    false,
+                    "DeepSeek",
+                    "https://api.deepseek.com",
+                    &["deepseek-chat", "deepseek-reasoner"],
+                    "deepseek-chat",
+                    128_000,
+                    "",
+                ),
+                provider_config(
+                    "groq",
+                    "Groq",
+                    "fas fa-bolt",
+                    false,
+                    "Groq",
+                    "https://api.groq.com/openai/v1",
+                    &["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+                    "llama-3.3-70b-versatile",
+                    128_000,
+                    "",
+                ),
+                provider_config(
+                    "cohere",
+                    "Cohere",
+                    "fas fa-circle",
+                    false,
+                    "Cohere",
+                    "https://api.cohere.ai",
+                    &["command-r-plus", "command-r"],
+                    "command-r-plus",
+                    128_000,
+                    "",
+                ),
+                provider_config(
+                    "xai",
+                    "xAI",
+                    "fas fa-robot",
+                    false,
+                    "xAI",
+                    "https://api.x.ai/v1",
+                    &["grok-3-mini", "grok-3"],
+                    "grok-3-mini",
+                    128_000,
+                    "",
+                ),
+                provider_config(
+                    "mistral",
+                    "Mistral",
+                    "fas fa-wind",
+                    false,
+                    "Mistral",
+                    "https://api.mistral.ai/v1",
+                    &["mistral-large-latest", "ministral-8b-latest"],
+                    "mistral-large-latest",
+                    128_000,
+                    "",
+                ),
+                provider_config(
+                    "moonshot",
+                    "Moonshot",
+                    "fas fa-moon",
+                    false,
+                    "Moonshot",
+                    "https://api.moonshot.ai/v1",
+                    &["kimi-k2-0905-preview", "moonshot-v1-8k"],
+                    "kimi-k2-0905-preview",
+                    128_000,
+                    "",
+                ),
+                provider_config(
+                    "hyperbolic",
+                    "Hyperbolic",
+                    "fas fa-infinity",
+                    false,
+                    "Hyperbolic",
+                    "https://api.hyperbolic.xyz/v1",
+                    &["meta-llama/Meta-Llama-3-70B-Instruct"],
+                    "meta-llama/Meta-Llama-3-70B-Instruct",
+                    128_000,
+                    "",
+                ),
+                provider_config(
+                    "mira",
+                    "Mira",
+                    "fas fa-sparkles",
+                    false,
+                    "Mira",
+                    "https://api.mira.network/v1",
+                    &["mira-chat"],
+                    "mira-chat",
+                    128_000,
+                    "",
+                ),
+                provider_config(
+                    "openrouter",
+                    "OpenRouter",
+                    "fas fa-route",
+                    false,
+                    "OpenRouter",
+                    "https://openrouter.ai/api/v1",
+                    &["openai/gpt-4o-mini", "anthropic/claude-3.5-sonnet"],
+                    "openai/gpt-4o-mini",
+                    128_000,
+                    "",
+                ),
+                provider_config(
+                    "perplexity",
+                    "Perplexity",
+                    "fas fa-magnifying-glass",
+                    false,
+                    "Perplexity",
+                    "https://api.perplexity.ai",
+                    &["llama-3.1-sonar-small-128k-online"],
+                    "llama-3.1-sonar-small-128k-online",
+                    128_000,
+                    "",
+                ),
+                provider_config(
+                    "together",
+                    "Together",
+                    "fas fa-link",
+                    false,
+                    "Together",
+                    "https://api.together.xyz/v1",
+                    &["meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"],
+                    "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+                    128_000,
+                    "",
+                ),
+                provider_config(
+                    "huggingface",
+                    "HuggingFace",
+                    "fas fa-face-smile",
+                    false,
+                    "HuggingFace",
+                    "https://router.huggingface.co/v1",
+                    &["meta-llama/Meta-Llama-3-8B-Instruct"],
+                    "meta-llama/Meta-Llama-3-8B-Instruct",
+                    128_000,
+                    "",
+                ),
+                provider_config(
+                    "ollama",
+                    "Ollama",
+                    "fas fa-server",
+                    false,
+                    "Ollama",
+                    "http://localhost:11434",
+                    &["qwen2.5:14b", "llama3.1:8b"],
+                    "qwen2.5:14b",
+                    32_000,
+                    "ollama",
+                ),
+                provider_config(
+                    "azure",
+                    "Azure OpenAI",
+                    "fab fa-microsoft",
+                    false,
+                    "Azure",
+                    "https://<your-resource>.openai.azure.com",
+                    &["gpt-4o-mini"],
+                    "gpt-4o-mini",
+                    128_000,
+                    "",
+                ),
+                provider_config(
+                    "galadriel",
+                    "Galadriel",
+                    "fas fa-ring",
+                    false,
+                    "Galadriel",
+                    "https://api.galadriel.com/v1/verified",
+                    &["gpt-4o"],
+                    "gpt-4o",
+                    128_000,
+                    "",
+                ),
+                provider_config(
+                    "voyageai",
+                    "VoyageAI",
+                    "fas fa-compass",
+                    false,
+                    "VoyageAI",
+                    "https://api.voyageai.com/v1",
+                    &["voyage-3-large"],
+                    "voyage-3-large",
+                    128_000,
+                    "",
+                ),
             ],
             global_config: AIGlobalConfig::default(),
         }
@@ -609,6 +857,17 @@ pub struct UpdateAgentInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorkGroupInput {
+    pub name: String,
+    pub goal: String,
+    pub kind: WorkGroupKind,
+    pub default_visibility: String,
+    pub auto_archive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateWorkGroupInput {
+    pub id: String,
     pub name: String,
     pub goal: String,
     pub kind: WorkGroupKind,

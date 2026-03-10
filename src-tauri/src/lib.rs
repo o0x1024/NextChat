@@ -5,7 +5,8 @@ use tauri::{Manager, State};
 use crate::core::{
     domain::{
         AIProviderConfig, AgentProfile, CreateAgentInput, CreateWorkGroupInput, DashboardState,
-        SendHumanMessageInput, SystemSettings, TaskCard, ToolRun, UpdateAgentInput, WorkGroup,
+        SendHumanMessageInput, SkillPack, SystemSettings, TaskCard, ToolRun, UpdateAgentInput,
+        UpdateWorkGroupInput, WorkGroup,
     },
     llm_rig::test_connection,
     logging,
@@ -59,6 +60,17 @@ async fn create_work_group(
     command_result(
         "tauri.create_work_group",
         state.service.create_work_group(input),
+    )
+}
+
+#[tauri::command]
+async fn update_work_group(
+    state: State<'_, SharedState>,
+    input: UpdateWorkGroupInput,
+) -> Result<WorkGroup, String> {
+    command_result(
+        "tauri.update_work_group",
+        state.service.update_work_group(input),
     )
 }
 
@@ -214,6 +226,72 @@ async fn refresh_provider_models(
     )
 }
 
+#[tauri::command]
+async fn install_skill_from_local(
+    state: State<'_, SharedState>,
+    source_path: String,
+) -> Result<SkillPack, String> {
+    command_result(
+        "tauri.install_skill_from_local",
+        state.service.install_skill_from_local_path(&source_path),
+    )
+}
+
+#[tauri::command]
+async fn install_skill_from_github(
+    state: State<'_, SharedState>,
+    source: String,
+    skill_path: Option<String>,
+) -> Result<SkillPack, String> {
+    command_result(
+        "tauri.install_skill_from_github",
+        state
+            .service
+            .install_skill_from_github(&source, skill_path.as_deref())
+            .await,
+    )
+}
+
+#[tauri::command]
+async fn update_installed_skill(
+    state: State<'_, SharedState>,
+    skill_id: String,
+    name: Option<String>,
+    prompt_template: Option<String>,
+) -> Result<SkillPack, String> {
+    command_result(
+        "tauri.update_installed_skill",
+        state
+            .service
+            .update_installed_skill(&skill_id, name, prompt_template),
+    )
+}
+
+#[tauri::command]
+async fn set_installed_skill_enabled(
+    state: State<'_, SharedState>,
+    skill_id: String,
+    enabled: bool,
+) -> Result<SkillPack, String> {
+    command_result(
+        "tauri.set_installed_skill_enabled",
+        state
+            .service
+            .set_installed_skill_enabled(&skill_id, enabled),
+    )
+}
+
+#[tauri::command]
+async fn delete_installed_skill(
+    state: State<'_, SharedState>,
+    skill_id: String,
+) -> Result<(), String> {
+    command_result(
+        "tauri.delete_installed_skill",
+        state.service.delete_installed_skill(&skill_id),
+    )
+}
+
 fn command_result<T>(target: &str, result: anyhow::Result<T>) -> Result<T, String> {
     result.map_err(|error| {
         let message = error.to_string();
@@ -256,6 +334,7 @@ pub fn run() {
             update_agent_profile,
             delete_agent_profile,
             create_work_group,
+            update_work_group,
             add_agent_to_work_group,
             remove_agent_from_work_group,
             send_human_message,
@@ -268,7 +347,12 @@ pub fn run() {
             get_settings,
             update_settings,
             test_provider_connection,
-            refresh_provider_models
+            refresh_provider_models,
+            install_skill_from_local,
+            install_skill_from_github,
+            update_installed_skill,
+            set_installed_skill_enabled,
+            delete_installed_skill
         ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri application");

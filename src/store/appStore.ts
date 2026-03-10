@@ -6,12 +6,18 @@ import {
   createAgentProfile,
   createWorkGroup,
   deleteAgentProfile,
+  deleteInstalledSkill,
   getDashboardState,
   pauseLease,
   removeAgentFromWorkGroup,
   resumeTaskCard,
   sendHumanMessage,
+  installSkillFromGithub,
+  installSkillFromLocal,
+  setInstalledSkillEnabled,
   subscribeToEvents,
+  updateWorkGroup,
+  updateInstalledSkill,
   updateAgentProfile,
   updateSettings,
 } from "../lib/tauri";
@@ -22,6 +28,7 @@ import type {
   SendHumanMessageInput,
   SystemSettings,
   UpdateAgentInput,
+  UpdateWorkGroupInput,
 } from "../types";
 
 type Unlisten = () => void | Promise<void>;
@@ -45,6 +52,7 @@ interface AppStore extends DashboardState {
   createAgent: (input: CreateAgentInput) => Promise<void>;
   updateAgent: (input: UpdateAgentInput) => Promise<void>;
   createGroup: (input: CreateWorkGroupInput) => Promise<void>;
+  updateGroup: (input: UpdateWorkGroupInput) => Promise<void>;
   addAgent: (workGroupId: string, agentId: string) => Promise<void>;
   removeAgent: (workGroupId: string, agentId: string) => Promise<void>;
   sendMessage: (input: SendHumanMessageInput) => Promise<void>;
@@ -53,6 +61,11 @@ interface AppStore extends DashboardState {
   pauseLeaseById: (leaseId: string) => Promise<void>;
   resumeTask: (taskCardId: string) => Promise<void>;
   updateSettings: (settings: SystemSettings) => Promise<void>;
+  installSkillFromGithub: (source: string, skillPath?: string) => Promise<void>;
+  installSkillFromLocal: (sourcePath: string) => Promise<void>;
+  updateInstalledSkill: (skillId: string, name?: string, promptTemplate?: string) => Promise<void>;
+  setInstalledSkillEnabled: (skillId: string, enabled: boolean) => Promise<void>;
+  deleteInstalledSkill: (skillId: string) => Promise<void>;
 }
 
 let unlisteners: Unlisten[] = [];
@@ -164,6 +177,11 @@ export const useAppStore = create<AppStore>((set, get) => ({
     await get().refresh();
     set({ selectedWorkGroupId: group.id, selectedTaskId: undefined });
   },
+  async updateGroup(input) {
+    const group = await updateWorkGroup(input);
+    await get().refresh();
+    set({ selectedWorkGroupId: group.id, selectedTaskId: undefined });
+  },
   async addAgent(workGroupId, agentId) {
     await withRefresh(() => addAgentToWorkGroup(workGroupId, agentId), get().refresh);
   },
@@ -187,6 +205,24 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
   async updateSettings(settings) {
     await withRefresh(() => updateSettings(settings), get().refresh);
+  },
+  async installSkillFromGithub(source, skillPath) {
+    await withRefresh(() => installSkillFromGithub(source, skillPath), get().refresh);
+  },
+  async installSkillFromLocal(sourcePath) {
+    await withRefresh(() => installSkillFromLocal(sourcePath), get().refresh);
+  },
+  async updateInstalledSkill(skillId, name, promptTemplate) {
+    await withRefresh(
+      () => updateInstalledSkill(skillId, name, promptTemplate),
+      get().refresh,
+    );
+  },
+  async setInstalledSkillEnabled(skillId, enabled) {
+    await withRefresh(() => setInstalledSkillEnabled(skillId, enabled), get().refresh);
+  },
+  async deleteInstalledSkill(skillId) {
+    await withRefresh(() => deleteInstalledSkill(skillId), get().refresh);
   },
 }));
 

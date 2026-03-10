@@ -8,7 +8,7 @@ use rig::{
     providers::{anthropic, gemini, openai},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::core::{
@@ -169,19 +169,69 @@ fn normalized_openai_compatible_base_url(base_url: &str) -> Option<String> {
     }
 }
 
-fn openai_compatible_client(config: &AIProviderConfig) -> Result<openai::CompletionsClient> {
-    if let Some(base_url) = normalized_openai_compatible_base_url(&config.base_url) {
-        openai::Client::builder()
-            .api_key(&config.api_key)
-            .base_url(&base_url)
-            .build()
-            .map(|client| client.completions_api())
-            .map_err(Into::into)
-    } else {
-        openai::Client::new(&config.api_key)
-            .map(|client| client.completions_api())
-            .map_err(Into::into)
+fn provider_requires_api_key(provider_type: &str) -> bool {
+    provider_type != "Ollama"
+}
+
+fn is_openai_compatible_provider_type(provider_type: &str) -> bool {
+    matches!(
+        provider_type,
+        "OpenAI"
+            | "DeepSeek"
+            | "Groq"
+            | "xAI"
+            | "Moonshot"
+            | "Hyperbolic"
+            | "Mira"
+            | "OpenRouter"
+            | "Perplexity"
+            | "Together"
+            | "Mistral"
+            | "HuggingFace"
+            | "Galadriel"
+            | "Azure"
+            | "Ollama"
+    )
+}
+
+fn parse_custom_headers(config: &AIProviderConfig) -> Result<Vec<(String, String)>> {
+    let raw = config.custom_headers.trim();
+    if raw.is_empty() || raw == "{}" {
+        return Ok(vec![]);
     }
+    let parsed: Value = serde_json::from_str(raw)
+        .with_context(|| format!("Invalid customHeaders JSON for provider '{}'", config.id))?;
+    let map = parsed.as_object().ok_or_else(|| {
+        anyhow!(
+            "customHeaders for provider '{}' must be a JSON object",
+            config.id
+        )
+    })?;
+    let mut headers = Vec::with_capacity(map.len());
+    for (key, value) in map {
+        match value {
+            Value::String(text) => headers.push((key.clone(), text.clone())),
+            _ => {
+                return Err(anyhow!(
+                    "customHeaders['{}'] for provider '{}' must be a string",
+                    key,
+                    config.id
+                ));
+            }
+        }
+    }
+    Ok(headers)
+}
+
+fn openai_compatible_client(config: &AIProviderConfig) -> Result<openai::CompletionsClient> {
+    let mut builder = openai::Client::builder().api_key(config.api_key.trim());
+    if let Some(base_url) = normalized_openai_compatible_base_url(&config.base_url) {
+        builder = builder.base_url(&base_url);
+    }
+    builder
+        .build()
+        .map(|client| client.completions_api())
+        .map_err(Into::into)
 }
 
 fn normalized_api_base_url(base_url: &str, default_base_url: &str) -> String {
@@ -210,17 +260,6 @@ fn openai_compatible_api_base_url(base_url: &str) -> String {
     } else {
         format!("{trimmed}/v1")
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIModelListResponse {
-    #[serde(default)]
-    data: Vec<OpenAIModel>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIModel {
-    id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -400,6 +439,62 @@ where
     response.json::<T>().await.map_err(Into::into)
 }
 
+fn parse_model_ids(payload: &Value) -> Vec<String> {
+    if let Some(data) = payload.get("data").and_then(Value::as_array) {
+        let models = data.iter().filter_map(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("name").and_then(Value::as_str))
+                .map(ToOwned::to_owned)
+        });
+        return dedupe_models(models);
+    }
+
+    if let Some(models) = payload.get("models").and_then(Value::as_array) {
+        let models = models.iter().filter_map(|item| {
+            item.as_str().map(ToOwned::to_owned).or_else(|| {
+                item.get("id")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("name").and_then(Value::as_str))
+                    .map(ToOwned::to_owned)
+            })
+        });
+        return dedupe_models(models);
+    }
+
+    if let Some(array) = payload.as_array() {
+        let models = array.iter().filter_map(|item| {
+            item.as_str().map(ToOwned::to_owned).or_else(|| {
+                item.get("id")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("name").and_then(Value::as_str))
+                    .map(ToOwned::to_owned)
+            })
+        });
+        return dedupe_models(models);
+    }
+
+    vec![]
+}
+
+fn apply_custom_headers_to_request(
+    mut request: reqwest::RequestBuilder,
+    config: &AIProviderConfig,
+) -> Result<reqwest::RequestBuilder> {
+    for (key, value) in parse_custom_headers(config)? {
+        let header_name = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+            .with_context(|| format!("Invalid header name '{key}' in provider '{}'", config.id))?;
+        let header_value = reqwest::header::HeaderValue::from_str(&value).with_context(|| {
+            format!(
+                "Invalid header value for '{key}' in provider '{}'",
+                config.id
+            )
+        })?;
+        request = request.header(header_name, header_value);
+    }
+    Ok(request)
+}
+
 async fn fetch_openai_compatible_models(config: &AIProviderConfig) -> Result<Vec<String>> {
     let client = Client::new();
     let mut request = client.get(join_api_path(
@@ -409,8 +504,9 @@ async fn fetch_openai_compatible_models(config: &AIProviderConfig) -> Result<Vec
     if !config.api_key.trim().is_empty() {
         request = request.bearer_auth(config.api_key.trim());
     }
+    request = apply_custom_headers_to_request(request, config)?;
 
-    let payload: OpenAIModelListResponse = parse_json_response(
+    let payload: Value = parse_json_response(
         request
             .send()
             .await
@@ -418,9 +514,7 @@ async fn fetch_openai_compatible_models(config: &AIProviderConfig) -> Result<Vec
     )
     .await?;
 
-    Ok(dedupe_models(
-        payload.data.into_iter().map(|model| model.id),
-    ))
+    Ok(parse_model_ids(&payload))
 }
 
 async fn fetch_anthropic_models(config: &AIProviderConfig) -> Result<Vec<String>> {
@@ -437,13 +531,16 @@ async fn fetch_anthropic_models(config: &AIProviderConfig) -> Result<Vec<String>
     };
 
     let payload: AnthropicModelListResponse = parse_json_response(
-        client
-            .get(join_api_path(&api_base_url, "models"))
-            .header("x-api-key", config.api_key.trim())
-            .header("anthropic-version", "2023-06-01")
-            .send()
-            .await
-            .context("Failed to request model list from Anthropic")?,
+        apply_custom_headers_to_request(
+            client
+                .get(join_api_path(&api_base_url, "models"))
+                .header("x-api-key", config.api_key.trim())
+                .header("anthropic-version", "2023-06-01"),
+            config,
+        )?
+        .send()
+        .await
+        .context("Failed to request model list from Anthropic")?,
     )
     .await?;
 
@@ -463,12 +560,15 @@ async fn fetch_gemini_models(config: &AIProviderConfig) -> Result<Vec<String>> {
         "https://generativelanguage.googleapis.com/v1beta",
     );
     let payload: GeminiModelListResponse = parse_json_response(
-        client
-            .get(join_api_path(&base_url, "models"))
-            .query(&[("key", config.api_key.trim())])
-            .send()
-            .await
-            .context("Failed to request model list from Gemini")?,
+        apply_custom_headers_to_request(
+            client
+                .get(join_api_path(&base_url, "models"))
+                .query(&[("key", config.api_key.trim())]),
+            config,
+        )?
+        .send()
+        .await
+        .context("Failed to request model list from Gemini")?,
     )
     .await?;
 
@@ -490,6 +590,19 @@ async fn fetch_gemini_models(config: &AIProviderConfig) -> Result<Vec<String>> {
     Ok(dedupe_models(models))
 }
 
+async fn fetch_ollama_models(config: &AIProviderConfig) -> Result<Vec<String>> {
+    let client = Client::new();
+    let base_url = normalized_api_base_url(&config.base_url, "http://localhost:11434");
+    let payload: Value = parse_json_response(
+        apply_custom_headers_to_request(client.get(join_api_path(&base_url, "api/tags")), config)?
+            .send()
+            .await
+            .context("Failed to request model list from Ollama")?,
+    )
+    .await?;
+    Ok(parse_model_ids(&payload))
+}
+
 pub async fn refresh_models(config: &AIProviderConfig) -> Result<Vec<String>> {
     logging::llm_event(
         "llm.refresh_models",
@@ -503,7 +616,13 @@ pub async fn refresh_models(config: &AIProviderConfig) -> Result<Vec<String>> {
 
     let result = async {
         match config.rig_provider_type.as_str() {
-            "OpenAI" | "DeepSeek" | "Groq" => fetch_openai_compatible_models(config).await,
+            provider_type if is_openai_compatible_provider_type(provider_type) => {
+                if provider_type == "Ollama" {
+                    fetch_ollama_models(config).await
+                } else {
+                    fetch_openai_compatible_models(config).await
+                }
+            }
             "Anthropic" => fetch_anthropic_models(config).await,
             "Gemini" => fetch_gemini_models(config).await,
             _ => Err(anyhow!(
@@ -577,12 +696,18 @@ where
         .find(|p| p.id == *provider_id);
 
     let config = match config {
-        Some(c) if c.enabled && !c.api_key.is_empty() => c,
+        Some(c)
+            if c.enabled
+                && (!provider_requires_api_key(&c.rig_provider_type)
+                    || !c.api_key.trim().is_empty()) =>
+        {
+            c
+        }
         _ => {
             log_llm_skip(
                 "llm.complete_task_with_tools",
                 provider_id,
-                "Skipped tool-capable LLM request because provider is missing, disabled, or has no API key",
+                "Skipped tool-capable LLM request because provider is missing, disabled, or credentials are incomplete",
             );
             return Ok(None);
         }
@@ -616,7 +741,7 @@ where
 
     let result = async {
         match config.rig_provider_type.as_str() {
-            "OpenAI" | "DeepSeek" => {
+            provider_type if is_openai_compatible_provider_type(provider_type) => {
                 let client = openai_compatible_client(config)?;
 
                 let agent = client
@@ -712,12 +837,18 @@ impl ModelProviderAdapter for RigModelAdapter {
         let config = settings.providers.iter().find(|p| p.id == *provider_id);
 
         let config = match config {
-            Some(c) if c.enabled && !c.api_key.is_empty() => c,
+            Some(c)
+                if c.enabled
+                    && (!provider_requires_api_key(&c.rig_provider_type)
+                        || !c.api_key.trim().is_empty()) =>
+            {
+                c
+            }
             _ => {
                 log_llm_skip(
                     "llm.complete",
                     provider_id,
-                    "Skipped LLM completion because provider is missing, disabled, or has no API key",
+                    "Skipped LLM completion because provider is missing, disabled, or credentials are incomplete",
                 );
                 return Ok(None);
             }
@@ -741,7 +872,7 @@ impl ModelProviderAdapter for RigModelAdapter {
 
         let result = async {
             match config.rig_provider_type.as_str() {
-                "OpenAI" | "DeepSeek" => {
+                provider_type if is_openai_compatible_provider_type(provider_type) => {
                     let client = openai_compatible_client(config)?;
 
                     let agent = client
@@ -827,7 +958,7 @@ pub async fn test_connection(config: &AIProviderConfig) -> Result<()> {
 
     let result = async {
         match config.rig_provider_type.as_str() {
-            "OpenAI" | "DeepSeek" => {
+            provider_type if is_openai_compatible_provider_type(provider_type) => {
                 let client = openai_compatible_client(config)?;
                 let agent = client.agent(&config.default_model).max_tokens(1).build();
                 Ok::<_, anyhow::Error>(

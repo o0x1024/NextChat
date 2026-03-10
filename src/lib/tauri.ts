@@ -7,8 +7,10 @@ import type {
   CreateWorkGroupInput,
   DashboardState,
   SendHumanMessageInput,
+  SkillPack,
   SystemSettings,
   UpdateAgentInput,
+  UpdateWorkGroupInput,
   WorkGroup,
 } from "../types";
 
@@ -44,6 +46,10 @@ export async function deleteAgentProfile(id: string) {
 
 export async function createWorkGroup(input: CreateWorkGroupInput): Promise<WorkGroup> {
   return invoke("create_work_group", { input });
+}
+
+export async function updateWorkGroup(input: UpdateWorkGroupInput): Promise<WorkGroup> {
+  return invoke("update_work_group", { input });
 }
 
 export async function addAgentToWorkGroup(workGroupId: string, agentId: string): Promise<WorkGroup> {
@@ -94,6 +100,36 @@ export async function refreshProviderModels(
   config: AIProviderConfig,
 ): Promise<AIProviderConfig> {
   return invoke("refresh_provider_models", { config });
+}
+
+export async function installSkillFromLocal(sourcePath: string): Promise<SkillPack> {
+  return invoke("install_skill_from_local", { sourcePath });
+}
+
+export async function installSkillFromGithub(
+  source: string,
+  skillPath?: string,
+): Promise<SkillPack> {
+  return invoke("install_skill_from_github", { source, skillPath });
+}
+
+export async function updateInstalledSkill(
+  skillId: string,
+  name?: string,
+  promptTemplate?: string,
+): Promise<SkillPack> {
+  return invoke("update_installed_skill", { skillId, name, promptTemplate });
+}
+
+export async function setInstalledSkillEnabled(
+  skillId: string,
+  enabled: boolean,
+): Promise<SkillPack> {
+  return invoke("set_installed_skill_enabled", { skillId, enabled });
+}
+
+export async function deleteInstalledSkill(skillId: string): Promise<void> {
+  return invoke("delete_installed_skill", { skillId });
 }
 
 export function subscribeToEvents(onEvent: () => void) {

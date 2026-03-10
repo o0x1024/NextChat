@@ -224,6 +224,12 @@ pub fn allowed_rig_tools(context: &TaskExecutionContext) -> Vec<ToolManifest> {
 }
 
 fn tool_parameters_schema(manifest: &ToolManifest) -> Value {
+    if let Ok(parsed) = serde_json::from_str::<Value>(&manifest.input_schema) {
+        if parsed.get("type").is_some() && parsed.get("properties").is_some() {
+            return parsed;
+        }
+    }
+
     match manifest.id.as_str() {
         "project.search" => json!({
             "type": "object",
@@ -321,6 +327,41 @@ fn tool_parameters_schema(manifest: &ToolManifest) -> Value {
                 }
             },
             "required": ["input"]
+        }),
+        "skills.manage" => json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "install_local", "install_github", "update", "toggle", "delete"],
+                    "description": "Operation type."
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Required for install actions. Local path for install_local, GitHub repo for install_github."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional skill sub-path when installing from GitHub."
+                },
+                "skill_id": {
+                    "type": "string",
+                    "description": "Target installed skill id for update/toggle/delete."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Optional updated display name for update."
+                },
+                "prompt_template": {
+                    "type": "string",
+                    "description": "Optional updated description for update."
+                },
+                "enabled": {
+                    "type": "boolean",
+                    "description": "Required boolean flag for toggle."
+                }
+            },
+            "required": ["action"]
         }),
         _ => json!({
             "type": "object",

@@ -184,6 +184,10 @@ export interface SkillPack {
   planningRules: string[];
   allowedToolTags: string[];
   doneCriteria: string[];
+  enabled: boolean;
+  editable: boolean;
+  source: string;
+  installPath?: string | null;
 }
 
 export interface MemoryItem {
@@ -216,6 +220,8 @@ export interface AIProviderConfig {
   baseUrl: string;
   models: string[];
   defaultModel: string;
+  maxContextLength: number;
+  customHeaders: string;
   temperature: number;
   maxTokens: number;
   outputTokenLimit: number;
@@ -278,6 +284,10 @@ export interface CreateWorkGroupInput {
   kind: WorkGroupKind;
   defaultVisibility: "verbose" | "summary";
   autoArchive: boolean;
+}
+
+export interface UpdateWorkGroupInput extends CreateWorkGroupInput {
+  id: string;
 }
 
 export interface SendHumanMessageInput {

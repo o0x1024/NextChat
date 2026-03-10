@@ -8,7 +8,12 @@ import { ToolWorkspace } from "./components/dashboard/ToolWorkspace";
 import { applyThemeToDocument, daisyThemes, type ThemeMode } from "./constants/themes";
 import { useAppStore } from "./store/appStore";
 import { usePreferencesStore, type Language } from "./store/preferencesStore";
-import type { CreateAgentInput, CreateWorkGroupInput, UpdateAgentInput } from "./types";
+import type {
+  CreateAgentInput,
+  CreateWorkGroupInput,
+  UpdateAgentInput,
+  UpdateWorkGroupInput,
+} from "./types";
 
 function App() {
   const { t, i18n } = useTranslation();
@@ -173,6 +178,7 @@ function App() {
                 backstageOpen={backstageOpen}
                 onSelectWorkGroup={(id: string) => store.setSelectedWorkGroupId(id)}
                 onCreateGroup={async (input: CreateWorkGroupInput) => { await store.createGroup(input); }}
+                onUpdateGroup={async (input: UpdateWorkGroupInput) => { await store.updateGroup(input); }}
                 onSendMessage={async (workGroupId: string, content: string) => {
                   await store.sendMessage({ workGroupId, content });
                 }}
@@ -190,7 +196,27 @@ function App() {
             )}
 
             {activeView === "tools" && (
-              <ToolWorkspace tools={tools} toolRuns={toolRuns} agents={agents} />
+              <ToolWorkspace
+                tools={tools}
+                skills={skills}
+                toolRuns={toolRuns}
+                agents={agents}
+                onInstallSkillFromGithub={async (source: string, skillPath?: string) => {
+                  await store.installSkillFromGithub(source, skillPath);
+                }}
+                onInstallSkillFromLocal={async (sourcePath: string) => {
+                  await store.installSkillFromLocal(sourcePath);
+                }}
+                onUpdateInstalledSkill={async (skillId: string, name?: string, promptTemplate?: string) => {
+                  await store.updateInstalledSkill(skillId, name, promptTemplate);
+                }}
+                onSetInstalledSkillEnabled={async (skillId: string, enabled: boolean) => {
+                  await store.setInstalledSkillEnabled(skillId, enabled);
+                }}
+                onDeleteInstalledSkill={async (skillId: string) => {
+                  await store.deleteInstalledSkill(skillId);
+                }}
+              />
             )}
 
             {activeView === "settings" && (

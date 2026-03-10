@@ -14,7 +14,7 @@ pub enum ToolExposureReason {
 pub fn selected_skills_for_agent(agent: &AgentProfile, skills: &[SkillPack]) -> Vec<SkillPack> {
     skills
         .iter()
-        .filter(|skill| agent.skill_ids.contains(&skill.id))
+        .filter(|skill| agent.skill_ids.contains(&skill.id) && skill.enabled)
         .cloned()
         .collect()
 }
@@ -152,6 +152,10 @@ mod tests {
             planning_rules: vec![],
             allowed_tool_tags: vec!["workspace".into(), "network".into()],
             done_criteria: vec![],
+            enabled: true,
+            editable: false,
+            source: "builtin".into(),
+            install_path: None,
         }]
     }
 

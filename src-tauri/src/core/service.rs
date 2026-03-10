@@ -18,7 +18,8 @@ use crate::core::{
         new_id, now, AIProviderConfig, AgentProfile, AuditEvent, ClaimContext, ClaimScorer,
         ConversationMessage, CreateAgentInput, CreateWorkGroupInput, DashboardState, Lease,
         LeaseState, MessageKind, ModelPolicy, SendHumanMessageInput, SenderKind, SystemSettings,
-        TaskCard, TaskStatus, ToolRun, ToolRunState, UpdateAgentInput, Visibility, WorkGroup,
+        TaskCard, TaskStatus, ToolRun, ToolRunState, UpdateAgentInput, UpdateWorkGroupInput,
+        Visibility, WorkGroup,
     },
     llm_rig::{refresh_models, RigModelAdapter},
     storage::Storage,
@@ -64,8 +65,83 @@ impl AppService {
     pub fn dashboard_state(&self) -> Result<DashboardState> {
         let mut state = self.storage.dashboard_state()?;
         state.tools = self.tool_runtime.builtin_tools();
-        state.skills = self.tool_runtime.builtin_skills();
+        state.skills = self.tool_runtime.all_skills();
         Ok(state)
+    }
+
+    pub fn install_skill_from_local_path(
+        &self,
+        source_path: &str,
+    ) -> Result<crate::core::domain::SkillPack> {
+        let skill = self
+            .tool_runtime
+            .install_skill_from_local_path(source_path)?;
+        self.record_audit(
+            "skill.installed.local",
+            "skill",
+            &skill.id,
+            json!({ "sourcePath": source_path, "name": skill.name }),
+        )?;
+        Ok(skill)
+    }
+
+    pub async fn install_skill_from_github(
+        &self,
+        source: &str,
+        skill_path: Option<&str>,
+    ) -> Result<crate::core::domain::SkillPack> {
+        let skill = self
+            .tool_runtime
+            .install_skill_from_github(source, skill_path)
+            .await?;
+        self.record_audit(
+            "skill.installed.github",
+            "skill",
+            &skill.id,
+            json!({ "source": source, "path": skill_path, "name": skill.name }),
+        )?;
+        Ok(skill)
+    }
+
+    pub fn update_installed_skill(
+        &self,
+        skill_id: &str,
+        name: Option<String>,
+        prompt_template: Option<String>,
+    ) -> Result<crate::core::domain::SkillPack> {
+        let skill = self
+            .tool_runtime
+            .update_installed_skill(skill_id, name, prompt_template)?;
+        self.record_audit(
+            "skill.updated",
+            "skill",
+            &skill.id,
+            json!({ "name": skill.name, "enabled": skill.enabled }),
+        )?;
+        Ok(skill)
+    }
+
+    pub fn set_installed_skill_enabled(
+        &self,
+        skill_id: &str,
+        enabled: bool,
+    ) -> Result<crate::core::domain::SkillPack> {
+        let skill = self
+            .tool_runtime
+            .set_installed_skill_enabled(skill_id, enabled)?;
+        self.record_audit(
+            "skill.toggled",
+            "skill",
+            &skill.id,
+            json!({ "enabled": enabled }),
+        )?;
+        Ok(skill)
+    }
+
+    pub fn delete_installed_skill(&self, skill_id: &str) -> Result<()> {
+        self.tool_runtime.delete_installed_skill(skill_id)?;
+        self.record_audit("skill.deleted", "skill", skill_id, json!({}))?;
+        Ok(())
     }
 
     pub fn create_agent_profile(&self, input: CreateAgentInput) -> Result<AgentProfile> {
@@ -167,6 +243,23 @@ impl AppService {
         self.storage.insert_work_group(&group)?;
         self.record_audit(
             "work_group.created",
+            "work_group",
+            &group.id,
+            json!({ "name": group.name }),
+        )?;
+        Ok(group)
+    }
+
+    pub fn update_work_group(&self, input: UpdateWorkGroupInput) -> Result<WorkGroup> {
+        let mut group = self.storage.get_work_group(&input.id)?;
+        group.kind = input.kind;
+        group.name = input.name;
+        group.goal = input.goal;
+        group.default_visibility = input.default_visibility;
+        group.auto_archive = input.auto_archive;
+        self.storage.insert_work_group(&group)?;
+        self.record_audit(
+            "work_group.updated",
             "work_group",
             &group.id,
             json!({ "name": group.name }),

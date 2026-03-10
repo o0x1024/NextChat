@@ -11,6 +11,8 @@ export interface AIProviderConfig {
     baseUrl: string;
     models: string[];
     defaultModel: string;
+    maxContextLength: number;
+    customHeaders: string;
     temperature: number;
     maxTokens: number;
     outputTokenLimit: number;
@@ -35,6 +37,8 @@ export const defaultProviders: AIProviderConfig[] = [
         baseUrl: "https://api.openai.com/v1",
         models: ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo", "o1", "o1-mini", "o3-mini"],
         defaultModel: "gpt-4o",
+        maxContextLength: 128000,
+        customHeaders: "{}",
         temperature: 0.7,
         maxTokens: 2000,
         outputTokenLimit: 16384,
@@ -50,6 +54,8 @@ export const defaultProviders: AIProviderConfig[] = [
         baseUrl: "https://api.anthropic.com",
         models: ["claude-sonnet-4-20250514", "claude-3-5-haiku-20241022", "claude-3-opus-20240229"],
         defaultModel: "claude-sonnet-4-20250514",
+        maxContextLength: 200000,
+        customHeaders: "{}",
         temperature: 0.7,
         maxTokens: 2000,
         outputTokenLimit: 16384,
@@ -65,6 +71,8 @@ export const defaultProviders: AIProviderConfig[] = [
         baseUrl: "https://api.deepseek.com",
         models: ["deepseek-chat", "deepseek-coder", "deepseek-reasoner"],
         defaultModel: "deepseek-chat",
+        maxContextLength: 128000,
+        customHeaders: "{}",
         temperature: 0.7,
         maxTokens: 2000,
         outputTokenLimit: 16384,
@@ -80,6 +88,8 @@ export const defaultProviders: AIProviderConfig[] = [
         baseUrl: "https://generativelanguage.googleapis.com/v1beta",
         models: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-1.5-pro"],
         defaultModel: "gemini-2.5-flash",
+        maxContextLength: 1000000,
+        customHeaders: "{}",
         temperature: 0.7,
         maxTokens: 2000,
         outputTokenLimit: 16384,
@@ -95,6 +105,8 @@ export const defaultProviders: AIProviderConfig[] = [
         baseUrl: "https://api.groq.com/openai/v1",
         models: ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"],
         defaultModel: "llama-3.3-70b-versatile",
+        maxContextLength: 128000,
+        customHeaders: "{}",
         temperature: 0.7,
         maxTokens: 2000,
         outputTokenLimit: 16384,
@@ -110,6 +122,8 @@ export const defaultProviders: AIProviderConfig[] = [
         baseUrl: "https://api.cohere.ai/v1",
         models: ["command-r-plus", "command-r", "command-light"],
         defaultModel: "command-r-plus",
+        maxContextLength: 128000,
+        customHeaders: "{}",
         temperature: 0.7,
         maxTokens: 2000,
         outputTokenLimit: 16384,
@@ -125,6 +139,8 @@ export const defaultProviders: AIProviderConfig[] = [
         baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
         models: ["qwen-max", "qwen-plus", "qwen-turbo", "qwen-long"],
         defaultModel: "qwen-max",
+        maxContextLength: 128000,
+        customHeaders: "{}",
         temperature: 0.7,
         maxTokens: 2000,
         outputTokenLimit: 16384,
@@ -140,6 +156,8 @@ export const defaultProviders: AIProviderConfig[] = [
         baseUrl: "https://api.hyperbolic.xyz/v1",
         models: ["meta-llama/Meta-Llama-3-70B-Instruct"],
         defaultModel: "meta-llama/Meta-Llama-3-70B-Instruct",
+        maxContextLength: 128000,
+        customHeaders: "{}",
         temperature: 0.7,
         maxTokens: 2000,
         outputTokenLimit: 16384,
@@ -155,6 +173,8 @@ export const defaultProviders: AIProviderConfig[] = [
         baseUrl: "http://localhost:1234/v1",
         models: ["local-model"],
         defaultModel: "local-model",
+        maxContextLength: 32000,
+        customHeaders: "{}",
         temperature: 0.7,
         maxTokens: 2000,
         outputTokenLimit: 16384,
