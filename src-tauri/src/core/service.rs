@@ -7,6 +7,7 @@ mod execution_payloads;
 mod group_owner_memory_tests;
 mod memory;
 mod runtime;
+mod summary_stream;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

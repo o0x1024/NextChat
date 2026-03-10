@@ -87,13 +87,13 @@ export function ChatMessageList({
   return (
     <div
       ref={containerRef}
-      className="min-h-0 flex-1 space-y-1 overflow-y-auto"
+      className="min-h-0 flex-1 space-y-1 overflow-x-hidden overflow-y-auto"
       onScroll={handleScroll}
     >
       {currentMessages.map((message) => (
         <div
           key={message.id}
-          className={`chat ${message.senderKind === "human" ? "chat-end" : "chat-start"}`}
+          className={`chat min-w-0 ${message.senderKind === "human" ? "chat-end" : "chat-start"}`}
         >
           <div className="chat-header mb-1 text-xs text-base-content/50">
             <span className="font-medium">{message.senderName}</span>
@@ -130,7 +130,7 @@ export function ChatMessageList({
             )}
             <time className="ml-2">{formatTime(message.createdAt, language)}</time>
           </div>
-          <div className={`chat-bubble text-sm ${senderBubbleClass(message)}`}>
+          <div className={`chat-bubble min-w-0 max-w-full text-sm ${senderBubbleClass(message)}`}>
             {shouldRenderMarkdown(message) ? (
               <MarkdownMessage content={message.content} />
             ) : (
@@ -141,7 +141,7 @@ export function ChatMessageList({
       ))}
 
       {visibleStreamTracks.map((track) => (
-        <div key={`stream-${track.streamId}`} className="chat chat-start">
+        <div key={`stream-${track.streamId}`} className="chat chat-start min-w-0">
           <div className="chat-header mb-1 text-xs text-base-content/50">
             <span className="font-medium">{track.senderName}</span>
             {track.taskCardId && currentTaskTitles.get(track.taskCardId) && (
@@ -174,7 +174,7 @@ export function ChatMessageList({
             </span>
             <time className="ml-2">{formatTime(track.updatedAt, language)}</time>
           </div>
-          <div className="chat-bubble chat-bubble-secondary text-sm">
+          <div className="chat-bubble chat-bubble-secondary min-w-0 max-w-full text-sm">
             <div className="whitespace-pre-wrap break-words">
               {track.content}
               {track.status === "streaming" ? (

@@ -27,17 +27,26 @@ pub(super) fn structured_tool_call_content(
     call_id: &str,
     input: &str,
 ) -> String {
+    structured_tool_call_content_for_fields(&tool.id, &tool.name, call_id, input)
+}
+
+pub(super) fn structured_tool_call_content_for_fields(
+    tool_id: &str,
+    tool_name: &str,
+    call_id: &str,
+    input: &str,
+) -> String {
     serde_json::to_string(&ToolCallPayload {
-        tool_id: &tool.id,
-        tool_name: &tool.name,
+        tool_id,
+        tool_name,
         call_id,
         input,
     })
     .unwrap_or_else(|_| {
         format!(
             "{{\"toolId\":\"{}\",\"toolName\":\"{}\",\"callId\":\"{}\",\"input\":{}}}",
-            tool.id,
-            tool.name,
+            tool_id,
+            tool_name,
             call_id,
             serde_json::to_string(input).unwrap_or_else(|_| "\"\"".to_string())
         )
@@ -50,14 +59,24 @@ pub(super) fn structured_tool_result_content(
     input: &str,
     output: &str,
 ) -> String {
+    structured_tool_result_content_for_fields(&tool.id, &tool.name, call_id, input, output)
+}
+
+pub(super) fn structured_tool_result_content_for_fields(
+    tool_id: &str,
+    tool_name: &str,
+    call_id: Option<&str>,
+    input: &str,
+    output: &str,
+) -> String {
     if already_structured_tool_result(output) {
         return output.to_string();
     }
 
-    let fallback_call_id = call_id.unwrap_or(tool.id.as_str());
+    let fallback_call_id = call_id.unwrap_or(tool_id);
     serde_json::to_string(&ToolResultPayload {
-        tool_id: &tool.id,
-        tool_name: &tool.name,
+        tool_id,
+        tool_name,
         call_id: fallback_call_id,
         input,
         output,
@@ -65,8 +84,8 @@ pub(super) fn structured_tool_result_content(
     .unwrap_or_else(|_| {
         format!(
             "{{\"toolId\":\"{}\",\"toolName\":\"{}\",\"callId\":\"{}\",\"input\":{},\"output\":{}}}",
-            tool.id,
-            tool.name,
+            tool_id,
+            tool_name,
             fallback_call_id,
             serde_json::to_string(input).unwrap_or_else(|_| "\"\"".to_string()),
             serde_json::to_string(output).unwrap_or_else(|_| "\"\"".to_string())

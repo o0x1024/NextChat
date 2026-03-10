@@ -20,6 +20,8 @@ import {
   installSkillFromGithub,
   installSkillFromLocal,
   setInstalledSkillEnabled,
+  type DashboardEventName,
+  type DashboardEventPayloadMap,
   subscribeToEvents,
   updateSkillDetail,
   updateWorkGroup,
@@ -29,14 +31,20 @@ import {
   upsertInstalledSkillFile,
 } from "../lib/tauri";
 import type {
+  AuditEvent,
   ChatStreamEvent,
   ChatStreamTrack,
+  ClaimBid,
+  ConversationMessage,
   CreateAgentInput,
   CreateWorkGroupInput,
   DashboardState,
+  Lease,
   SendHumanMessageInput,
   SkillDetail,
   SystemSettings,
+  TaskCard,
+  ToolRun,
   UpdateAgentInput,
   UpdateSkillDetailInput,
   UpdateWorkGroupInput,
@@ -89,6 +97,7 @@ interface AppStore extends DashboardState {
 
 let unlisteners: Unlisten[] = [];
 let subscriptionsStarted = false;
+let subscriptionsPromise: Promise<void> | null = null;
 let settingsUpdateQueue: Promise<void> = Promise.resolve();
 
 const emptyState: DashboardState = {
@@ -133,9 +142,15 @@ function upsertChatStreamTrack(
     taskCardId: event.taskCardId,
     status: "streaming",
     content: "",
+    lastSequence: -1,
+    replaceOnNextDelta: false,
     startedAt: event.createdAt,
     updatedAt: event.createdAt,
   };
+
+  if (existing && event.sequence <= existing.lastSequence) {
+    return tracks;
+  }
 
   let nextTrack = {
     ...baseTrack,
@@ -146,25 +161,32 @@ function upsertChatStreamTrack(
     kind: event.kind,
     visibility: event.visibility,
     taskCardId: event.taskCardId,
+    lastSequence: event.sequence,
     updatedAt: event.createdAt,
   };
 
   if (event.phase === "delta") {
     nextTrack = {
       ...nextTrack,
-      content: `${baseTrack.content}${event.delta ?? ""}`,
+      content: baseTrack.replaceOnNextDelta
+        ? (event.delta ?? "")
+        : `${baseTrack.content}${event.delta ?? ""}`,
+      replaceOnNextDelta: false,
       status: "streaming",
     };
   } else if (event.phase === "done") {
     nextTrack = {
       ...nextTrack,
       content: event.fullContent ?? `${baseTrack.content}${event.delta ?? ""}`,
+      replaceOnNextDelta: false,
       status: "completed",
     };
   } else {
     nextTrack = {
       ...nextTrack,
-      content: "",
+      content: existing ? baseTrack.content : "",
+      replaceOnNextDelta: Boolean(existing),
+      lastSequence: event.sequence,
       status: "streaming",
       startedAt: event.createdAt,
     };
@@ -178,6 +200,84 @@ function upsertChatStreamTrack(
 
 function pruneChatStreamTracks(tracks: ChatStreamTrack[], messageIds: Set<string>) {
   return tracks.filter((track) => !messageIds.has(track.streamId));
+}
+
+function upsertById<T extends { id: string }>(
+  items: T[],
+  nextItem: T,
+  compare: (left: T, right: T) => number,
+) {
+  return [...items.filter((item) => item.id !== nextItem.id), nextItem].sort(compare);
+}
+
+function sortMessages(left: ConversationMessage, right: ConversationMessage) {
+  return left.createdAt.localeCompare(right.createdAt);
+}
+
+function sortTaskCards(left: TaskCard, right: TaskCard) {
+  return right.createdAt.localeCompare(left.createdAt);
+}
+
+function sortClaimBids(left: ClaimBid, right: ClaimBid) {
+  return left.createdAt.localeCompare(right.createdAt);
+}
+
+function sortLeases(left: Lease, right: Lease) {
+  return left.grantedAt.localeCompare(right.grantedAt);
+}
+
+function sortToolRuns(left: ToolRun, right: ToolRun) {
+  return (left.startedAt ?? "").localeCompare(right.startedAt ?? "");
+}
+
+function sortAuditEvents(left: AuditEvent, right: AuditEvent) {
+  return right.createdAt.localeCompare(left.createdAt);
+}
+
+function reduceDashboardEventState(
+  state: AppStore,
+  eventName: DashboardEventName,
+  payload: DashboardEventPayloadMap[DashboardEventName],
+) {
+  switch (eventName) {
+    case "chat:message-created": {
+      const nextMessage = payload as ConversationMessage;
+      const messages = upsertById(state.messages, nextMessage, sortMessages);
+      return {
+        messages,
+        chatStreamTracks: pruneChatStreamTracks(
+          state.chatStreamTracks,
+          new Set(messages.map((message) => message.id)),
+        ),
+      };
+    }
+    case "task:card-created":
+    case "task:status-changed":
+      return {
+        taskCards: upsertById(state.taskCards, payload as TaskCard, sortTaskCards),
+      };
+    case "claim:bid-submitted":
+      return {
+        claimBids: upsertById(state.claimBids, payload as ClaimBid, sortClaimBids),
+      };
+    case "lease:granted":
+    case "lease:preempt-requested":
+      return {
+        leases: upsertById(state.leases, payload as Lease, sortLeases),
+      };
+    case "tool:run-started":
+    case "tool:run-completed":
+    case "approval:requested":
+      return {
+        toolRuns: upsertById(state.toolRuns, payload as ToolRun, sortToolRuns),
+      };
+    case "audit:event-created":
+      return {
+        auditEvents: upsertById(state.auditEvents, payload as AuditEvent, sortAuditEvents),
+      };
+    default:
+      return null;
+  }
 }
 
 async function withRefresh<T>(fn: () => Promise<T>, refresh: () => Promise<void>) {
@@ -198,24 +298,44 @@ export const useAppStore = create<AppStore>((set, get) => ({
   async init() {
     await get().refresh();
     if (!subscriptionsStarted) {
-      const listeners = await subscribeToEvents({
-        onDashboardEvent: () => {
-          void get().refresh(false);
-        },
-        onChatStreamEvent: (_eventName, payload) => {
-          set((state) => ({
-            chatStreamTracks: upsertChatStreamTrack(
-              pruneChatStreamTracks(
-                state.chatStreamTracks,
-                new Set(state.messages.map((message) => message.id)),
-              ),
-              payload,
-            ),
-          }));
-        },
-      });
-      unlisteners = listeners;
-      subscriptionsStarted = true;
+      if (!subscriptionsPromise) {
+        subscriptionsPromise = (async () => {
+          const listeners = await subscribeToEvents({
+            onDashboardEvent: (eventName, payload) => {
+              let handled = false;
+              set((state) => {
+                const nextState = reduceDashboardEventState(state, eventName, payload);
+                handled = nextState !== null;
+                return nextState ? { ...state, ...nextState } : state;
+              });
+              if (!handled) {
+                void get().refresh(false);
+              }
+            },
+            onChatStreamEvent: (_eventName, payload) => {
+              set((state) => ({
+                chatStreamTracks: upsertChatStreamTrack(
+                  pruneChatStreamTracks(
+                    state.chatStreamTracks,
+                    new Set(state.messages.map((message) => message.id)),
+                  ),
+                  payload,
+                ),
+              }));
+            },
+          });
+          unlisteners = listeners;
+          subscriptionsStarted = true;
+        })()
+          .catch((error) => {
+            subscriptionsStarted = false;
+            throw error;
+          })
+          .finally(() => {
+            subscriptionsPromise = null;
+          });
+      }
+      await subscriptionsPromise;
     }
   },
   async refresh(withLoading = true) {

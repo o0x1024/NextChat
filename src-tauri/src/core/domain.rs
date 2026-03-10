@@ -943,9 +943,17 @@ pub struct TaskExecutionContext {
     pub approved_tool: Option<ToolManifest>,
     pub settings: SystemSettings,
     #[serde(skip)]
-    pub summary_stream: Option<UnboundedSender<String>>,
+    pub summary_stream: Option<UnboundedSender<SummaryStreamSignal>>,
     #[serde(skip)]
     pub tool_stream: Option<UnboundedSender<ToolStreamChunk>>,
+    #[serde(skip)]
+    pub tool_call_stream: Option<UnboundedSender<ToolCallProgressEvent>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SummaryStreamSignal {
+    Delta(String),
+    Reset,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -967,6 +975,22 @@ pub struct ToolStreamChunk {
     pub tool_id: String,
     pub channel: String,
     pub delta: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolCallProgressPhase {
+    Started,
+    Completed,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolCallProgressEvent {
+    pub tool_id: String,
+    pub tool_name: String,
+    pub call_id: String,
+    pub input: String,
+    pub output: String,
+    pub phase: ToolCallProgressPhase,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

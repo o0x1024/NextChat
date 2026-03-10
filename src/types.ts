@@ -123,6 +123,8 @@ export interface ChatStreamTrack {
   taskCardId?: string | null;
   status: ChatStreamStatus;
   content: string;
+  lastSequence: number;
+  replaceOnNextDelta: boolean;
   startedAt: string;
   updatedAt: string;
 }

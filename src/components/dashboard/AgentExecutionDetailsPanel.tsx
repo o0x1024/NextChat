@@ -89,6 +89,7 @@ type ExecutionEvent =
 interface ToolResultMatch {
   output: string;
   timestamp: string;
+  messageId?: string;
 }
 
 function toolRunBadgeClass(state: ToolRun["state"]) {
@@ -137,6 +138,62 @@ function prettifyPayload(raw: string) {
     return JSON.stringify(JSON.parse(trimmed), null, 2);
   } catch {
     return raw;
+  }
+}
+
+const HUMAN_MESSAGE_PREFIXES = [
+  "Human:",
+  "Human directive:",
+  "User:",
+  "User directive:",
+  "用户:",
+  "用户指令:",
+];
+
+function stripHumanMessageLines(value: string) {
+  const filtered = value
+    .split("\n")
+    .filter((line) => {
+      const normalized = line.trimStart();
+      return !HUMAN_MESSAGE_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+    })
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n");
+
+  return filtered.trim();
+}
+
+function sanitizeExecutionPayloadValue(value: unknown): unknown {
+  if (typeof value === "string") {
+    return stripHumanMessageLines(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeExecutionPayloadValue(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+        key,
+        sanitizeExecutionPayloadValue(entry),
+      ]),
+    );
+  }
+  return value;
+}
+
+function formatExecutionPayload(raw: string, hideHumanMessages = false) {
+  const source = hideHumanMessages ? stripHumanMessageLines(raw) : raw;
+  const trimmed = source.trim();
+  if (!trimmed) {
+    return source;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    const sanitized = hideHumanMessages ? sanitizeExecutionPayloadValue(parsed) : parsed;
+    return JSON.stringify(sanitized, null, 2);
+  } catch {
+    return source;
   }
 }
 
@@ -314,6 +371,7 @@ export function AgentExecutionDetailsPanel({
         fallbackToolResults.set(toolResultFallbackKey(taskCardId, message.senderId), {
           output: message.content,
           timestamp: message.createdAt,
+          messageId: message.id,
         });
         continue;
       }
@@ -361,6 +419,9 @@ export function AgentExecutionDetailsPanel({
       }
       if (fallbackToolResults.has(toolResultFallbackKey(taskCardId, message.senderId))) {
         consumedResultKeys.add(toolResultFallbackKey(taskCardId, message.senderId));
+      }
+      if (matchedResult?.messageId) {
+        hiddenMessageIds.add(matchedResult.messageId);
       }
 
       const runState = runStateByTaskTool.get(`${taskCardId}::${parsedCall.toolId}`);
@@ -570,7 +631,7 @@ export function AgentExecutionDetailsPanel({
 
         <div
           ref={eventsContainerRef}
-          className="max-h-[28rem] space-y-2 overflow-y-auto pr-1"
+          className="max-h-[28rem] space-y-2 overflow-x-hidden overflow-y-auto pr-1"
           onScroll={handleEventsScroll}
         >
           {events.map((event) => {
@@ -578,9 +639,9 @@ export function AgentExecutionDetailsPanel({
 
             if (event.type === "stream") {
               return (
-                <article key={event.id} className="rounded-box bg-base-200 px-3 py-2">
+                <article key={event.id} className="min-w-0 overflow-hidden rounded-box bg-base-200 px-3 py-2">
                   <div className="mb-1 flex items-center justify-between gap-2 text-xs">
-                    <div className="flex items-center gap-2">
+                    <div className="flex min-w-0 items-center gap-2">
                       <span className="font-semibold">{event.senderName}</span>
                       <span className="badge badge-xs badge-info">
                         {messageKindLabel(event.kind)}
@@ -595,7 +656,7 @@ export function AgentExecutionDetailsPanel({
                       {formatTime(event.timestamp, language)}
                     </time>
                   </div>
-                  <div className="whitespace-pre-wrap font-mono text-sm">
+                  <div className="overflow-x-auto whitespace-pre-wrap break-words rounded-box bg-base-100/70 px-2 py-1 font-mono text-sm">
                     {event.content}
                     {event.status === "streaming" ? (
                       <span className="ml-1 inline-block h-4 w-1 animate-pulse bg-current align-middle" />
@@ -611,9 +672,9 @@ export function AgentExecutionDetailsPanel({
 
             if (event.type === "tool_run") {
               return (
-                <article key={event.id} className="rounded-box bg-base-200 px-3 py-2">
+                <article key={event.id} className="min-w-0 overflow-hidden rounded-box bg-base-200 px-3 py-2">
                   <div className="mb-1 flex items-center justify-between gap-2 text-xs">
-                    <div className="flex items-center gap-2">
+                    <div className="flex min-w-0 items-center gap-2">
                       <span className="font-semibold">{event.agentName}</span>
                       <span className="badge badge-xs badge-info">{event.toolName}</span>
                       <span className={`badge badge-xs ${toolRunBadgeClass(event.state)}`}>
@@ -639,19 +700,18 @@ export function AgentExecutionDetailsPanel({
 
             if (event.type === "tool_call") {
               const tool = toolById.get(event.toolId);
+              const displayInput = formatExecutionPayload(event.input, true);
+              const displayOutput = formatExecutionPayload(event.output, true);
               return (
-                <details key={event.id} className="rounded-box bg-base-200" open>
-                  <summary className="flex cursor-pointer items-center justify-between gap-3 px-3 py-2">
-                    <div className="flex min-w-0 items-center gap-2">
+                <details key={event.id} className="min-w-0 overflow-hidden rounded-box bg-base-200">
+                  <summary className="flex list-none cursor-pointer items-center justify-between gap-3 px-3 py-2 [&::-webkit-details-marker]:hidden">
+                    <div className="flex min-w-0 flex-1 items-center gap-2">
                       <span className="truncate text-sm font-semibold">
                         {tool?.name ?? event.toolName}
                       </span>
                       <span className="badge badge-xs badge-ghost">{event.senderName}</span>
-                      {taskTitle ? (
-                        <span className="badge badge-ghost badge-xs">{taskTitle}</span>
-                      ) : null}
                     </div>
-                    <span className={`badge badge-xs ${toolRunBadgeClass(event.state)}`}>
+                    <span className={`badge badge-xs shrink-0 ${toolRunBadgeClass(event.state)}`}>
                       {t(`toolRunState.${event.state}`)}
                     </span>
                   </summary>
@@ -661,16 +721,16 @@ export function AgentExecutionDetailsPanel({
                         <div className="mb-1 font-semibold text-base-content/70">
                           {t("executionInputParams")}
                         </div>
-                        <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-box bg-base-100 px-2 py-1 text-xs">
-                          {prettifyPayload(event.input)}
+                        <pre className="max-h-48 w-full overflow-auto whitespace-pre-wrap break-all rounded-box bg-base-100 px-2 py-1 font-mono text-xs">
+                          {displayInput || "-"}
                         </pre>
                       </div>
                       <div>
                         <div className="mb-1 font-semibold text-base-content/70">
                           {t("executionResultLabel")}
                         </div>
-                        <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-box bg-base-100 px-2 py-1 text-xs">
-                          {event.output ? prettifyPayload(event.output) : "-"}
+                        <pre className="max-h-48 w-full overflow-auto whitespace-pre-wrap break-all rounded-box bg-base-100 px-2 py-1 font-mono text-xs">
+                          {displayOutput || "-"}
                         </pre>
                       </div>
                       <div className="flex items-center justify-between text-base-content/60">
@@ -689,9 +749,9 @@ export function AgentExecutionDetailsPanel({
             }
 
             return (
-              <article key={event.id} className="rounded-box bg-base-200 px-3 py-2">
+              <article key={event.id} className="min-w-0 overflow-hidden rounded-box bg-base-200 px-3 py-2">
                 <div className="mb-1 flex items-center justify-between gap-2 text-xs">
-                  <div className="flex items-center gap-2">
+                  <div className="flex min-w-0 items-center gap-2">
                     <span className="font-semibold">{event.senderName}</span>
                     <span className="badge badge-xs badge-info">
                       {messageKindLabel(event.kind)}
@@ -701,7 +761,15 @@ export function AgentExecutionDetailsPanel({
                     {formatTime(event.timestamp, language)}
                   </time>
                 </div>
-                <div className="whitespace-pre-wrap text-sm">{event.content}</div>
+                <div
+                  className={
+                    event.kind === "tool_result"
+                      ? "overflow-x-auto whitespace-pre-wrap break-all rounded-box bg-base-100/70 px-2 py-1 font-mono text-xs"
+                      : "whitespace-pre-wrap break-words text-sm"
+                  }
+                >
+                  {event.kind === "tool_result" ? prettifyPayload(event.content) : event.content}
+                </div>
                 <div className="mt-2 flex flex-wrap gap-2 text-xs">
                   {taskTitle ? <span className="badge badge-ghost">{taskTitle}</span> : null}
                   {event.executionMode ? (

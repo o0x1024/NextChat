@@ -53,6 +53,18 @@ pub static BUILTIN_TOOLS: Lazy<Vec<ToolManifest>> = Lazy::new(|| {
             description: "Search file contents with regex and output modes.".into(),
         },
         ToolManifest {
+            id: "Skills".into(),
+            name: "Skills".into(),
+            category: "workspace".into(),
+            risk_level: ToolRiskLevel::Low,
+            input_schema: r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","load","read_file"]},"skill_id":{"type":"string"},"path":{"type":"string"}},"required":["action"],"additionalProperties":false}"#.into(),
+            output_schema: r#"{"action":"string","skills":"array?","skill":"object?","content":"string?","path":"string?","filePath":"string?","runtimeHint":"string?"}"#.into(),
+            timeout_ms: 15_000,
+            concurrency_limit: 4,
+            permissions: vec!["workspace:index".into()],
+            description: "List available skills, load one skill, or read a referenced file from an installed local skill.".into(),
+        },
+        ToolManifest {
             id: "LS".into(),
             name: "LS".into(),
             category: "filesystem".into(),

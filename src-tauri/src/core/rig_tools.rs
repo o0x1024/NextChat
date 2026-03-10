@@ -13,7 +13,7 @@ use crate::core::domain::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 
-fn sanitize_rig_tool_name(tool_id: &str) -> String {
+pub(crate) fn sanitize_rig_tool_name(tool_id: &str) -> String {
     let mut sanitized = String::with_capacity(tool_id.len());
 
     for ch in tool_id.chars() {
@@ -36,6 +36,7 @@ fn sanitize_rig_tool_name(tool_id: &str) -> String {
 pub struct RigToolEvent {
     pub tool_id: String,
     pub tool_name: String,
+    pub call_id: String,
     pub input: String,
     pub output: String,
 }
@@ -52,9 +53,47 @@ impl RigToolCallLog {
         }
     }
 
-    pub fn push(&self, event: RigToolEvent) {
+    pub fn record_call(&self, tool_id: &str, tool_name: &str, call_id: &str, input: &str) {
         if let Ok(mut events) = self.events.lock() {
-            events.push(event);
+            if let Some(existing) = events.iter_mut().find(|event| event.call_id == call_id) {
+                existing.tool_id = tool_id.to_string();
+                existing.tool_name = tool_name.to_string();
+                existing.input = input.to_string();
+                return;
+            }
+            events.push(RigToolEvent {
+                tool_id: tool_id.to_string(),
+                tool_name: tool_name.to_string(),
+                call_id: call_id.to_string(),
+                input: input.to_string(),
+                output: String::new(),
+            });
+        }
+    }
+
+    pub fn record_result(
+        &self,
+        tool_id: &str,
+        tool_name: &str,
+        call_id: &str,
+        input: &str,
+        output: &str,
+    ) {
+        if let Ok(mut events) = self.events.lock() {
+            if let Some(existing) = events.iter_mut().find(|event| event.call_id == call_id) {
+                existing.tool_id = tool_id.to_string();
+                existing.tool_name = tool_name.to_string();
+                existing.input = input.to_string();
+                existing.output = output.to_string();
+                return;
+            }
+            events.push(RigToolEvent {
+                tool_id: tool_id.to_string(),
+                tool_name: tool_name.to_string(),
+                call_id: call_id.to_string(),
+                input: input.to_string(),
+                output: output.to_string(),
+            });
         }
     }
 
@@ -86,7 +125,6 @@ pub struct NextChatRigTool<TTool> {
     agent: crate::core::domain::AgentProfile,
     working_directory: String,
     approval_granted: bool,
-    call_log: RigToolCallLog,
     tool_stream: Option<UnboundedSender<ToolStreamChunk>>,
 }
 
@@ -99,7 +137,6 @@ impl<TTool> NextChatRigTool<TTool> {
         agent: crate::core::domain::AgentProfile,
         working_directory: String,
         approval_granted: bool,
-        call_log: RigToolCallLog,
         tool_stream: Option<UnboundedSender<ToolStreamChunk>>,
     ) -> Self {
         Self {
@@ -110,7 +147,6 @@ impl<TTool> NextChatRigTool<TTool> {
             agent,
             working_directory,
             approval_granted,
-            call_log,
             tool_stream,
         }
     }
@@ -163,13 +199,6 @@ where
                     ToolError::ToolCallError(Box::new(RigToolCallError(error.to_string())))
                 })?;
 
-            self.call_log.push(RigToolEvent {
-                tool_id: self.manifest.id.clone(),
-                tool_name: self.manifest.name.clone(),
-                input: normalized_input,
-                output: result.output.clone(),
-            });
-
             Ok(result.output)
         })
     }
@@ -178,7 +207,6 @@ where
 pub fn build_rig_tools<TTool>(
     context: &TaskExecutionContext,
     tool_handler: Arc<TTool>,
-    call_log: RigToolCallLog,
 ) -> Vec<Box<dyn ToolDyn>>
 where
     TTool: ToolHandler + 'static,
@@ -199,7 +227,6 @@ where
                 context.agent.clone(),
                 context.work_group.working_directory.clone(),
                 approval_granted,
-                call_log.clone(),
                 context.tool_stream.clone(),
             )) as Box<dyn ToolDyn>
         })
@@ -344,6 +371,7 @@ mod tests {
             settings: SystemSettings::default(),
             summary_stream: None,
             tool_stream: None,
+            tool_call_stream: None,
         }
     }
 

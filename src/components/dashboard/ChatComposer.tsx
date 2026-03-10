@@ -16,7 +16,8 @@ interface ChatComposerProps {
   mentionError: string | null;
   currentApprovalsCount: number;
   activeTasksCount: number;
-  defaultModel: string;
+  stoppableTasksCount: number;
+  stoppingExecution: boolean;
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   onChangeValue: (value: string) => void;
@@ -25,6 +26,7 @@ interface ChatComposerProps {
   onOpenMentionPicker: () => void;
   onJumpToApprovals: () => void;
   onJumpToTaskBoard: () => void;
+  onStopExecution: () => void;
   onClearHistory: () => void;
 }
 
@@ -36,7 +38,8 @@ export function ChatComposer({
   mentionError,
   currentApprovalsCount,
   activeTasksCount,
-  defaultModel,
+  stoppableTasksCount,
+  stoppingExecution,
   textareaRef,
   onSubmit,
   onChangeValue,
@@ -45,6 +48,7 @@ export function ChatComposer({
   onOpenMentionPicker,
   onJumpToApprovals,
   onJumpToTaskBoard,
+  onStopExecution,
   onClearHistory,
 }: ChatComposerProps) {
   const { t } = useTranslation();
@@ -86,9 +90,9 @@ export function ChatComposer({
   }
 
   return (
-    <div className="mt-auto shrink-0 px-5 pb-6 pt-3">
+    <div className="mt-auto shrink-0 pb-1 pt-3">
       <form
-        className="flex flex-col rounded-2xl border border-primary/20 bg-base-100 p-2 pt-3 shadow-sm transition-all focus-within:ring-2 focus-within:ring-primary/10"
+        className="flex flex-col rounded-2xl border border-primary/20 bg-base-100 p-1 pt-2 shadow-sm transition-all focus-within:ring-2 focus-within:ring-primary/10"
         onSubmit={(event) => {
           if (value.trim()) {
             onSubmit(event);
@@ -99,7 +103,7 @@ export function ChatComposer({
       >
         <textarea
           ref={textareaRef as RefObject<HTMLTextAreaElement>}
-          className="textarea textarea-ghost min-h-[60px] w-full resize-none bg-transparent text-sm leading-relaxed placeholder:opacity-30 focus:outline-none"
+          className="textarea textarea-ghost min-h-[0px] w-full resize-none bg-transparent text-sm leading-relaxed placeholder:opacity-30 focus:outline-none"
           placeholder={t("taskPlaceholder")}
           rows={2}
           value={value}
@@ -185,6 +189,20 @@ export function ChatComposer({
             </button>
             <button
               type="button"
+              className="btn btn-circle btn-ghost h-6 min-h-0 w-6 px-0 text-base-content/60 hover:text-error"
+              title={stoppableTasksCount > 0 ? t("stopExecution") : t("noActiveTasksToStop")}
+              aria-label={stoppableTasksCount > 0 ? t("stopExecution") : t("noActiveTasksToStop")}
+              onClick={onStopExecution}
+              disabled={stoppableTasksCount === 0 || stoppingExecution}
+            >
+              <i
+                className={`${
+                  stoppingExecution ? "fas fa-spinner fa-spin text-[10px]" : "fas fa-stop text-[10px]"
+                }`}
+              />
+            </button>
+            <button
+              type="button"
               className="btn btn-circle btn-ghost h-6 min-h-0 w-6 px-0 text-base-content/60 hover:text-warning"
               title={t("clearHistory")}
               aria-label={t("clearHistory")}
@@ -194,13 +212,7 @@ export function ChatComposer({
             </button>
           </div>
 
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-1.5 text-[10px] font-bold text-base-content/40">
-              {defaultModel} <i className="fas fa-chevron-down text-[8px]" />
-            </div>
-            <div className="text-base-content/30">
-              <i className="fas fa-language text-xs" />
-            </div>
+          <div className="flex items-center">
             <button
               type="submit"
               className={`btn btn-circle h-7 min-h-0 w-7 btn-xs border-none transition-all ${

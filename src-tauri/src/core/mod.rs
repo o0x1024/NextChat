@@ -9,6 +9,7 @@ pub mod rig_tools;
 pub mod service;
 pub mod skill_policy;
 pub mod storage;
+pub mod stream_text;
 pub mod tool_catalog;
 pub mod tool_runtime;
 pub mod tool_worker;

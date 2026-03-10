@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -16,11 +20,12 @@ use uuid::Uuid;
 
 use crate::core::{
     domain::{
-        AIProviderConfig, ModelPolicy, ModelProviderAdapter, SystemSettings, TaskExecutionContext,
-        ToolHandler,
+        AIProviderConfig, ModelPolicy, ModelProviderAdapter, SummaryStreamSignal, SystemSettings,
+        TaskExecutionContext, ToolCallProgressEvent, ToolCallProgressPhase, ToolHandler,
     },
     logging,
-    rig_tools::{build_rig_tools, RigToolCallLog, RigToolEvent},
+    rig_tools::{build_rig_tools, sanitize_rig_tool_name, RigToolCallLog, RigToolEvent},
+    stream_text::merge_stream_text,
 };
 
 #[derive(Debug, Clone)]
@@ -52,6 +57,11 @@ struct LlmRequestLogContext {
 #[derive(Debug, Clone)]
 struct LlmRequestHook {
     context: LlmRequestLogContext,
+    call_log: RigToolCallLog,
+    tool_call_stream: Option<UnboundedSender<ToolCallProgressEvent>>,
+    summary_stream: Option<UnboundedSender<SummaryStreamSignal>>,
+    summary_reset_epoch: Arc<AtomicUsize>,
+    tool_identity_by_hook_name: HashMap<String, (String, String)>,
 }
 
 impl LlmRequestHook {
@@ -74,6 +84,13 @@ impl LlmRequestHook {
             "taskCardId": self.context.task_card_id,
             "workGroupId": self.context.work_group_id,
         })
+    }
+
+    fn resolve_tool_identity(&self, hook_tool_name: &str) -> (String, String) {
+        self.tool_identity_by_hook_name
+            .get(hook_tool_name)
+            .cloned()
+            .unwrap_or_else(|| (hook_tool_name.to_string(), hook_tool_name.to_string()))
     }
 }
 
@@ -121,13 +138,31 @@ where
         internal_call_id: &str,
         args: &str,
     ) -> ToolCallHookAction {
+        let call_id = tool_call_id.unwrap_or_else(|| internal_call_id.to_string());
+        let (tool_id, display_name) = self.resolve_tool_identity(tool_name);
+        self.call_log
+            .record_call(&tool_id, &display_name, &call_id, args);
+        if let Some(stream) = self.tool_call_stream.as_ref() {
+            let _ = stream.send(ToolCallProgressEvent {
+                tool_id: tool_id.clone(),
+                tool_name: display_name.clone(),
+                call_id: call_id.clone(),
+                input: args.to_string(),
+                output: String::new(),
+                phase: ToolCallProgressPhase::Started,
+            });
+        }
+        self.summary_reset_epoch.fetch_add(1, Ordering::SeqCst);
+        if let Some(stream) = self.summary_stream.as_ref() {
+            let _ = stream.send(SummaryStreamSignal::Reset);
+        }
         self.log(
             "tool_call",
             merge_json(
                 self.common_payload(),
                 json!({
                     "toolName": tool_name,
-                    "toolCallId": tool_call_id,
+                    "toolCallId": call_id,
                     "internalCallId": internal_call_id,
                     "args": logging::truncate(args, 8_000),
                 }),
@@ -144,13 +179,27 @@ where
         args: &str,
         result: &str,
     ) -> HookAction {
+        let call_id = tool_call_id.unwrap_or_else(|| internal_call_id.to_string());
+        let (tool_id, display_name) = self.resolve_tool_identity(tool_name);
+        self.call_log
+            .record_result(&tool_id, &display_name, &call_id, args, result);
+        if let Some(stream) = self.tool_call_stream.as_ref() {
+            let _ = stream.send(ToolCallProgressEvent {
+                tool_id: tool_id.clone(),
+                tool_name: display_name.clone(),
+                call_id: call_id.clone(),
+                input: args.to_string(),
+                output: result.to_string(),
+                phase: ToolCallProgressPhase::Completed,
+            });
+        }
         self.log(
             "tool_result",
             merge_json(
                 self.common_payload(),
                 json!({
                     "toolName": tool_name,
-                    "toolCallId": tool_call_id,
+                    "toolCallId": call_id,
                     "internalCallId": internal_call_id,
                     "args": logging::truncate(args, 8_000),
                     "result": logging::truncate(result, 12_000),
@@ -825,7 +874,7 @@ pub async fn complete_task_with_tools<TTool>(
     tool_handler: std::sync::Arc<TTool>,
     preamble: &str,
     prompt: &str,
-    summary_stream: Option<UnboundedSender<String>>,
+    summary_stream: Option<UnboundedSender<SummaryStreamSignal>>,
 ) -> Result<Option<RigAgentResponse>>
 where
     TTool: ToolHandler + 'static,
@@ -876,9 +925,26 @@ where
     );
 
     let call_log = RigToolCallLog::new();
-    let tools = build_rig_tools(context, tool_handler, call_log.clone());
+    let tools = build_rig_tools(context, tool_handler);
+    let summary_reset_epoch = Arc::new(AtomicUsize::new(0));
+    let tool_identity_by_hook_name = context
+        .available_tools
+        .iter()
+        .chain(context.approved_tool.iter())
+        .map(|tool| {
+            (
+                sanitize_rig_tool_name(&tool.id),
+                (tool.id.clone(), tool.name.clone()),
+            )
+        })
+        .collect();
     let hook = LlmRequestHook {
         context: log_context.clone(),
+        call_log: call_log.clone(),
+        tool_call_stream: context.tool_call_stream.clone(),
+        summary_stream: summary_stream.clone(),
+        summary_reset_epoch: summary_reset_epoch.clone(),
+        tool_identity_by_hook_name,
     };
 
     let result = async {
@@ -898,15 +964,24 @@ where
                 let mut stream = agent.stream_prompt(prompt).with_hook(hook.clone()).await;
                 let mut streamed_summary = String::new();
                 let mut final_summary: Option<String> = None;
+                let mut seen_reset_epoch = 0usize;
 
                 while let Some(chunk) = stream.next().await {
+                    let reset_epoch = summary_reset_epoch.load(Ordering::SeqCst);
+                    if reset_epoch != seen_reset_epoch {
+                        streamed_summary.clear();
+                        seen_reset_epoch = reset_epoch;
+                    }
                     match chunk? {
                         rig::agent::MultiTurnStreamItem::StreamAssistantItem(
                             StreamedAssistantContent::Text(text),
                         ) => {
-                            streamed_summary.push_str(&text.text);
-                            if let Some(stream) = summary_stream.as_ref() {
-                                let _ = stream.send(text.text);
+                            if let Some(delta) =
+                                merge_stream_text(&mut streamed_summary, &text.text)
+                            {
+                                if let Some(stream) = summary_stream.as_ref() {
+                                    let _ = stream.send(SummaryStreamSignal::Delta(delta));
+                                }
                             }
                         }
                         rig::agent::MultiTurnStreamItem::FinalResponse(response) => {
@@ -934,15 +1009,24 @@ where
                 let mut stream = agent.stream_prompt(prompt).with_hook(hook.clone()).await;
                 let mut streamed_summary = String::new();
                 let mut final_summary: Option<String> = None;
+                let mut seen_reset_epoch = 0usize;
 
                 while let Some(chunk) = stream.next().await {
+                    let reset_epoch = summary_reset_epoch.load(Ordering::SeqCst);
+                    if reset_epoch != seen_reset_epoch {
+                        streamed_summary.clear();
+                        seen_reset_epoch = reset_epoch;
+                    }
                     match chunk? {
                         rig::agent::MultiTurnStreamItem::StreamAssistantItem(
                             StreamedAssistantContent::Text(text),
                         ) => {
-                            streamed_summary.push_str(&text.text);
-                            if let Some(stream) = summary_stream.as_ref() {
-                                let _ = stream.send(text.text);
+                            if let Some(delta) =
+                                merge_stream_text(&mut streamed_summary, &text.text)
+                            {
+                                if let Some(stream) = summary_stream.as_ref() {
+                                    let _ = stream.send(SummaryStreamSignal::Delta(delta));
+                                }
                             }
                         }
                         rig::agent::MultiTurnStreamItem::FinalResponse(response) => {
@@ -970,15 +1054,24 @@ where
                 let mut stream = agent.stream_prompt(prompt).with_hook(hook).await;
                 let mut streamed_summary = String::new();
                 let mut final_summary: Option<String> = None;
+                let mut seen_reset_epoch = 0usize;
 
                 while let Some(chunk) = stream.next().await {
+                    let reset_epoch = summary_reset_epoch.load(Ordering::SeqCst);
+                    if reset_epoch != seen_reset_epoch {
+                        streamed_summary.clear();
+                        seen_reset_epoch = reset_epoch;
+                    }
                     match chunk? {
                         rig::agent::MultiTurnStreamItem::StreamAssistantItem(
                             StreamedAssistantContent::Text(text),
                         ) => {
-                            streamed_summary.push_str(&text.text);
-                            if let Some(stream) = summary_stream.as_ref() {
-                                let _ = stream.send(text.text);
+                            if let Some(delta) =
+                                merge_stream_text(&mut streamed_summary, &text.text)
+                            {
+                                if let Some(stream) = summary_stream.as_ref() {
+                                    let _ = stream.send(SummaryStreamSignal::Delta(delta));
+                                }
                             }
                         }
                         rig::agent::MultiTurnStreamItem::FinalResponse(response) => {
@@ -1073,6 +1166,11 @@ impl ModelProviderAdapter for RigModelAdapter {
 
         let hook = LlmRequestHook {
             context: log_context.clone(),
+            call_log: RigToolCallLog::new(),
+            tool_call_stream: None,
+            summary_stream: None,
+            summary_reset_epoch: Arc::new(AtomicUsize::new(0)),
+            tool_identity_by_hook_name: HashMap::new(),
         };
 
         let result = async {
@@ -1159,6 +1257,11 @@ pub async fn test_connection(config: &AIProviderConfig) -> Result<()> {
 
     let hook = LlmRequestHook {
         context: log_context.clone(),
+        call_log: RigToolCallLog::new(),
+        tool_call_stream: None,
+        summary_stream: None,
+        summary_reset_epoch: Arc::new(AtomicUsize::new(0)),
+        tool_identity_by_hook_name: HashMap::new(),
     };
 
     let result = async {

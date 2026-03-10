@@ -240,6 +240,7 @@ impl Storage {
                     "Map the problem space, gather context, and keep the team aligned on evidence.",
                     vec!["skill.research".to_string()],
                     vec![
+                        "Skills".to_string(),
                         "Grep".to_string(),
                         "WebSearch".to_string(),
                         "WebFetch".to_string(),
@@ -254,6 +255,7 @@ impl Storage {
                     "Turn task cards into executable changes, plans, and runnable artifacts.",
                     vec!["skill.builder".to_string()],
                     vec![
+                        "Skills".to_string(),
                         "Read".to_string(),
                         "Edit".to_string(),
                         "Write".to_string(),
@@ -272,6 +274,7 @@ impl Storage {
                     "Stress test proposals, spot regressions, and keep the bar high.",
                     vec!["skill.reviewer".to_string()],
                     vec![
+                        "Skills".to_string(),
                         "Read".to_string(),
                         "Grep".to_string(),
                         "LS".to_string(),

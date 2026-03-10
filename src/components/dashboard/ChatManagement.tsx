@@ -58,6 +58,7 @@ export function ChatManagement({
   onAddAgent,
   onRemoveAgent,
   onApproveRun,
+  onCancelTask,
 }: ChatManagementProps) {
   const { t } = useTranslation();
 
@@ -71,6 +72,7 @@ export function ChatManagement({
   const [composerValue, setComposerValue] = useState("");
   const [mentionIndex, setMentionIndex] = useState(0);
   const [mentionError, setMentionError] = useState<string | null>(null);
+  const [stoppingExecution, setStoppingExecution] = useState(false);
   const [focusAgentId, setFocusAgentId] = useState<string | null>(null);
 
   const [createModalOpen, setCreateModalOpen] = useState(false);
@@ -175,6 +177,14 @@ export function ChatManagement({
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   }, [currentGroup, taskCards]);
 
+  const stoppableTasks = useMemo(
+    () =>
+      currentGroupTasks.filter(
+        (task) => !["completed", "cancelled", "needs_review"].includes(task.status),
+      ),
+    [currentGroupTasks],
+  );
+
   const activeTasks = useMemo(
     () => currentGroupTasks.filter((task) => !["completed", "cancelled"].includes(task.status)),
     [currentGroupTasks],
@@ -236,6 +246,29 @@ export function ChatManagement({
     await onSendMessage(currentGroup.id, composerValue.trim());
     setComposerValue("");
     setMentionError(null);
+  }
+
+  async function handleStopExecution() {
+    if (stoppingExecution || stoppableTasks.length === 0) {
+      return;
+    }
+    setStoppingExecution(true);
+    try {
+      const results = await Promise.allSettled(
+        stoppableTasks.map((task) => onCancelTask(task.id)),
+      );
+      const failed = results.find(
+        (result): result is PromiseRejectedResult => result.status === "rejected",
+      );
+      if (failed) {
+        throw failed.reason;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      window.alert(message);
+    } finally {
+      setStoppingExecution(false);
+    }
   }
 
   async function handleCreateGroup(event: FormEvent<HTMLFormElement>) {
@@ -804,11 +837,11 @@ export function ChatManagement({
             )}
 
             <div
-              className={`flex min-h-0 flex-1 px-5 py-4 ${
+              className={`flex min-h-0 flex-1 px-3 py-4 ${
                 sidePanelOpen ? "flex-col gap-4 xl:flex-row" : "flex-col"
               }`}
             >
-              <div className="flex min-h-0 flex-1 flex-col">
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col">
                 <ChatMessageList
                   currentMessages={currentMessages}
                   streamTracks={currentGroupStreamTracks}
@@ -825,7 +858,8 @@ export function ChatManagement({
                   mentionError={mentionError}
                   currentApprovalsCount={currentApprovals.length}
                   activeTasksCount={activeTasks.length}
-                  defaultModel={settings.globalConfig.defaultLLMModel}
+                  stoppableTasksCount={stoppableTasks.length}
+                  stoppingExecution={stoppingExecution}
                   textareaRef={textareaRef}
                   onSubmit={(event) => {
                     void handleSend(event);
@@ -839,6 +873,9 @@ export function ChatManagement({
                   onOpenMentionPicker={openMentionPicker}
                   onJumpToApprovals={jumpToApprovals}
                   onJumpToTaskBoard={() => jumpToTaskBoard()}
+                  onStopExecution={() => {
+                    void handleStopExecution();
+                  }}
                   onClearHistory={() => {
                     if (currentGroup) {
                       handleClearHistory(currentGroup);
@@ -850,8 +887,8 @@ export function ChatManagement({
               {sidePanelOpen && (
                 <>
                   <div
-                    className={`-ml-2 hidden w-2 shrink-0 cursor-col-resize border-l border-base-content/10 bg-transparent transition-colors hover:bg-primary/20 xl:block ${
-                      resizingRightPanel ? "bg-primary/30" : ""
+                    className={`-ml-2 hidden w-2 shrink-0 cursor-col-resize border-l border-transparent bg-transparent transition-colors hover:border-primary/20 hover:bg-primary/20 xl:block ${
+                      resizingRightPanel ? "border-primary/30 bg-primary/30" : ""
                     }`}
                     onPointerDown={handleRightPanelResizeStart}
                     onPointerMove={handleRightPanelResizeMove}
@@ -903,6 +940,8 @@ export function ChatManagement({
                         currentGroup={currentGroup}
                         currentMembers={currentMembers}
                         availableAgents={availableAgentsForCurrentGroup}
+                        currentGroupTasks={currentGroupTasks}
+                        onCancelTask={onCancelTask}
                         onAddAgent={handleAddMember}
                         onRemoveAgent={handleRemoveMember}
                       />

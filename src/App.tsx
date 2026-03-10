@@ -90,7 +90,10 @@ function App() {
   };
 
   return (
-    <div data-theme={theme} className="flex h-screen w-screen bg-base-200 text-base-content antialiased overflow-hidden">
+    <div
+      data-theme={theme}
+      className="app-shell flex h-screen w-screen overflow-hidden bg-base-200 text-base-content antialiased"
+    >
       <style>{`
         :root {
           font-size: ${fontSize}px !important;
@@ -101,13 +104,14 @@ function App() {
         .grid { gap: var(--component-gap, inherit); }
         .space-y-4 > * + * { margin-top: var(--component-gap, 1rem) !important; }
         .space-x-4 > * + * { margin-left: var(--component-gap, 1rem) !important; }
+        .app-shell { gap: 0 !important; }
       `}</style>
 
       {/* Sidebar */}
       <Sidebar activeView={activeView} onViewChange={setActiveView} />
 
       {/* Main Content Area */}
-      <div className="flex flex-1 flex-col min-w-0 bg-base-200">
+      <div className="flex min-w-0 flex-1 flex-col bg-base-200">
         {/* Top Navbar */}
         <header className="navbar bg-base-100/40 backdrop-blur-md border-b border-base-content/5 px-6 h-14 shrink-0 z-20">
           <div className="flex-1 gap-3">
@@ -145,7 +149,7 @@ function App() {
         </header>
 
         {/* Content Body */}
-        <main className="flex-1 min-h-0 relative p-4 lg:p-6 overflow-hidden">
+        <main className="relative min-h-0 flex-1 overflow-hidden px-3 pb-4 pt-2 lg:px-4 lg:pb-6 lg:pt-3">
           {error && (
             <div className="toast toast-top toast-center z-[101] mt-16 animate-in slide-in-from-top duration-300">
               <div className="alert alert-error shadow-2xl rounded-2xl border border-white/10">
@@ -216,6 +220,9 @@ function App() {
                   }}
                   onApproveRun={async (id: string, ok: boolean) => {
                     await store.approveRun(id, ok);
+                  }}
+                  onCancelTask={async (taskCardId: string) => {
+                    await store.cancelTask(taskCardId);
                   }}
                 />
               </section>

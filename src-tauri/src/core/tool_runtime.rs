@@ -1,4 +1,5 @@
 mod policy;
+mod skills_tool;
 
 use std::{
     collections::HashMap,
@@ -256,6 +257,10 @@ impl ToolRuntime {
             ("Bash", &["bash", "shell", "command", "终端", "命令"][..]),
             ("Glob", &["glob", "pattern", "文件名", "匹配"][..]),
             ("Grep", &["grep", "regex", "search", "查找", "搜索"][..]),
+            (
+                "Skills",
+                &["skill", "skills", "skill.md", "技能", "提示词包"][..],
+            ),
             ("LS", &["ls", "list", "directory", "目录"][..]),
             ("ExitPlanMode", &["plan", "ready to code", "退出规划"][..]),
             ("Read", &["read", "查看", "读取", "file"][..]),
@@ -1871,6 +1876,7 @@ impl ToolHandler for ToolRuntime {
             "Bash" => self.run_bash_compat_tool(&request).await,
             "Glob" => self.run_glob_compat_tool(&request).await,
             "Grep" => self.run_grep_compat_tool(&request).await,
+            "Skills" => self.run_skills_tool(&request).await,
             "LS" => self.run_ls_compat_tool(&request).await,
             "ExitPlanMode" => self.run_exit_plan_mode_tool(&request).await,
             "Read" => self.run_read_compat_tool(&request).await,

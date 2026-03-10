@@ -409,6 +409,9 @@ const resources = {
       clearHistory: "Clear History",
       clearHistoryConfirmHint:
         "Clear all chat history in '{{name}}'? This removes messages, tasks, bids, leases, tool runs, and task memory.",
+      stopExecution: "Stop Execution",
+      noActiveTasksToStop: "No active tasks to stop",
+      noAgentTasksToStop: "This agent has no active tasks",
       cancel: "Cancel",
       delete: "Delete",
       save: "Save",
@@ -871,6 +874,9 @@ const resources = {
       clearHistory: "清空历史",
       clearHistoryConfirmHint:
         "确定清空群聊“{{name}}”的历史记录？这会删除消息、任务、竞标、租约、工具运行与任务记忆。",
+      stopExecution: "停止执行",
+      noActiveTasksToStop: "没有可停止的活跃任务",
+      noAgentTasksToStop: "该智能体当前没有可停止的任务",
       cancel: "取消",
       delete: "删除",
       save: "保存",

@@ -36,6 +36,7 @@ export interface ChatManagementProps {
   onAddAgent: (workGroupId: string, agentId: string) => Promise<void>;
   onRemoveAgent: (workGroupId: string, agentId: string) => Promise<void>;
   onApproveRun: (toolRunId: string, approved: boolean) => Promise<void>;
+  onCancelTask: (taskCardId: string) => Promise<void>;
 }
 
 export type PanelTarget =

@@ -8,7 +8,7 @@ interface MarkdownMessageProps {
 
 export function MarkdownMessage({ content }: MarkdownMessageProps) {
   return (
-    <div className="chat-markdown">
+    <div className="chat-markdown min-w-0 max-w-full">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkBreaks]}
         components={{
@@ -27,7 +27,7 @@ export function MarkdownMessage({ content }: MarkdownMessageProps) {
               return (
                 <code
                   {...props}
-                  className="rounded bg-base-100/70 px-1 py-0.5 font-mono text-[0.85em]"
+                  className="rounded px-1 py-0.5 font-mono text-[0.85em]"
                 >
                   {children}
                 </code>
@@ -35,7 +35,7 @@ export function MarkdownMessage({ content }: MarkdownMessageProps) {
             }
 
             return (
-              <code {...props} className={className}>
+              <code {...props} className={`${className} block text-inherit`}>
                 {children}
               </code>
             );
@@ -43,7 +43,7 @@ export function MarkdownMessage({ content }: MarkdownMessageProps) {
           pre: ({ node: _node, ...props }) => (
             <pre
               {...props}
-              className="my-3 overflow-x-auto rounded-box bg-base-100/80 p-3 font-mono text-xs"
+              className="my-3 min-w-0 max-w-full whitespace-pre-wrap break-words rounded-box p-3 font-mono text-xs leading-relaxed shadow-sm"
             />
           ),
         }}

@@ -5,7 +5,13 @@
 }
 
 .chat-markdown {
+    --code-block-bg: #0d1117;
+    --code-inline-bg: rgba(110, 118, 129, 0.4);
+    --code-border: #30363d;
+    --code-text: #e6edf3;
     overflow-wrap: anywhere;
+    min-width: 0;
+    max-width: 100%;
 }
 
 .chat-markdown > :first-child {
@@ -35,6 +41,41 @@
     border-left: 3px solid color-mix(in srgb, currentColor 18%, transparent);
     opacity: 0.9;
     padding-left: 0.75rem;
+}
+
+.chat-markdown pre,
+.chat-markdown :not(pre) > code {
+    border: 1px solid var(--code-border);
+}
+
+.chat-markdown pre {
+    background: var(--code-block-bg);
+    color: var(--code-text);
+    padding: 0.75rem;
+    max-width: 100%;
+    min-width: 0;
+    overflow-x: hidden;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+
+.chat-markdown pre code {
+    background: transparent;
+    border: 0;
+    color: inherit;
+    padding: 0;
+    white-space: inherit;
+    overflow-wrap: inherit;
+    word-break: inherit;
+}
+
+.chat-markdown :not(pre) > code {
+    background: var(--code-inline-bg);
+    color: var(--code-text);
+    white-space: break-spaces;
+    overflow-wrap: anywhere;
+    word-break: break-word;
 }
 
 .chat-markdown table {

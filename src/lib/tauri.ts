@@ -6,15 +6,22 @@ import type {
   AIProviderConfig,
   AIGlobalConfig,
   AgentProfile,
+  AuditEvent,
   ChatStreamEvent,
+  ClaimBid,
+  ConversationMessage,
   CreateAgentInput,
   CreateWorkGroupInput,
   DashboardState,
+  Lease,
+  MemoryItem,
   SendHumanMessageInput,
   SkillDetail,
   UpdateSkillDetailInput,
   SkillPack,
   SystemSettings,
+  TaskCard,
+  ToolRun,
   UpdateAgentInput,
   UpdateWorkGroupInput,
   WorkGroup,
@@ -83,7 +90,23 @@ export const dashboardEventNames = [
   "approval:requested",
   "memory:updated",
   "audit:event-created",
-];
+] as const;
+
+export type DashboardEventName = (typeof dashboardEventNames)[number];
+
+export interface DashboardEventPayloadMap {
+  "chat:message-created": ConversationMessage;
+  "task:card-created": TaskCard;
+  "claim:bid-submitted": ClaimBid;
+  "lease:granted": Lease;
+  "lease:preempt-requested": Lease;
+  "task:status-changed": TaskCard;
+  "tool:run-started": ToolRun;
+  "tool:run-completed": ToolRun;
+  "approval:requested": ToolRun;
+  "memory:updated": MemoryItem | Record<string, unknown>;
+  "audit:event-created": AuditEvent;
+}
 
 export const chatStreamEventNames = [
   "chat:stream-start",
@@ -294,12 +317,19 @@ export async function getDocumentDirectory(): Promise<string | null> {
 }
 
 export function subscribeToEvents(handlers: {
-  onDashboardEvent: (eventName: string) => void;
+  onDashboardEvent: <T extends DashboardEventName>(
+    eventName: T,
+    payload: DashboardEventPayloadMap[T],
+  ) => void;
   onChatStreamEvent: (eventName: (typeof chatStreamEventNames)[number], payload: ChatStreamEvent) => void;
 }) {
   return Promise.all([
     ...dashboardEventNames.map((eventName) =>
-      listen(eventName, () => handlers.onDashboardEvent(eventName)),
+      listen<DashboardEventPayloadMap[typeof eventName]>(eventName, (event) => {
+        if (event.payload) {
+          handlers.onDashboardEvent(eventName, event.payload);
+        }
+      }),
     ),
     ...chatStreamEventNames.map((eventName) =>
       listen<ChatStreamEvent>(eventName, (event) => {

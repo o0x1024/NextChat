@@ -469,6 +469,7 @@ mod tests {
             settings: crate::core::domain::SystemSettings::default(),
             summary_stream: None,
             tool_stream: None,
+            tool_call_stream: None,
         }
     }
 

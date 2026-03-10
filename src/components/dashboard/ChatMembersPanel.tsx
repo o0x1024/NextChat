@@ -1,12 +1,14 @@
 import { useMemo, useState, type ChangeEvent } from "react";
 import { useTranslation } from "react-i18next";
-import type { AgentProfile, WorkGroup } from "../../types";
+import type { AgentProfile, TaskCard, WorkGroup } from "../../types";
 import { roleAccent } from "./ui";
 
 interface ChatMembersPanelProps {
   currentGroup: WorkGroup;
   currentMembers: AgentProfile[];
   availableAgents: AgentProfile[];
+  currentGroupTasks: TaskCard[];
+  onCancelTask: (taskCardId: string) => Promise<void>;
   onAddAgent: (agentId: string) => Promise<void>;
   onRemoveAgent: (agent: AgentProfile) => Promise<void>;
 }
@@ -20,11 +22,14 @@ export function ChatMembersPanel({
   currentGroup,
   currentMembers,
   availableAgents,
+  currentGroupTasks,
+  onCancelTask,
   onAddAgent,
   onRemoveAgent,
 }: ChatMembersPanelProps) {
   const { t } = useTranslation();
   const [search, setSearch] = useState("");
+  const [stoppingAgentId, setStoppingAgentId] = useState<string | null>(null);
   const filteredAvailableAgents = useMemo(() => {
     const query = search.trim().toLowerCase();
     if (!query) {
@@ -37,6 +42,35 @@ export function ChatMembersPanel({
       return haystack.includes(query);
     });
   }, [availableAgents, search]);
+
+  async function handleStopAgent(agentId: string) {
+    if (stoppingAgentId) {
+      return;
+    }
+    const stoppableTasks = currentGroupTasks.filter(
+      (task) =>
+        task.assignedAgentId === agentId &&
+        !["completed", "cancelled", "needs_review"].includes(task.status),
+    );
+    if (stoppableTasks.length === 0) {
+      return;
+    }
+    setStoppingAgentId(agentId);
+    try {
+      const results = await Promise.allSettled(stoppableTasks.map((task) => onCancelTask(task.id)));
+      const failed = results.find(
+        (result): result is PromiseRejectedResult => result.status === "rejected",
+      );
+      if (failed) {
+        throw failed.reason;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      window.alert(message);
+    } finally {
+      setStoppingAgentId(null);
+    }
+  }
 
   return (
     <>
@@ -51,6 +85,12 @@ export function ChatMembersPanel({
             {currentMembers.map((agent) => {
               const accent = roleAccent(agent.role);
               const lockOwner = isBuiltinGroupOwner(agent);
+              const stoppableTaskCount = currentGroupTasks.filter(
+                (task) =>
+                  task.assignedAgentId === agent.id &&
+                  !["completed", "cancelled", "needs_review"].includes(task.status),
+              ).length;
+              const stoppingCurrentAgent = stoppingAgentId === agent.id;
               return (
                 <div
                   key={agent.id}
@@ -62,15 +102,40 @@ export function ChatMembersPanel({
                     </div>
                     <div className="truncate text-xs text-base-content/60">{agent.role}</div>
                   </div>
-                  <button
-                    type="button"
-                    className="btn btn-ghost btn-xs text-error"
-                    disabled={lockOwner}
-                    title={lockOwner ? t("groupOwnerLocked") : t("delete")}
-                    onClick={() => void onRemoveAgent(agent)}
-                  >
-                    <i className="fas fa-user-minus" />
-                  </button>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-xs"
+                      disabled={lockOwner || stoppableTaskCount === 0 || Boolean(stoppingAgentId)}
+                      title={
+                        lockOwner
+                          ? t("groupOwnerLocked")
+                          : stoppableTaskCount > 0
+                            ? t("stopExecution")
+                            : t("noAgentTasksToStop")
+                      }
+                      onClick={() => {
+                        void handleStopAgent(agent.id);
+                      }}
+                    >
+                      <i
+                        className={`${
+                          stoppingCurrentAgent
+                            ? "fas fa-spinner fa-spin text-[10px]"
+                            : "fas fa-stop text-[10px]"
+                        }`}
+                      />
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-xs text-error"
+                      disabled={lockOwner}
+                      title={lockOwner ? t("groupOwnerLocked") : t("delete")}
+                      onClick={() => void onRemoveAgent(agent)}
+                    >
+                      <i className="fas fa-user-minus" />
+                    </button>
+                  </div>
                 </div>
               );
             })}
