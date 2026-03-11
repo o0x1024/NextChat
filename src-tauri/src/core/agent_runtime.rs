@@ -9,6 +9,7 @@ use crate::core::domain::{
     ToolExecutionRequest, ToolHandler,
 };
 use crate::core::llm_rig::complete_task_with_tools;
+use crate::core::runtime_environment::runtime_environment_block;
 
 #[derive(Clone)]
 pub struct AgentRuntime<TModel, TTool> {
@@ -25,6 +26,104 @@ impl<TModel, TTool> AgentRuntime<TModel, TTool> {
             tool_handler,
         }
     }
+}
+
+fn build_execution_preamble(context: &TaskExecutionContext) -> String {
+    let skill_summary = if context.available_skills.is_empty() {
+        "No extra skills enabled.".to_string()
+    } else {
+        context
+            .available_skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let available_tool_summary = if context.available_tools.is_empty() {
+        "No tools enabled.".to_string()
+    } else {
+        context
+            .available_tools
+            .iter()
+            .map(|tool| format!("{} ({})", tool.id, tool.description))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+
+    format!(
+        "You are {}. Role: {}. Objective: {}. Skills: {}. Available tools: {}.\nRuntime environment:\n{}\nUse tools when they materially improve accuracy. If a high-risk tool is not exposed, do not imply that it was used.",
+        context.agent.name,
+        context.agent.role,
+        context.agent.objective,
+        skill_summary,
+        available_tool_summary,
+        runtime_environment_block(&context.work_group)
+    )
+}
+
+fn build_execution_prompt(context: &TaskExecutionContext) -> String {
+    let planning_rules = context
+        .available_skills
+        .iter()
+        .flat_map(|skill| skill.planning_rules.iter().cloned())
+        .collect::<Vec<_>>();
+    let done_criteria = context
+        .available_skills
+        .iter()
+        .flat_map(|skill| skill.done_criteria.iter().cloned())
+        .collect::<Vec<_>>();
+    let memory_summary = if context.memory_context.is_empty() {
+        "- None".to_string()
+    } else {
+        context
+            .memory_context
+            .iter()
+            .map(|item| {
+                format!(
+                    "- [{}] {}",
+                    item.scope_id,
+                    item.content.lines().next().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let conversation_items = context
+        .conversation_window
+        .iter()
+        .rev()
+        .take(6)
+        .map(|message| format!("{}: {}", message.sender_name, message.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "Work group goal: {}\nWorking directory: {}\nTask: {}\nConversation items:\n{}\nMemory context:\n{}\nPlanning rules:\n{}\nDone criteria:\n{}\nReturn a concise progress summary. If you need to delegate follow-up work, append one line per child task in the exact format `Delegate @AgentName: task details`. If you used tools, cite the concrete outcome instead of generic statements.",
+        context.work_group.goal,
+        context.work_group.working_directory,
+        context.task_card.normalized_goal,
+        conversation_items,
+        memory_summary,
+        if planning_rules.is_empty() {
+            "- None".to_string()
+        } else {
+            planning_rules
+                .iter()
+                .map(|rule| format!("- {rule}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        if done_criteria.is_empty() {
+            "- Provide the best available answer".to_string()
+        } else {
+            done_criteria
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    )
 }
 
 #[async_trait]
@@ -44,84 +143,8 @@ where
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-
-        let available_tool_summary = if context.available_tools.is_empty() {
-            "No tools enabled.".to_string()
-        } else {
-            context
-                .available_tools
-                .iter()
-                .map(|tool| format!("{} ({})", tool.id, tool.description))
-                .collect::<Vec<_>>()
-                .join("; ")
-        };
-        let planning_rules = context
-            .available_skills
-            .iter()
-            .flat_map(|skill| skill.planning_rules.iter().cloned())
-            .collect::<Vec<_>>();
-        let done_criteria = context
-            .available_skills
-            .iter()
-            .flat_map(|skill| skill.done_criteria.iter().cloned())
-            .collect::<Vec<_>>();
-        let memory_summary = if context.memory_context.is_empty() {
-            "- None".to_string()
-        } else {
-            context
-                .memory_context
-                .iter()
-                .map(|item| {
-                    format!(
-                        "- [{}] {}",
-                        item.scope_id,
-                        item.content.lines().next().unwrap_or_default()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-
-        let preamble = format!(
-            "You are {}. Role: {}. Objective: {}. Skills: {}. Available tools: {}. Use tools when they materially improve accuracy. If a high-risk tool is not exposed, do not imply that it was used.",
-            context.agent.name,
-            context.agent.role,
-            context.agent.objective,
-            skill_summary,
-            available_tool_summary
-        );
-        let prompt = format!(
-            "Work group goal: {}\nTask: {}\nConversation items:\n{}\nMemory context:\n{}\nPlanning rules:\n{}\nDone criteria:\n{}\nReturn a concise progress summary. If you need to delegate follow-up work, append one line per child task in the exact format `Delegate @AgentName: task details`. If you used tools, cite the concrete outcome instead of generic statements.",
-            context.work_group.goal,
-            context.task_card.normalized_goal,
-            context
-                .conversation_window
-                .iter()
-                .rev()
-                .take(6)
-                .map(|message| format!("{}: {}", message.sender_name, message.content))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            memory_summary,
-            if planning_rules.is_empty() {
-                "- None".to_string()
-            } else {
-                planning_rules
-                    .iter()
-                    .map(|rule| format!("- {rule}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            },
-            if done_criteria.is_empty() {
-                "- Provide the best available answer".to_string()
-            } else {
-                done_criteria
-                    .iter()
-                    .map(|item| format!("- {item}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
-        );
+        let preamble = build_execution_preamble(&context);
+        let prompt = build_execution_prompt(&context);
 
         let rig_execution = complete_task_with_tools(
             &context,
@@ -395,7 +418,10 @@ fn merge_subtasks(explicit: Vec<String>, heuristic: Vec<String>, limit: usize) -
 
 #[cfg(test)]
 mod tests {
-    use super::{build_suggested_subtasks, cleaned_summary, extract_delegation_directives};
+    use super::{
+        build_execution_preamble, build_execution_prompt, build_suggested_subtasks,
+        cleaned_summary, extract_delegation_directives,
+    };
     use crate::core::domain::{
         AgentPermissionPolicy, AgentProfile, MemoryPolicy, ModelPolicy, TaskCard,
         TaskExecutionContext, TaskStatus, ToolManifest, WorkGroup, WorkGroupKind,
@@ -508,5 +534,28 @@ mod tests {
             true,
         );
         assert_eq!(summary, "Shipped draft.");
+    }
+
+    #[test]
+    fn execution_prompt_includes_working_directory() {
+        let mut ctx = context("Inspect the repository structure");
+        ctx.work_group.working_directory = "/Users/a1024/code/NextChat".into();
+
+        let prompt = build_execution_prompt(&ctx);
+
+        assert!(prompt.contains("Working directory: /Users/a1024/code/NextChat"));
+    }
+
+    #[test]
+    fn execution_preamble_includes_environment_details() {
+        let mut ctx = context("Inspect the repository structure");
+        ctx.work_group.working_directory = "/Users/a1024/code/NextChat".into();
+
+        let preamble = build_execution_preamble(&ctx);
+
+        assert!(preamble.contains("Runtime environment:"));
+        assert!(preamble.contains("Working directory: /Users/a1024/code/NextChat"));
+        assert!(preamble.contains("Shell execution:"));
+        assert!(preamble.contains("Platform:"));
     }
 }

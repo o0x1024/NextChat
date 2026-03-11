@@ -11,6 +11,7 @@ use crate::core::{
     llm_rig::test_connection,
     logging,
     service::AppService,
+    workflow::{OwnerBlockerResolution, RaiseTaskBlockerInput, TaskBlockerRecord},
 };
 
 struct SharedState {
@@ -41,6 +42,17 @@ async fn generate_agent_profile(
     command_result(
         "tauri.generate_agent_profile",
         state.service.generate_agent_profile(&prompt).await,
+    )
+}
+
+#[tauri::command]
+async fn generate_agent_profiles(
+    state: State<'_, SharedState>,
+    prompt: String,
+) -> Result<Vec<CreateAgentInput>, String> {
+    command_result(
+        "tauri.generate_agent_profiles",
+        state.service.generate_agent_profiles(&prompt).await,
     )
 }
 
@@ -183,6 +195,34 @@ async fn cancel_task_card(
             .service
             .cancel_task_card(app, &task_card_id)
             .map(|_| ()),
+    )
+}
+
+#[tauri::command]
+async fn raise_task_blocker(
+    app: tauri::AppHandle,
+    state: State<'_, SharedState>,
+    task_id: String,
+    blocker: RaiseTaskBlockerInput,
+) -> Result<TaskBlockerRecord, String> {
+    command_result(
+        "tauri.raise_task_blocker",
+        state.service.raise_task_blocker(app, &task_id, blocker),
+    )
+}
+
+#[tauri::command]
+async fn resolve_owner_blocker(
+    app: tauri::AppHandle,
+    state: State<'_, SharedState>,
+    blocker_id: String,
+    resolution: OwnerBlockerResolution,
+) -> Result<(), String> {
+    command_result(
+        "tauri.resolve_owner_blocker",
+        state
+            .service
+            .resolve_owner_blocker(app, &blocker_id, resolution),
     )
 }
 
@@ -419,6 +459,7 @@ pub fn maybe_run_tool_worker_from_args() -> anyhow::Result<bool> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|app| {
             let service = create_service(app).map_err(|error| {
                 logging::error("app.setup", error.to_string());
@@ -431,6 +472,7 @@ pub fn run() {
             get_dashboard_state,
             create_agent_profile,
             generate_agent_profile,
+            generate_agent_profiles,
             update_agent_profile,
             delete_agent_profile,
             create_work_group,
@@ -443,6 +485,8 @@ pub fn run() {
             list_task_cards,
             approve_tool_run,
             cancel_task_card,
+            raise_task_blocker,
+            resolve_owner_blocker,
             pause_lease,
             resume_task_card,
             get_audit_events,

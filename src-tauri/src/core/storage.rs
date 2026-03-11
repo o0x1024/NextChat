@@ -1,6 +1,9 @@
 mod bids;
 mod memory;
+mod messages;
+mod tasks;
 mod work_groups;
+mod workflows;
 
 use std::{fs, path::PathBuf};
 
@@ -9,9 +12,9 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::core::domain::{
-    new_id, now, AgentPermissionPolicy, AgentProfile, AuditEvent, ConversationMessage,
-    DashboardState, ExecutionMode, Lease, LeaseState, MemoryPolicy, MemoryScope, MessageKind,
-    ModelPolicy, SenderKind, SystemSettings, TaskCard, ToolRun, Visibility, WorkGroup,
+    new_id, now, AgentPermissionPolicy, AgentProfile, AuditEvent, DashboardState, Lease,
+    LeaseState, MemoryPolicy, MemoryScope, MessageKind, ModelPolicy, PendingUserQuestion,
+    PendingUserQuestionStatus, SenderKind, SystemSettings, ToolRun, Visibility, WorkGroup,
     WorkGroupKind,
 };
 
@@ -100,6 +103,61 @@ impl Storage {
                   created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS workflows (
+                  id TEXT PRIMARY KEY,
+                  work_group_id TEXT NOT NULL,
+                  source_message_id TEXT NOT NULL,
+                  route_mode TEXT NOT NULL,
+                  title TEXT NOT NULL,
+                  normalized_intent TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  owner_agent_id TEXT NOT NULL,
+                  current_stage_id TEXT,
+                  created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS workflow_stages (
+                  id TEXT PRIMARY KEY,
+                  workflow_id TEXT NOT NULL,
+                  title TEXT NOT NULL,
+                  goal TEXT NOT NULL,
+                  order_index INTEGER NOT NULL,
+                  execution_mode TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  entry_message_id TEXT,
+                  completion_message_id TEXT,
+                  created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS task_dispatches (
+                  task_id TEXT PRIMARY KEY,
+                  workflow_id TEXT,
+                  stage_id TEXT,
+                  dispatch_source TEXT NOT NULL,
+                  depends_on_task_ids TEXT NOT NULL,
+                  acknowledged_at TEXT,
+                  result_message_id TEXT,
+                  locked_by_user_mention INTEGER NOT NULL DEFAULT 0,
+                  target_agent_id TEXT NOT NULL,
+                  route_mode TEXT NOT NULL,
+                  narrative_stage_label TEXT,
+                  narrative_task_label TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS task_blockers (
+                  id TEXT PRIMARY KEY,
+                  task_id TEXT NOT NULL,
+                  workflow_id TEXT,
+                  raised_by_agent_id TEXT NOT NULL,
+                  resolution_target TEXT NOT NULL,
+                  category TEXT NOT NULL,
+                  summary TEXT NOT NULL,
+                  details TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  resolved_at TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS claim_bids (
                   id TEXT PRIMARY KEY,
                   task_card_id TEXT NOT NULL,
@@ -135,6 +193,23 @@ impl Storage {
                   result_ref TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS pending_user_questions (
+                  id TEXT PRIMARY KEY,
+                  work_group_id TEXT NOT NULL,
+                  task_card_id TEXT NOT NULL,
+                  agent_id TEXT NOT NULL,
+                  tool_run_id TEXT,
+                  question TEXT NOT NULL,
+                  options TEXT NOT NULL,
+                  context TEXT,
+                  allow_free_form INTEGER NOT NULL,
+                  asked_message_id TEXT NOT NULL,
+                  answer_message_id TEXT,
+                  status TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  answered_at TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS memory_items (
                   id TEXT PRIMARY KEY,
                   scope TEXT NOT NULL,
@@ -163,9 +238,14 @@ impl Storage {
 
                 CREATE INDEX IF NOT EXISTS idx_messages_group ON messages(work_group_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_tasks_group ON task_cards(work_group_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_workflows_group ON workflows(work_group_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_workflow_stages_workflow ON workflow_stages(workflow_id, order_index);
+                CREATE INDEX IF NOT EXISTS idx_task_dispatches_workflow ON task_dispatches(workflow_id, stage_id);
+                CREATE INDEX IF NOT EXISTS idx_task_blockers_task ON task_blockers(task_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_bids_task ON claim_bids(task_card_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_leases_task ON leases(task_card_id);
                 CREATE INDEX IF NOT EXISTS idx_tool_runs_task ON tool_runs(task_card_id);
+                CREATE INDEX IF NOT EXISTS idx_pending_user_questions_group ON pending_user_questions(work_group_id, created_at);
                 "#,
             )?;
             ensure_column(conn, "messages", "execution_mode", "TEXT")?;
@@ -219,6 +299,24 @@ impl Storage {
                     )?;
                 }
             }
+            {
+                let mut stmt = conn.prepare("SELECT id, tool_ids FROM agents")?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (agent_id, tool_ids_raw) = row?;
+                    let mut tool_ids: Vec<String> = decode(tool_ids_raw)?;
+                    if tool_ids.iter().any(|tool_id| tool_id == "AskUserQuestion") {
+                        continue;
+                    }
+                    tool_ids.push("AskUserQuestion".to_string());
+                    conn.execute(
+                        "UPDATE agents SET tool_ids = ?1 WHERE id = ?2",
+                        params![json(&tool_ids)?, agent_id],
+                    )?;
+                }
+            }
             Ok(())
         })
     }
@@ -245,6 +343,7 @@ impl Storage {
                         "WebSearch".to_string(),
                         "WebFetch".to_string(),
                         "Read".to_string(),
+                        "AskUserQuestion".to_string(),
                         "Task".to_string(),
                     ],
                 ),
@@ -263,6 +362,8 @@ impl Storage {
                         "Grep".to_string(),
                         "Glob".to_string(),
                         "Bash".to_string(),
+                        "shell.exec".to_string(),
+                        "AskUserQuestion".to_string(),
                         "TodoWrite".to_string(),
                         "ExitPlanMode".to_string(),
                     ],
@@ -278,6 +379,7 @@ impl Storage {
                         "Read".to_string(),
                         "Grep".to_string(),
                         "LS".to_string(),
+                        "AskUserQuestion".to_string(),
                         "TodoWrite".to_string(),
                     ],
                 ),
@@ -389,6 +491,7 @@ impl Storage {
             work_groups: self.list_work_groups()?,
             messages: self.list_messages()?,
             task_cards: self.list_task_cards(None)?,
+            task_blockers: self.list_task_blockers()?,
             claim_bids: self.list_claim_bids()?,
             leases: self.list_leases()?,
             tool_runs: self.list_tool_runs()?,
@@ -486,122 +589,6 @@ impl Storage {
         })
     }
 
-    pub fn insert_message(&self, message: &ConversationMessage) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"
-                INSERT INTO messages (
-                  id, conversation_id, work_group_id, sender_kind, sender_id, sender_name, kind,
-                  visibility, content, mentions, task_card_id, execution_mode, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                "#,
-                params![
-                    message.id,
-                    message.conversation_id,
-                    message.work_group_id,
-                    json(&message.sender_kind)?,
-                    message.sender_id,
-                    message.sender_name,
-                    json(&message.kind)?,
-                    json(&message.visibility)?,
-                    message.content,
-                    json(&message.mentions)?,
-                    message.task_card_id,
-                    message.execution_mode.as_ref().map(json).transpose()?,
-                    message.created_at,
-                ],
-            )?;
-            Ok(())
-        })
-    }
-
-    pub fn list_messages(&self) -> Result<Vec<ConversationMessage>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT * FROM messages ORDER BY created_at ASC")?;
-            let rows = stmt.query_map([], map_message)?;
-            collect_rows(rows)
-        })
-    }
-
-    pub fn list_messages_for_group(&self, work_group_id: &str) -> Result<Vec<ConversationMessage>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT * FROM messages WHERE work_group_id = ?1 ORDER BY created_at ASC",
-            )?;
-            let rows = stmt.query_map(params![work_group_id], map_message)?;
-            collect_rows(rows)
-        })
-    }
-
-    pub fn insert_task_card(&self, task_card: &TaskCard) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"
-                INSERT OR REPLACE INTO task_cards (
-                  id, parent_id, source_message_id, title, normalized_goal, input_payload, priority,
-                  status, work_group_id, created_by, assigned_agent_id, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                "#,
-                params![
-                    task_card.id,
-                    task_card.parent_id,
-                    task_card.source_message_id,
-                    task_card.title,
-                    task_card.normalized_goal,
-                    task_card.input_payload,
-                    task_card.priority,
-                    json(&task_card.status)?,
-                    task_card.work_group_id,
-                    task_card.created_by,
-                    task_card.assigned_agent_id,
-                    task_card.created_at,
-                ],
-            )?;
-            Ok(())
-        })
-    }
-
-    pub fn list_task_cards(&self, work_group_id: Option<&str>) -> Result<Vec<TaskCard>> {
-        self.with_conn(|conn| {
-            let sql = if work_group_id.is_some() {
-                "SELECT * FROM task_cards WHERE work_group_id = ?1 ORDER BY created_at DESC"
-            } else {
-                "SELECT * FROM task_cards ORDER BY created_at DESC"
-            };
-            let mut stmt = conn.prepare(sql)?;
-            let rows = if let Some(id) = work_group_id {
-                stmt.query_map(params![id], map_task_card)?
-            } else {
-                stmt.query_map([], map_task_card)?
-            };
-            collect_rows(rows)
-        })
-    }
-
-    pub fn get_task_card(&self, task_card_id: &str) -> Result<TaskCard> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                "SELECT * FROM task_cards WHERE id = ?1",
-                params![task_card_id],
-                map_task_card,
-            )
-            .context("task card not found")
-        })
-    }
-
-    pub fn list_child_tasks(&self, parent_id: &str) -> Result<Vec<TaskCard>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn
-                .prepare("SELECT * FROM task_cards WHERE parent_id = ?1 ORDER BY created_at ASC")?;
-            let rows = stmt.query_map(params![parent_id], map_task_card)?;
-            collect_rows(rows)
-        })
-    }
-
-    pub fn update_task_card(&self, task_card: &TaskCard) -> Result<()> {
-        self.insert_task_card(task_card)
-    }
-
     pub fn insert_lease(&self, lease: &Lease) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
@@ -690,6 +677,73 @@ impl Storage {
                 conn.prepare("SELECT * FROM tool_runs ORDER BY COALESCE(started_at, '') ASC")?;
             let rows = stmt.query_map([], map_tool_run)?;
             collect_rows(rows)
+        })
+    }
+
+    pub fn insert_pending_user_question(&self, question: &PendingUserQuestion) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"
+                INSERT INTO pending_user_questions (
+                  id, work_group_id, task_card_id, agent_id, tool_run_id, question, options,
+                  context, allow_free_form, asked_message_id, answer_message_id, status, created_at, answered_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                ON CONFLICT(id) DO UPDATE SET
+                  work_group_id = excluded.work_group_id,
+                  task_card_id = excluded.task_card_id,
+                  agent_id = excluded.agent_id,
+                  tool_run_id = excluded.tool_run_id,
+                  question = excluded.question,
+                  options = excluded.options,
+                  context = excluded.context,
+                  allow_free_form = excluded.allow_free_form,
+                  asked_message_id = excluded.asked_message_id,
+                  answer_message_id = excluded.answer_message_id,
+                  status = excluded.status,
+                  created_at = excluded.created_at,
+                  answered_at = excluded.answered_at
+                "#,
+                params![
+                    question.id,
+                    question.work_group_id,
+                    question.task_card_id,
+                    question.agent_id,
+                    question.tool_run_id,
+                    question.question,
+                    json(&question.options)?,
+                    question.context,
+                    if question.allow_free_form { 1_i64 } else { 0_i64 },
+                    question.asked_message_id,
+                    question.answer_message_id,
+                    json(&question.status)?,
+                    question.created_at,
+                    question.answered_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn latest_pending_user_question_for_group(
+        &self,
+        work_group_id: &str,
+    ) -> Result<Option<PendingUserQuestion>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"
+                SELECT
+                  id, work_group_id, task_card_id, agent_id, tool_run_id, question, options,
+                  context, allow_free_form, asked_message_id, answer_message_id, status, created_at, answered_at
+                FROM pending_user_questions
+                WHERE work_group_id = ?1 AND status = ?2
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#,
+                params![work_group_id, json(&PendingUserQuestionStatus::Pending)?],
+                map_pending_user_question,
+            )
+            .optional()
+            .map_err(Into::into)
         })
     }
 
@@ -886,44 +940,6 @@ fn map_work_group(row: &Row<'_>) -> rusqlite::Result<WorkGroup> {
     })
 }
 
-fn map_message(row: &Row<'_>) -> rusqlite::Result<ConversationMessage> {
-    Ok(ConversationMessage {
-        id: row.get("id")?,
-        conversation_id: row.get("conversation_id")?,
-        work_group_id: row.get("work_group_id")?,
-        sender_kind: decode(row.get("sender_kind")?)?,
-        sender_id: row.get("sender_id")?,
-        sender_name: row.get("sender_name")?,
-        kind: decode(row.get("kind")?)?,
-        visibility: decode(row.get("visibility")?)?,
-        content: row.get("content")?,
-        mentions: decode(row.get("mentions")?)?,
-        task_card_id: row.get("task_card_id")?,
-        execution_mode: row
-            .get::<_, Option<String>>("execution_mode")?
-            .map(decode::<ExecutionMode>)
-            .transpose()?,
-        created_at: row.get("created_at")?,
-    })
-}
-
-fn map_task_card(row: &Row<'_>) -> rusqlite::Result<TaskCard> {
-    Ok(TaskCard {
-        id: row.get("id")?,
-        parent_id: row.get("parent_id")?,
-        source_message_id: row.get("source_message_id")?,
-        title: row.get("title")?,
-        normalized_goal: row.get("normalized_goal")?,
-        input_payload: row.get("input_payload")?,
-        priority: row.get("priority")?,
-        status: decode(row.get("status")?)?,
-        work_group_id: row.get("work_group_id")?,
-        created_by: row.get("created_by")?,
-        assigned_agent_id: row.get("assigned_agent_id")?,
-        created_at: row.get("created_at")?,
-    })
-}
-
 fn map_lease(row: &Row<'_>) -> rusqlite::Result<Lease> {
     Ok(Lease {
         id: row.get("id")?,
@@ -948,6 +964,25 @@ fn map_tool_run(row: &Row<'_>) -> rusqlite::Result<ToolRun> {
         started_at: row.get("started_at")?,
         finished_at: row.get("finished_at")?,
         result_ref: row.get("result_ref")?,
+    })
+}
+
+fn map_pending_user_question(row: &Row<'_>) -> rusqlite::Result<PendingUserQuestion> {
+    Ok(PendingUserQuestion {
+        id: row.get("id")?,
+        work_group_id: row.get("work_group_id")?,
+        task_card_id: row.get("task_card_id")?,
+        agent_id: row.get("agent_id")?,
+        tool_run_id: row.get("tool_run_id")?,
+        question: row.get("question")?,
+        options: decode(row.get("options")?)?,
+        context: row.get("context")?,
+        allow_free_form: row.get::<_, i64>("allow_free_form")? == 1,
+        asked_message_id: row.get("asked_message_id")?,
+        answer_message_id: row.get("answer_message_id")?,
+        status: decode(row.get("status")?)?,
+        created_at: row.get("created_at")?,
+        answered_at: row.get("answered_at")?,
     })
 }
 

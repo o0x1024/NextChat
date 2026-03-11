@@ -18,6 +18,7 @@ export type TaskStatus =
   | "leased"
   | "waiting_children"
   | "waiting_approval"
+  | "waiting_user_input"
   | "in_progress"
   | "paused"
   | "cancelled"
@@ -31,6 +32,15 @@ export type ToolRunState =
   | "running"
   | "completed"
   | "cancelled";
+export type BlockerResolutionTarget = "owner" | "user";
+export type BlockerCategory =
+  | "missing_dependency"
+  | "missing_context"
+  | "permission_required"
+  | "tool_failure"
+  | "design_conflict"
+  | "need_user_decision";
+export type BlockerStatus = "open" | "resolved" | "cancelled";
 
 export interface ModelPolicy {
   provider: string;
@@ -213,6 +223,46 @@ export interface ToolRun {
   resultRef?: string | null;
 }
 
+export interface TaskBlockerRecord {
+  id: string;
+  taskId: string;
+  workflowId?: string | null;
+  raisedByAgentId: string;
+  resolutionTarget: BlockerResolutionTarget;
+  category: BlockerCategory;
+  summary: string;
+  details: string;
+  status: BlockerStatus;
+  createdAt: string;
+  resolvedAt?: string | null;
+}
+
+export type OwnerBlockerResolution =
+  | { action: "provide_context"; message: string }
+  | { action: "reassign_task"; targetAgentId: string; message: string }
+  | {
+      action: "create_dependency_task";
+      targetAgentId: string;
+      title: string;
+      goal: string;
+      message: string;
+    }
+  | {
+      action: "request_approval";
+      question: string;
+      options: string[];
+      context?: string | null;
+      allowFreeForm?: boolean | null;
+    }
+  | {
+      action: "ask_user";
+      question: string;
+      options: string[];
+      context?: string | null;
+      allowFreeForm?: boolean | null;
+    }
+  | { action: "pause_task"; message: string };
+
 export interface SkillPack {
   id: string;
   name: string;
@@ -327,6 +377,7 @@ export interface DashboardState {
   workGroups: WorkGroup[];
   messages: ConversationMessage[];
   taskCards: TaskCard[];
+  taskBlockers: TaskBlockerRecord[];
   claimBids: ClaimBid[];
   leases: Lease[];
   toolRuns: ToolRun[];

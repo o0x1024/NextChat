@@ -33,6 +33,7 @@ import {
 } from "./mentions";
 import { WorkGroupDialogs } from "./WorkGroupDialogs";
 import { roleAccent } from "./ui";
+import { findLatestNarrativeMessageId } from "./narrativeTargeting";
 
 type SidePanelMode = "execution" | "running" | "members" | null;
 
@@ -42,9 +43,11 @@ export function ChatManagement({
   messages,
   chatStreamTracks,
   taskCards,
+  taskBlockers,
   leases,
   claimBids,
   toolRuns,
+  auditEvents,
   tools,
   settings,
   selectedWorkGroupId,
@@ -59,38 +62,35 @@ export function ChatManagement({
   onRemoveAgent,
   onApproveRun,
   onCancelTask,
+  onResolveBlocker,
 }: ChatManagementProps) {
   const { t } = useTranslation();
-
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(256);
   const [resizingSidebar, setResizingSidebar] = useState(false);
   const [sidePanelMode, setSidePanelMode] = useState<SidePanelMode>("execution");
   const [rightPanelWidth, setRightPanelWidth] = useState(360);
   const [resizingRightPanel, setResizingRightPanel] = useState(false);
-
   const [composerValue, setComposerValue] = useState("");
+  const [sendingMessage, setSendingMessage] = useState(false);
   const [mentionIndex, setMentionIndex] = useState(0);
   const [mentionError, setMentionError] = useState<string | null>(null);
   const [stoppingExecution, setStoppingExecution] = useState(false);
   const [focusAgentId, setFocusAgentId] = useState<string | null>(null);
-
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [editModalOpen, setEditModalOpen] = useState(false);
   const [directoryPickerError, setDirectoryPickerError] = useState<string | null>(null);
-
   const [deleteTargetGroup, setDeleteTargetGroup] = useState<WorkGroup | null>(null);
   const [deletingGroup, setDeletingGroup] = useState(false);
   const [clearHistoryTargetGroup, setClearHistoryTargetGroup] = useState<WorkGroup | null>(null);
   const [clearingHistory, setClearingHistory] = useState(false);
-
   const [highlightedTaskId, setHighlightedTaskId] = useState<string | null>(null);
+  const [highlightedBlockerId, setHighlightedBlockerId] = useState<string | null>(null);
+  const [targetMessageId, setTargetMessageId] = useState<string | null>(null);
   const [panelTarget, setPanelTarget] = useState<PanelTarget | null>(null);
-
   const [groupForm, setGroupForm] = useState<CreateWorkGroupInput>(emptyGroupForm);
   const [editGroupForm, setEditGroupForm] = useState<UpdateWorkGroupInput>(emptyEditGroupForm);
   const [defaultWorkingDirectory, setDefaultWorkingDirectory] = useState(".");
-
   const rootRef = useRef<HTMLDivElement | null>(null);
   const sidebarResizeRef = useRef<{
     pointerId: number | null;
@@ -123,48 +123,24 @@ export function ChatManagement({
   const taskBoardRef = useRef<HTMLDivElement | null>(null);
   const approvalsRef = useRef<HTMLDivElement | null>(null);
   const taskCardRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const blockerCardRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const currentGroup = useMemo(() => workGroups.find((group) => group.id === selectedWorkGroupId) ?? workGroups[0], [selectedWorkGroupId, workGroups]);
 
-  const currentGroup = useMemo(
-    () => workGroups.find((group) => group.id === selectedWorkGroupId) ?? workGroups[0],
-    [selectedWorkGroupId, workGroups],
-  );
-
-  const currentGroupMessages = useMemo(() => {
-    if (!currentGroup) return [];
-    return messages.filter((message) => message.workGroupId === currentGroup.id);
-  }, [currentGroup, messages]);
-
-  const currentGroupStreamTracks = useMemo(() => {
-    if (!currentGroup) return [];
-    return chatStreamTracks.filter((track) => track.workGroupId === currentGroup.id);
-  }, [chatStreamTracks, currentGroup]);
-
-  const currentMessages = useMemo(() => {
-    if (!currentGroup) return [];
-    return currentGroupMessages.filter((message) => message.visibility === "main");
-  }, [currentGroup, currentGroupMessages]);
-
+  const currentGroupMessages = useMemo(() => !currentGroup ? [] : messages.filter((message) => message.workGroupId === currentGroup.id), [currentGroup, messages]);
+  const currentGroupStreamTracks = useMemo(() => !currentGroup ? [] : chatStreamTracks.filter((track) => track.workGroupId === currentGroup.id), [chatStreamTracks, currentGroup]);
+  const currentMessages = useMemo(() => !currentGroup ? [] : currentGroupMessages.filter((message) => message.visibility === "main"), [currentGroup, currentGroupMessages]);
   const currentMembers = useMemo(() => {
     if (!currentGroup) return [];
     const memberIds = new Set(currentGroup.memberAgentIds);
     return agents.filter((agent) => memberIds.has(agent.id));
   }, [agents, currentGroup]);
-
-  const currentMemberIds = useMemo(
-    () => new Set(currentMembers.map((member) => member.id)),
-    [currentMembers],
-  );
-
-  const availableAgentsForCurrentGroup = useMemo(
-    () => agents.filter((agent) => !currentMemberIds.has(agent.id)),
-    [agents, currentMemberIds],
-  );
+  const currentMemberIds = useMemo(() => new Set(currentMembers.map((member) => member.id)), [currentMembers]);
+  const availableAgentsForCurrentGroup = useMemo(() => agents.filter((agent) => !currentMemberIds.has(agent.id)), [agents, currentMemberIds]);
 
   const mentionDraft = useMemo(() => {
     const caret = textareaRef.current?.selectionStart ?? composerValue.length;
     return activeMentionDraft(composerValue, caret);
   }, [composerValue]);
-
   const mentionOptions = useMemo(
     () => mentionCandidates(currentMembers, mentionDraft?.query ?? "").slice(0, 6),
     [currentMembers, mentionDraft],
@@ -191,15 +167,10 @@ export function ChatManagement({
   );
 
   const activeTaskIds = useMemo(() => new Set(activeTasks.map((task) => task.id)), [activeTasks]);
-  const currentTaskIds = useMemo(
-    () => new Set(currentGroupTasks.map((task) => task.id)),
-    [currentGroupTasks],
-  );
-  const currentTaskTitles = useMemo(
-    () => new Map(currentGroupTasks.map((task) => [task.id, task.title])),
-    [currentGroupTasks],
-  );
-
+  const currentTaskIds = useMemo(() => new Set(currentGroupTasks.map((task) => task.id)), [currentGroupTasks]);
+  const currentTaskTitles = useMemo(() => new Map(currentGroupTasks.map((task) => [task.id, task.title])), [currentGroupTasks]);
+  const currentTaskAssignees = useMemo(() => new Map(currentGroupTasks.filter((task) => Boolean(task.assignedAgentId)).map((task) => [task.id, task.assignedAgentId as string])), [currentGroupTasks]);
+  const currentMemberNames = useMemo(() => new Map(currentMembers.map((member) => [member.id, member.name])), [currentMembers]);
   const currentLeases = useMemo(
     () =>
       leases.filter(
@@ -218,12 +189,21 @@ export function ChatManagement({
       ),
     [currentTaskIds, toolRuns],
   );
-
+  const currentTaskBlockers = useMemo(
+    () =>
+      taskBlockers
+        .filter((blocker) => currentTaskIds.has(blocker.taskId))
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt)),
+    [currentTaskIds, taskBlockers],
+  );
   const sidePanelOpen = sidePanelMode !== null;
 
   async function handleSend(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!currentGroup || !composerValue.trim()) return;
+    if (!currentGroup || sendingMessage) return;
+
+    const trimmedContent = composerValue.trim();
+    if (!trimmedContent) return;
 
     const validation = validateMentions(composerValue, currentMembers);
     if (validation.invalidMentions.length > 0) {
@@ -243,11 +223,20 @@ export function ChatManagement({
       return;
     }
 
-    await onSendMessage(currentGroup.id, composerValue.trim());
+    setSendingMessage(true);
     setComposerValue("");
     setMentionError(null);
-  }
 
+    try {
+      await onSendMessage(currentGroup.id, trimmedContent);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setComposerValue(trimmedContent);
+      setMentionError(message);
+    } finally {
+      setSendingMessage(false);
+    }
+  }
   async function handleStopExecution() {
     if (stoppingExecution || stoppableTasks.length === 0) {
       return;
@@ -394,23 +383,31 @@ export function ChatManagement({
     setSidePanelMode("running");
     setPanelTarget({ section: "approvals" });
   }
-
   function jumpToTaskBoard(taskId?: string) {
     setSidePanelMode("running");
     setPanelTarget({ section: "tasks", taskId });
     setHighlightedTaskId(taskId ?? null);
   }
+  function jumpToBlocker(blockerId: string) {
+    setSidePanelMode("running");
+    setPanelTarget({ section: "blockers", blockerId });
+    setHighlightedBlockerId(blockerId);
+  }
 
+  function jumpToExecutionAgent(agentId: string) { setSidePanelMode("execution"); setFocusAgentId(agentId); }
+
+  function jumpToNarrative(target: { taskId?: string; blockerId?: string }) {
+    const messageId = findLatestNarrativeMessageId(currentMessages, target);
+    if (messageId) setTargetMessageId(messageId);
+  }
   function toggleSidePanel(mode: Exclude<SidePanelMode, null>) {
     setSidePanelMode((current) => (current === mode ? null : mode));
   }
-
   function openCreateGroupModal() {
     setGroupForm({ ...emptyGroupForm, workingDirectory: defaultWorkingDirectory });
     setDirectoryPickerError(null);
     setCreateModalOpen(true);
   }
-
   function openEditGroupModal(group: WorkGroup) {
     setEditGroupForm({
       id: group.id,
@@ -424,11 +421,9 @@ export function ChatManagement({
     setDirectoryPickerError(null);
     setEditModalOpen(true);
   }
-
   function handleDeleteGroup(group: WorkGroup) {
     setDeleteTargetGroup(group);
   }
-
   function handleClearHistory(group: WorkGroup) {
     setClearHistoryTargetGroup(group);
   }
@@ -610,6 +605,8 @@ export function ChatManagement({
     const target =
       panelTarget.section === "approvals"
         ? approvalsRef.current
+        : panelTarget.section === "blockers"
+          ? blockerCardRefs.current[panelTarget.blockerId]
         : panelTarget.taskId
           ? taskCardRefs.current[panelTarget.taskId]
           : taskBoardRef.current;
@@ -630,6 +627,20 @@ export function ChatManagement({
     const clearTimer = window.setTimeout(() => setHighlightedTaskId(null), 1800);
     return () => window.clearTimeout(clearTimer);
   }, [highlightedTaskId]);
+
+  useEffect(() => {
+    if (!highlightedBlockerId) {
+      return;
+    }
+    const clearTimer = window.setTimeout(() => setHighlightedBlockerId(null), 1800);
+    return () => window.clearTimeout(clearTimer);
+  }, [highlightedBlockerId]);
+
+  useEffect(() => {
+    if (!targetMessageId) return;
+    const clearTimer = window.setTimeout(() => setTargetMessageId(null), 1800);
+    return () => window.clearTimeout(clearTimer);
+  }, [targetMessageId]);
 
   useEffect(() => {
     applySidebarWidth(clampSidebarWidth(sidebarWidth));
@@ -846,12 +857,18 @@ export function ChatManagement({
                   currentMessages={currentMessages}
                   streamTracks={currentGroupStreamTracks}
                   currentTaskTitles={currentTaskTitles}
+                  currentTaskAssignees={currentTaskAssignees}
+                  currentMemberNames={currentMemberNames}
                   activeTaskIds={activeTaskIds}
                   language={language}
+                  targetMessageId={targetMessageId}
                   onJumpToTaskBoard={jumpToTaskBoard}
+                  onJumpToBlocker={jumpToBlocker}
+                  onJumpToExecutionAgent={jumpToExecutionAgent}
                 />
                 <ChatComposer
                   value={composerValue}
+                  sendingMessage={sendingMessage}
                   mentionDraft={mentionDraft}
                   mentionOptions={mentionOptions}
                   mentionIndex={mentionIndex}
@@ -861,26 +878,15 @@ export function ChatManagement({
                   stoppableTasksCount={stoppableTasks.length}
                   stoppingExecution={stoppingExecution}
                   textareaRef={textareaRef}
-                  onSubmit={(event) => {
-                    void handleSend(event);
-                  }}
-                  onChangeValue={(value) => {
-                    setComposerValue(value);
-                    setMentionError(null);
-                  }}
+                  onSubmit={(event) => void handleSend(event)}
+                  onChangeValue={(value) => { setComposerValue(value); setMentionError(null); }}
                   onSetMentionIndex={setMentionIndex}
                   onApplyMention={applyMention}
                   onOpenMentionPicker={openMentionPicker}
                   onJumpToApprovals={jumpToApprovals}
                   onJumpToTaskBoard={() => jumpToTaskBoard()}
-                  onStopExecution={() => {
-                    void handleStopExecution();
-                  }}
-                  onClearHistory={() => {
-                    if (currentGroup) {
-                      handleClearHistory(currentGroup);
-                    }
-                  }}
+                  onStopExecution={() => void handleStopExecution()}
+                  onClearHistory={() => { if (currentGroup) handleClearHistory(currentGroup); }}
                 />
               </div>
 
@@ -901,12 +907,16 @@ export function ChatManagement({
                         language={language}
                         focusAgentId={focusAgentId}
                         onFocusAgentIdChange={setFocusAgentId}
+                        onJumpToTask={jumpToTaskBoard}
+                        onJumpToBlocker={jumpToBlocker}
+                        onJumpToNarrative={jumpToNarrative}
                         currentMembers={currentMembers}
                         agents={agents}
                         currentGroupTasks={currentGroupTasks}
                         groupMessages={currentGroupMessages}
                         streamTracks={currentGroupStreamTracks}
                         toolRuns={toolRuns}
+                        auditEvents={auditEvents}
                         tools={tools}
                       />
                     )}
@@ -917,21 +927,20 @@ export function ChatManagement({
                         currentLeases={currentLeases}
                         currentApprovals={currentApprovals}
                         currentGroupTasks={currentGroupTasks}
+                        taskBlockers={currentTaskBlockers}
                         claimBids={claimBids}
                         agents={agents}
                         tools={tools}
                         highlightedTaskId={highlightedTaskId}
-                        onTaskBoardRef={(node) => {
-                          taskBoardRef.current = node;
-                        }}
-                        onApprovalsRef={(node) => {
-                          approvalsRef.current = node;
-                        }}
-                        onSetTaskCardRef={(taskId, node) => {
-                          taskCardRefs.current[taskId] = node;
-                        }}
+                        highlightedBlockerId={highlightedBlockerId}
+                        targetBlockerId={panelTarget?.section === "blockers" ? panelTarget.blockerId : null}
+                        onTaskBoardRef={(node) => { taskBoardRef.current = node; }}
+                        onApprovalsRef={(node) => { approvalsRef.current = node; }}
+                        onSetTaskCardRef={(taskId, node) => { taskCardRefs.current[taskId] = node; }}
+                        onSetBlockerCardRef={(blockerId, node) => { blockerCardRefs.current[blockerId] = node; }}
                         onJumpToTaskBoard={jumpToTaskBoard}
                         onApproveRun={onApproveRun}
+                        onResolveBlocker={onResolveBlocker}
                       />
                     )}
 

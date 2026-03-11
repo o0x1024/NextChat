@@ -15,12 +15,14 @@ import type {
   DashboardState,
   Lease,
   MemoryItem,
+  OwnerBlockerResolution,
   SendHumanMessageInput,
   SkillDetail,
   UpdateSkillDetailInput,
   SkillPack,
   SystemSettings,
   TaskCard,
+  TaskBlockerRecord,
   ToolRun,
   UpdateAgentInput,
   UpdateWorkGroupInput,
@@ -127,6 +129,10 @@ export async function generateAgentProfile(prompt: string): Promise<CreateAgentI
   return invoke("generate_agent_profile", { prompt });
 }
 
+export async function generateAgentProfiles(prompt: string): Promise<CreateAgentInput[]> {
+  return invoke("generate_agent_profiles", { prompt });
+}
+
 export async function updateAgentProfile(input: UpdateAgentInput): Promise<AgentProfile> {
   return invoke("update_agent_profile", { input });
 }
@@ -169,6 +175,17 @@ export async function approveToolRun(toolRunId: string, approved: boolean) {
 
 export async function cancelTaskCard(taskCardId: string) {
   return invoke("cancel_task_card", { taskCardId });
+}
+
+export async function raiseTaskBlocker(taskId: string, blocker: Record<string, unknown>) {
+  return invoke<TaskBlockerRecord>("raise_task_blocker", { taskId, blocker });
+}
+
+export async function resolveOwnerBlocker(
+  blockerId: string,
+  resolution: OwnerBlockerResolution,
+) {
+  return invoke("resolve_owner_blocker", { blockerId, resolution });
 }
 
 export async function pauseLease(leaseId: string) {

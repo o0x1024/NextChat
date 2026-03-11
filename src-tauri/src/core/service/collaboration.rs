@@ -131,6 +131,7 @@ fn collaboration_status_label(status: &TaskStatus) -> &'static str {
         TaskStatus::Cancelled => "cancelled",
         TaskStatus::NeedsReview => "needs_review",
         TaskStatus::WaitingApproval => "waiting_approval",
+        TaskStatus::WaitingUserInput => "waiting_user_input",
         _ => "in_progress",
     }
 }

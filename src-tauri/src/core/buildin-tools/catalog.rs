@@ -17,6 +17,18 @@ pub static BUILTIN_TOOLS: Lazy<Vec<ToolManifest>> = Lazy::new(|| {
             description: "Launch a sub-task request for specialized handling.".into(),
         },
         ToolManifest {
+            id: "AskUserQuestion".into(),
+            name: "AskUserQuestion".into(),
+            category: "coordination".into(),
+            risk_level: ToolRiskLevel::Low,
+            input_schema: r#"{"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"}},"context":{"type":"string"},"allow_free_form":{"type":"boolean"}},"required":["question"],"additionalProperties":false}"#.into(),
+            output_schema: r#"{"status":"string","question":"string","options":"array?","allowFreeForm":"boolean"}"#.into(),
+            timeout_ms: 5_000,
+            concurrency_limit: 1,
+            permissions: vec!["coordination:user_input".into()],
+            description: "Ask the user one necessary clarifying question. The current task pauses and resumes after the user replies.".into(),
+        },
+        ToolManifest {
             id: "Bash".into(),
             name: "Bash".into(),
             category: "system".into(),
@@ -240,9 +252,13 @@ pub static BUILTIN_SKILLS: Lazy<Vec<SkillPack>> = Lazy::new(|| {
             allowed_tool_tags: vec![
                 "filesystem".into(),
                 "workspace".into(),
+                "system".into(),
                 "coordination".into(),
             ],
-            done_criteria: vec!["Produce a change set".into(), "Note verification".into()],
+            done_criteria: vec![
+                "Produce runnable changes".into(),
+                "Explain verification".into(),
+            ],
             enabled: true,
             editable: false,
             source: "builtin".into(),
@@ -250,14 +266,22 @@ pub static BUILTIN_SKILLS: Lazy<Vec<SkillPack>> = Lazy::new(|| {
         },
         SkillPack {
             id: "skill.reviewer".into(),
-            name: "Review Lens".into(),
-            prompt_template: "Prioritize regressions, security, and missing tests.".into(),
+            name: "Reviewer Lens".into(),
+            prompt_template: "Prioritize correctness risks, regressions, and missing coverage."
+                .into(),
             planning_rules: vec![
-                "List findings by severity.".into(),
-                "Separate findings from summary.".into(),
+                "Look for edge cases and broken invariants.".into(),
+                "Prefer concrete evidence over vague concern.".into(),
             ],
-            allowed_tool_tags: vec!["workspace".into(), "coordination".into()],
-            done_criteria: vec!["Identify risks".into(), "Recommend fixes".into()],
+            allowed_tool_tags: vec![
+                "workspace".into(),
+                "filesystem".into(),
+                "coordination".into(),
+            ],
+            done_criteria: vec![
+                "List material findings".into(),
+                "State residual risks".into(),
+            ],
             enabled: true,
             editable: false,
             source: "builtin".into(),

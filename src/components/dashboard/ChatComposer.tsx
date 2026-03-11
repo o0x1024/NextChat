@@ -10,6 +10,7 @@ import type { MentionDraft } from "./mentions";
 
 interface ChatComposerProps {
   value: string;
+  sendingMessage: boolean;
   mentionDraft: MentionDraft | null;
   mentionOptions: AgentProfile[];
   mentionIndex: number;
@@ -32,6 +33,7 @@ interface ChatComposerProps {
 
 export function ChatComposer({
   value,
+  sendingMessage,
   mentionDraft,
   mentionOptions,
   mentionIndex,
@@ -83,8 +85,8 @@ export function ChatComposer({
 
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      if (value.trim()) {
-        onSubmit(event as unknown as FormEvent<HTMLFormElement>);
+      if (value.trim() && !sendingMessage) {
+        event.currentTarget.form?.requestSubmit();
       }
     }
   }
@@ -94,7 +96,7 @@ export function ChatComposer({
       <form
         className="flex flex-col rounded-2xl border border-primary/20 bg-base-100 p-1 pt-2 shadow-sm transition-all focus-within:ring-2 focus-within:ring-primary/10"
         onSubmit={(event) => {
-          if (value.trim()) {
+          if (value.trim() && !sendingMessage) {
             onSubmit(event);
           } else {
             event.preventDefault();
@@ -107,6 +109,7 @@ export function ChatComposer({
           placeholder={t("taskPlaceholder")}
           rows={2}
           value={value}
+          disabled={sendingMessage}
           onChange={(event: ChangeEvent<HTMLTextAreaElement>) => onChangeValue(event.target.value)}
           onKeyDown={handleKeyDown}
         />
@@ -220,7 +223,7 @@ export function ChatComposer({
                   ? "bg-primary text-primary-content shadow-lg shadow-primary/20 hover:scale-110"
                   : "bg-base-200 text-base-content/20"
               }`}
-              disabled={!value.trim()}
+              disabled={!value.trim() || sendingMessage}
             >
               <i className="fas fa-arrow-up text-[10px]" />
             </button>

@@ -1,11 +1,18 @@
 mod agent_generation;
+mod agent_narrative_orchestration;
+mod blockers;
 #[cfg(test)]
 mod clear_history_tests;
 mod collaboration;
+mod direct_routing;
 mod execution_payloads;
 #[cfg(test)]
 mod group_owner_memory_tests;
 mod memory;
+mod narrative_messages;
+mod owner_blocker_orchestration;
+mod owner_orchestration;
+mod routing;
 mod runtime;
 mod runtime_recovery;
 mod summary_stream;
@@ -19,11 +26,10 @@ use crate::core::{
     agent_runtime::AgentRuntime,
     coordinator::Coordinator,
     domain::{
-        new_id, now, AIProviderConfig, AgentProfile, AuditEvent, ClaimContext, ClaimScorer,
-        ConversationMessage, CreateAgentInput, CreateWorkGroupInput, DashboardState, Lease,
-        LeaseState, MessageKind, ModelPolicy, SendHumanMessageInput, SenderKind, SystemSettings,
-        TaskCard, TaskStatus, ToolRun, ToolRunState, UpdateAgentInput, UpdateWorkGroupInput,
-        Visibility, WorkGroup,
+        new_id, now, AIProviderConfig, AgentProfile, AuditEvent, ConversationMessage,
+        CreateAgentInput, CreateWorkGroupInput, DashboardState, Lease, LeaseState, MessageKind,
+        ModelPolicy, SenderKind, SystemSettings, TaskCard, TaskStatus, ToolRun, ToolRunState,
+        UpdateAgentInput, UpdateWorkGroupInput, Visibility, WorkGroup,
     },
     llm_rig::{refresh_models, RigModelAdapter},
     storage::Storage,
@@ -32,7 +38,7 @@ use crate::core::{
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use serde_json::json;
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, future::Future, sync::Arc};
 use tauri::{AppHandle, Emitter, Runtime};
 
 #[derive(Clone)]
@@ -41,6 +47,17 @@ pub struct AppService {
     coordinator: Coordinator,
     tool_runtime: Arc<ToolRuntime>,
     agent_runtime: Arc<AgentRuntime<RigModelAdapter, ToolRuntime>>,
+}
+
+fn block_on_service_future<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(|| tauri::async_runtime::block_on(future))
+    } else {
+        tauri::async_runtime::block_on(future)
+    }
 }
 
 impl AppService {
@@ -605,215 +622,6 @@ impl AppService {
         Ok(())
     }
 
-    pub fn send_human_message<R: Runtime>(
-        &self,
-        app: AppHandle<R>,
-        input: SendHumanMessageInput,
-    ) -> Result<ConversationMessage> {
-        let work_group = self.storage.get_work_group(&input.work_group_id)?;
-        let agents = self.storage.list_agents()?;
-        let members: Vec<AgentProfile> = agents
-            .into_iter()
-            .filter(|agent| work_group.member_agent_ids.contains(&agent.id))
-            .collect();
-
-        let mentions = Coordinator::extract_mentions(&input.content, &members);
-        let routing_members =
-            self.routing_members_for_message(&work_group.id, &members, &mentions)?;
-        let human_message = ConversationMessage {
-            id: new_id(),
-            conversation_id: work_group.id.clone(),
-            work_group_id: work_group.id.clone(),
-            sender_kind: SenderKind::Human,
-            sender_id: "human".into(),
-            sender_name: "Human".into(),
-            kind: MessageKind::Text,
-            visibility: Visibility::Main,
-            content: input.content.clone(),
-            mentions,
-            task_card_id: None,
-            execution_mode: None,
-            created_at: now(),
-        };
-        self.storage.insert_message(&human_message)?;
-        self.remember_human_directive(&app, &human_message)?;
-        emit(&app, "chat:message-created", &human_message)?;
-
-        self.preempt_active_leases(&app, &work_group.id)?;
-
-        let scored_members = scored_candidates(&self.tool_runtime, &routing_members);
-        let mut requested_tool = self.tool_runtime.select_tool_for_text(
-            &input.content,
-            &collect_allowed_tools(&self.tool_runtime, &routing_members),
-        );
-        let active_loads = self
-            .storage
-            .counts_for_agents(&work_group.member_agent_ids)?;
-
-        let task_card = TaskCard {
-            id: new_id(),
-            parent_id: None,
-            source_message_id: human_message.id.clone(),
-            title: Coordinator::build_task_title(&input.content),
-            normalized_goal: input.content.trim().to_string(),
-            input_payload: input.content.clone(),
-            priority: 100,
-            status: TaskStatus::Bidding,
-            work_group_id: work_group.id.clone(),
-            created_by: "human".into(),
-            assigned_agent_id: None,
-            created_at: now(),
-        };
-
-        let mut claim_plan = self.coordinator.score(ClaimContext {
-            task_card,
-            work_group: work_group.clone(),
-            candidates: scored_members,
-            content: input.content.clone(),
-            mentioned_agent_ids: human_message.mentions.clone(),
-            active_loads,
-            requested_tool: requested_tool.clone(),
-        })?;
-
-        let mut denied_request: Option<(AgentProfile, crate::core::domain::ToolManifest, String)> =
-            None;
-        let mut requested_tool_requires_approval = false;
-        if let Some(lease) = claim_plan.lease.as_ref() {
-            if let Some(agent) = routing_members
-                .iter()
-                .find(|candidate| candidate.id == lease.owner_agent_id)
-                .cloned()
-            {
-                if let Some(tool) = requested_tool.clone() {
-                    if should_skip_implicit_todowrite_fallback(
-                        &self.tool_runtime,
-                        &agent,
-                        &input.content,
-                        &tool,
-                    ) {
-                        requested_tool = None;
-                    }
-                }
-                if let Some(tool) = requested_tool.clone() {
-                    let decision = self.tool_runtime.authorize_tool_call(
-                        &agent,
-                        &tool,
-                        &claim_plan.task_card.input_payload,
-                        &work_group.working_directory,
-                    )?;
-                    if !decision.allowed {
-                        claim_plan.task_card.status = TaskStatus::NeedsReview;
-                        denied_request = Some((
-                            agent,
-                            tool,
-                            decision
-                                .reason
-                                .unwrap_or_else(|| "tool access rejected".to_string()),
-                        ));
-                        claim_plan.lease = None;
-                    } else if decision.approval_required {
-                        claim_plan.task_card.status = TaskStatus::WaitingApproval;
-                        requested_tool_requires_approval = true;
-                    }
-                }
-            }
-        }
-
-        self.storage.insert_task_card(&claim_plan.task_card)?;
-        emit(&app, "task:card-created", &claim_plan.task_card)?;
-        self.record_audit(
-            "task.created",
-            "task_card",
-            &claim_plan.task_card.id,
-            json!({ "sourceMessageId": human_message.id, "title": claim_plan.task_card.title }),
-        )?;
-
-        for bid in &claim_plan.bids {
-            self.storage.insert_claim_bid(bid)?;
-            emit(&app, "claim:bid-submitted", bid)?;
-        }
-
-        for message in &claim_plan.coordinator_messages {
-            let mut message = message.clone();
-            self.assign_group_owner_sender(&mut message)?;
-            self.storage.insert_message(&message)?;
-            emit(&app, "chat:message-created", &message)?;
-        }
-
-        if let Some(ref lease) = claim_plan.lease {
-            self.storage.insert_lease(lease)?;
-            emit(&app, "lease:granted", lease)?;
-            self.record_audit(
-                "lease.granted",
-                "lease",
-                &lease.id,
-                json!({ "taskCardId": lease.task_card_id, "agentId": lease.owner_agent_id }),
-            )?;
-        }
-
-        if let Some((agent, tool, reason)) = denied_request {
-            self.handle_permission_denial(
-                &app,
-                &work_group.id,
-                &mut claim_plan.task_card,
-                None,
-                &agent,
-                &tool,
-                &reason,
-            )?;
-        } else if let Some(tool) = requested_tool {
-            if let Some(ref lease) = claim_plan.lease {
-                let tool_run = ToolRun {
-                    id: new_id(),
-                    tool_id: tool.id.clone(),
-                    task_card_id: claim_plan.task_card.id.clone(),
-                    agent_id: lease.owner_agent_id.clone(),
-                    state: if requested_tool_requires_approval {
-                        ToolRunState::PendingApproval
-                    } else {
-                        ToolRunState::Queued
-                    },
-                    approval_required: requested_tool_requires_approval,
-                    started_at: None,
-                    finished_at: None,
-                    result_ref: None,
-                };
-                self.storage.insert_tool_run(&tool_run)?;
-                if tool_run.approval_required {
-                    let mut approval_message = ConversationMessage {
-                        id: new_id(),
-                        conversation_id: work_group.id.clone(),
-                        work_group_id: work_group.id.clone(),
-                        sender_kind: SenderKind::System,
-                        sender_id: "coordinator".into(),
-                        sender_name: "Coordinator".into(),
-                        kind: MessageKind::Approval,
-                        visibility: Visibility::Main,
-                        content: format!("Approval required for {} before execution.", tool.name),
-                        mentions: vec![lease.owner_agent_id.clone()],
-                        task_card_id: Some(claim_plan.task_card.id.clone()),
-                        execution_mode: None,
-                        created_at: now(),
-                    };
-                    self.assign_group_owner_sender(&mut approval_message)?;
-                    self.storage.insert_message(&approval_message)?;
-                    emit(&app, "chat:message-created", &approval_message)?;
-                    emit(&app, "approval:requested", &tool_run)?;
-                } else {
-                    self.spawn_task_execution(
-                        app.clone(),
-                        claim_plan.task_card.id.clone(),
-                        Some(tool_run.id.clone()),
-                    );
-                }
-            }
-        } else if claim_plan.lease.is_some() {
-            self.spawn_task_execution(app.clone(), claim_plan.task_card.id.clone(), None);
-        }
-
-        Ok(human_message)
-    }
-
     pub fn approve_tool_run<R: Runtime>(
         &self,
         app: AppHandle<R>,
@@ -965,8 +773,6 @@ fn collect_allowed_tools(tool_runtime: &ToolRuntime, agents: &[AgentProfile]) ->
 }
 
 fn should_skip_implicit_todowrite_fallback(
-    tool_runtime: &ToolRuntime,
-    agent: &AgentProfile,
     content: &str,
     tool: &crate::core::domain::ToolManifest,
 ) -> bool {
@@ -980,10 +786,7 @@ fn should_skip_implicit_todowrite_fallback(
     if explicit_todo_request {
         return false;
     }
-    !tool_runtime
-        .available_tools_for_agent(agent)
-        .into_iter()
-        .any(|available| available.id == tool.id)
+    true
 }
 
 fn scored_candidates(tool_runtime: &ToolRuntime, agents: &[AgentProfile]) -> Vec<AgentProfile> {

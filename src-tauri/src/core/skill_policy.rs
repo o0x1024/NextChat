@@ -55,7 +55,12 @@ pub fn tool_exposure_reason(
     tool: &ToolManifest,
     skills: &[SkillPack],
 ) -> ToolExposureReason {
-    if !agent.tool_ids.iter().any(|tool_id| tool_id == &tool.id) {
+    if !is_tool_enabled_for_agent(agent, &tool.id)
+        && !agent
+            .tool_ids
+            .iter()
+            .any(|tool_id| compat_tool_binding_matches(tool_id, &tool.id))
+    {
         return ToolExposureReason::NotBound;
     }
     if !is_tool_enabled_for_agent(agent, &tool.id) {
@@ -72,6 +77,17 @@ pub fn tool_exposure_reason(
     }
 
     ToolExposureReason::Available
+}
+
+fn compat_tool_binding_matches(bound_tool_id: &str, requested_tool_id: &str) -> bool {
+    matches!(
+        (bound_tool_id, requested_tool_id),
+        ("shell.exec", "Bash")
+            | ("file.readwrite", "Read" | "Write" | "Edit" | "MultiEdit")
+            | ("project.search", "Grep" | "Glob" | "LS")
+            | ("http.request", "WebFetch" | "WebSearch")
+            | ("plan.summarize", "TodoWrite")
+    )
 }
 
 #[cfg(test)]

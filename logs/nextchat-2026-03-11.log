@@ -1,0 +1,1 @@
+{"level":"ERROR","message":"CompletionError: JsonError: EOF while parsing a string at line 1 column 5881","target":"llm.complete_task_with_tools","timestamp":"2026-03-11T10:21:05.465139+00:00"}

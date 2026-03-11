@@ -1,26 +1,41 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { Language } from "../../store/preferencesStore";
 import type {
   AgentProfile,
+  AuditEvent,
   ChatStreamTrack,
   ConversationMessage,
   TaskCard,
   ToolManifest,
   ToolRun,
 } from "../../types";
+import { ExecutionDecisionFilter, type DecisionFilter } from "./ExecutionDecisionFilter";
+import { GroupedDecisionAuditList } from "./GroupedDecisionAuditList";
+import {
+  collectDecisionTaskIds,
+  decisionAuditBadgeClass,
+  decisionAuditStatus,
+  isDecisionAuditEventType,
+  parseDecisionAuditPayload,
+} from "./executionDecisionAudit";
+import { chainBadgeClass, narrativeChainToken } from "./chainVisual";
 import { formatTime } from "./ui";
 
 interface AgentExecutionDetailsPanelProps {
   language: Language;
   focusAgentId: string | null;
   onFocusAgentIdChange: (agentId: string | null) => void;
+  onJumpToTask: (taskId: string) => void;
+  onJumpToBlocker: (blockerId: string) => void;
+  onJumpToNarrative: (target: { taskId?: string; blockerId?: string }) => void;
   currentMembers: AgentProfile[];
   agents: AgentProfile[];
   currentGroupTasks: TaskCard[];
   groupMessages: ConversationMessage[];
   streamTracks: ChatStreamTrack[];
   toolRuns: ToolRun[];
+  auditEvents: AuditEvent[];
   tools: ToolManifest[];
 }
 
@@ -84,6 +99,23 @@ type ExecutionEvent =
       state: ToolRun["state"];
       approvalRequired: boolean;
       resultRef?: string | null;
+    }
+  | {
+      id: string;
+      type: "decision_audit";
+      timestamp: string;
+      taskCardId?: string;
+      blockerId?: string;
+      senderId: string;
+      senderName: string;
+      eventType: string;
+      status: "generated" | "failed" | "applied";
+      provider?: string;
+      model?: string;
+      action?: string;
+      prompt?: string;
+      raw?: string;
+      error?: string;
     };
 
 interface ToolResultMatch {
@@ -91,7 +123,6 @@ interface ToolResultMatch {
   timestamp: string;
   messageId?: string;
 }
-
 function toolRunBadgeClass(state: ToolRun["state"]) {
   switch (state) {
     case "completed":
@@ -149,7 +180,6 @@ const HUMAN_MESSAGE_PREFIXES = [
   "用户:",
   "用户指令:",
 ];
-
 function stripHumanMessageLines(value: string) {
   const filtered = value
     .split("\n")
@@ -187,7 +217,6 @@ function formatExecutionPayload(raw: string, hideHumanMessages = false) {
   if (!trimmed) {
     return source;
   }
-
   try {
     const parsed = JSON.parse(trimmed);
     const sanitized = hideHumanMessages ? sanitizeExecutionPayloadValue(parsed) : parsed;
@@ -255,16 +284,13 @@ function parseToolResultMessage(message: ConversationMessage): ParsedToolCall[] 
     if (!payload || typeof payload !== "object") {
       return [];
     }
-
     const multiCallPayload = (payload as { toolCalls?: unknown; tool_calls?: unknown }).toolCalls ??
       (payload as { toolCalls?: unknown; tool_calls?: unknown }).tool_calls;
-
     if (Array.isArray(multiCallPayload)) {
       return multiCallPayload
         .map((call) => parseToolCallRecord(call))
         .filter((call): call is ParsedToolCall => call !== null);
     }
-
     const singleCall = parseToolCallRecord(payload);
     return singleCall ? [singleCall] : [];
   } catch {
@@ -283,18 +309,22 @@ export function AgentExecutionDetailsPanel({
   language,
   focusAgentId,
   onFocusAgentIdChange,
+  onJumpToTask,
+  onJumpToBlocker,
+  onJumpToNarrative,
   currentMembers,
   agents,
   currentGroupTasks,
   groupMessages,
   streamTracks,
   toolRuns,
+  auditEvents,
   tools,
 }: AgentExecutionDetailsPanelProps) {
   const { t } = useTranslation();
   const eventsContainerRef = useRef<HTMLDivElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
-
+  const [decisionFilter, setDecisionFilter] = useState<DecisionFilter>("all");
   const taskIds = useMemo(() => new Set(currentGroupTasks.map((task) => task.id)), [currentGroupTasks]);
   const taskTitleById = useMemo(
     () => new Map(currentGroupTasks.map((task) => [task.id, task.title])),
@@ -304,6 +334,7 @@ export function AgentExecutionDetailsPanel({
     () => new Map(currentGroupTasks.map((task) => [task.id, task.createdAt])),
     [currentGroupTasks],
   );
+  const currentWorkGroupId = currentGroupTasks[0]?.workGroupId ?? groupMessages[0]?.workGroupId ?? null;
   const memberById = useMemo(
     () => new Map(currentMembers.map((agent) => [agent.id, agent])),
     [currentMembers],
@@ -554,14 +585,61 @@ export function AgentExecutionDetailsPanel({
         resultRef: run.resultRef,
       }));
 
-    return [...streamEvents, ...toolRunEvents, ...toolCallEvents, ...messageEvents]
+    const decisionAuditEvents = auditEvents
+      .filter((event) => isDecisionAuditEventType(event.eventType))
+      .reduce<ExecutionEvent[]>((result, event) => {
+        const payload = parseDecisionAuditPayload(event.payloadJson);
+        if (!payload) {
+          return result;
+        }
+        const relatedTaskIds = collectDecisionTaskIds(payload, event.entityId).filter((taskId) =>
+          taskIds.has(taskId),
+        );
+        const sameGroup =
+          payload.context?.workGroupId && currentWorkGroupId
+            ? payload.context.workGroupId === currentWorkGroupId
+            : false;
+        if (relatedTaskIds.length === 0 && !sameGroup) {
+          return result;
+        }
+        const senderId = payload.context?.actorId ?? payload.agentId ?? "system";
+        if (focusAgentId && senderId !== focusAgentId) {
+          return result;
+        }
+        result.push({
+          id: `audit-${event.id}`,
+          type: "decision_audit",
+          timestamp: event.createdAt,
+          taskCardId: relatedTaskIds[0],
+          blockerId:
+            payload.blockerId ??
+            payload.context?.blockerId ??
+            (event.eventType.startsWith("owner.blocker_decision.") ? event.entityId : undefined),
+          senderId,
+          senderName: agentById.get(senderId)?.name ?? memberById.get(senderId)?.name ?? senderId,
+          eventType: event.eventType,
+          status: decisionAuditStatus(event.eventType),
+          provider: payload.provider,
+          model: payload.model,
+          action: payload.action,
+          prompt: payload.prompt,
+          raw: payload.raw,
+          error: payload.error,
+        });
+        return result;
+      }, []);
+
+    return [...streamEvents, ...toolRunEvents, ...toolCallEvents, ...messageEvents, ...decisionAuditEvents]
       .filter((event) => event.timestamp)
       .sort((left, right) => left.timestamp.localeCompare(right.timestamp))
       .slice(-80);
   }, [
+    auditEvents,
     agentById,
+    currentWorkGroupId,
     focusAgentId,
     groupMessages,
+    memberById,
     runStateByTaskTool,
     streamTracks,
     taskCreatedAtById,
@@ -570,16 +648,27 @@ export function AgentExecutionDetailsPanel({
     toolRuns,
   ]);
 
+  const visibleEvents = useMemo(() => {
+    if (decisionFilter === "all") return events;
+    return events.filter(
+      (event) =>
+        event.type === "decision_audit" &&
+        (decisionFilter === "failed"
+          ? event.status === "failed"
+          : event.eventType.startsWith(`${decisionFilter}.`)),
+    );
+  }, [decisionFilter, events]);
+  const groupedDecisionEvents = useMemo(() => visibleEvents.filter((event) => event.type === "decision_audit"), [visibleEvents]);
   const eventFingerprint = useMemo(
     () =>
-      events
+      visibleEvents
         .map((event) =>
           event.type === "stream"
             ? `${event.id}:${event.timestamp}:${event.status}:${event.content.length}`
             : `${event.id}:${event.timestamp}`,
         )
         .join("|"),
-    [events],
+    [visibleEvents],
   );
 
   useEffect(() => {
@@ -605,10 +694,10 @@ export function AgentExecutionDetailsPanel({
       <div className="card-body gap-3">
         <div className="flex items-center justify-between gap-2">
           <h3 className="card-title text-base">{t("executionDetailsPanel")}</h3>
-          <span className="badge badge-ghost">{t("itemsCount", { count: events.length })}</span>
+          <span className="badge badge-ghost">{t("itemsCount", { count: visibleEvents.length })}</span>
         </div>
         <p className="text-sm text-base-content/60">{t("executionDetailsHint")}</p>
-
+        <ExecutionDecisionFilter language={language} value={decisionFilter} onChange={setDecisionFilter} />
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
@@ -634,8 +723,13 @@ export function AgentExecutionDetailsPanel({
           className="max-h-[28rem] space-y-2 overflow-x-hidden overflow-y-auto pr-1"
           onScroll={handleEventsScroll}
         >
-          {events.map((event) => {
-            const taskTitle = taskTitleById.get(event.taskCardId);
+          {decisionFilter !== "all" ? (
+            <GroupedDecisionAuditList events={groupedDecisionEvents} taskTitleById={taskTitleById} language={language} onJumpToTask={onJumpToTask} onJumpToBlocker={onJumpToBlocker} onJumpToNarrative={onJumpToNarrative} />
+          ) : null}
+          {decisionFilter === "all" &&
+            visibleEvents.map((event) => {
+            const taskTitle = event.taskCardId ? taskTitleById.get(event.taskCardId) : undefined;
+            const chain = event.type === "decision_audit" ? narrativeChainToken({ taskId: event.taskCardId, blockerId: event.blockerId }) : null;
 
             if (event.type === "stream") {
               return (
@@ -748,6 +842,96 @@ export function AgentExecutionDetailsPanel({
               );
             }
 
+            if (event.type === "decision_audit") {
+              return (
+                <details key={event.id} className="min-w-0 overflow-hidden rounded-box bg-base-200">
+                  <summary className="flex list-none cursor-pointer items-center justify-between gap-3 px-3 py-2 [&::-webkit-details-marker]:hidden">
+                    <div className="flex min-w-0 flex-1 items-center gap-2">
+                      <span className="truncate text-sm font-semibold">{event.senderName}</span>
+                      <span className="badge badge-xs badge-ghost">{event.eventType}</span>
+                      {chain ? <span className={`badge badge-xs ${chainBadgeClass(chain.key)}`}>{chain.label}</span> : null}
+                      {taskTitle ? <span className="badge badge-xs badge-ghost">{taskTitle}</span> : null}
+                    </div>
+                    <span className={`badge badge-xs shrink-0 ${decisionAuditBadgeClass(event.status)}`}>
+                      {t("status")}
+                    </span>
+                  </summary>
+                  <div className="border-t border-base-content/10 px-3 py-2 text-xs">
+                    <div className="mb-2 flex flex-wrap items-center gap-2">
+                      <span className={`badge badge-xs ${decisionAuditBadgeClass(event.status)}`}>
+                        {event.status}
+                      </span>
+                      {event.provider ? <span className="badge badge-xs badge-ghost">{t("provider")}: {event.provider}</span> : null}
+                      {event.model ? <span className="badge badge-xs badge-ghost">{t("model")}: {event.model}</span> : null}
+                      {event.action ? <span className="badge badge-xs badge-ghost">{t("actions")}: {event.action}</span> : null}
+                    </div>
+                    {event.prompt ? (
+                      <div className="mb-3">
+                        <div className="mb-1 font-semibold text-base-content/70">
+                          {t("executionInputParams")}
+                        </div>
+                        <pre className="max-h-48 w-full overflow-auto whitespace-pre-wrap break-all rounded-box bg-base-100 px-2 py-1 font-mono text-xs">
+                          {event.prompt}
+                        </pre>
+                      </div>
+                    ) : null}
+                    {event.raw ? (
+                      <div className="mb-3">
+                        <div className="mb-1 font-semibold text-base-content/70">
+                          {t("executionResultLabel")}
+                        </div>
+                        <pre className="max-h-48 w-full overflow-auto whitespace-pre-wrap break-all rounded-box bg-base-100 px-2 py-1 font-mono text-xs">
+                          {prettifyPayload(event.raw)}
+                        </pre>
+                      </div>
+                    ) : null}
+                    {event.error ? (
+                      <div className="mb-3">
+                        <div className="mb-1 font-semibold text-base-content/70">error</div>
+                        <pre className="max-h-32 w-full overflow-auto whitespace-pre-wrap break-all rounded-box bg-base-100 px-2 py-1 font-mono text-xs">
+                          {event.error}
+                        </pre>
+                      </div>
+                    ) : null}
+                    <div className="flex items-center justify-between gap-2 text-base-content/60">
+                      <div className="flex flex-wrap gap-2">
+                        {event.blockerId || event.taskCardId ? (
+                          <button
+                            type="button"
+                            className="btn btn-ghost btn-xs"
+                            onClick={() =>
+                              onJumpToNarrative({ blockerId: event.blockerId, taskId: event.taskCardId })
+                            }
+                          >
+                            {language === "zh" ? "打开叙事" : "Open narrative"}
+                          </button>
+                        ) : null}
+                        {event.blockerId ? (
+                          <button
+                            type="button"
+                            className="btn btn-ghost btn-xs"
+                            onClick={() => onJumpToBlocker(event.blockerId as string)}
+                          >
+                            {language === "zh" ? "定位阻塞" : "Open blocker"}
+                          </button>
+                        ) : null}
+                        {event.taskCardId ? (
+                          <button
+                            type="button"
+                            className="btn btn-ghost btn-xs"
+                            onClick={() => onJumpToTask(event.taskCardId as string)}
+                          >
+                            {t("openTask")}
+                          </button>
+                        ) : null}
+                      </div>
+                      <time>{formatTime(event.timestamp, language)}</time>
+                    </div>
+                  </div>
+                </details>
+              );
+            }
+
             return (
               <article key={event.id} className="min-w-0 overflow-hidden rounded-box bg-base-200 px-3 py-2">
                 <div className="mb-1 flex items-center justify-between gap-2 text-xs">
@@ -787,7 +971,7 @@ export function AgentExecutionDetailsPanel({
               </article>
             );
           })}
-          {events.length === 0 ? (
+          {visibleEvents.length === 0 ? (
             <div className="alert alert-soft">
               <span className="text-sm">{t("noExecutionDetails")}</span>
             </div>

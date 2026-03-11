@@ -32,9 +32,11 @@ function App() {
     messages,
     chatStreamTracks,
     taskCards,
+    taskBlockers,
     leases,
     claimBids,
     toolRuns,
+    auditEvents,
     tools,
     skills,
     selectedWorkGroupId,
@@ -176,12 +178,16 @@ function App() {
               >
                 <AgentManagement
                   agents={agents}
+                  workGroups={workGroups}
                   skills={skills}
                   tools={tools}
                   settings={settings}
                   onCreateAgent={async (input: CreateAgentInput) => { await store.createAgent(input); }}
                   onUpdateAgent={async (input: UpdateAgentInput) => { await store.updateAgent(input); }}
                   onDeleteAgent={async (id: string) => { await store.deleteAgent(id); }}
+                  onAddAgentToWorkGroup={async (workGroupId: string, agentId: string) => {
+                    await store.addAgent(workGroupId, agentId);
+                  }}
                 />
               </section>
             )}
@@ -197,9 +203,11 @@ function App() {
                   messages={messages}
                   chatStreamTracks={chatStreamTracks}
                   taskCards={taskCards}
+                  taskBlockers={taskBlockers}
                   leases={leases}
                   claimBids={claimBids}
                   toolRuns={toolRuns}
+                  auditEvents={auditEvents}
                   tools={tools}
                   settings={settings}
                   selectedWorkGroupId={selectedWorkGroupId}
@@ -223,6 +231,9 @@ function App() {
                   }}
                   onCancelTask={async (taskCardId: string) => {
                     await store.cancelTask(taskCardId);
+                  }}
+                  onResolveBlocker={async (blockerId, resolution) => {
+                    await store.resolveBlocker(blockerId, resolution);
                   }}
                 />
               </section>

@@ -5,7 +5,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{
     collect_allowed_tools, emit, execution_payloads, scored_candidates,
-    summary_stream::SummaryStreamSession, tool_stream::ToolStreamSession, AppService,
+    should_skip_implicit_todowrite_fallback, summary_stream::SummaryStreamSession,
+    tool_stream::ToolStreamSession, AppService,
 };
 use crate::core::domain::{
     new_id, now, AgentExecutor, AgentProfile, ChatStreamEvent, ChatStreamPhase, ClaimContext,
@@ -14,6 +15,7 @@ use crate::core::domain::{
     ToolRun, ToolRunState, ToolStreamChunk, Visibility,
 };
 use crate::core::skill_policy::selected_skills_for_agent;
+use crate::core::workflow::{NarrativeMessageType, RequestRouteMode};
 
 impl AppService {
     pub(super) fn spawn_task_execution<R: Runtime>(
@@ -28,6 +30,24 @@ impl AppService {
                 .run_task(app.clone(), &task_card_id, tool_run_id.as_deref())
                 .await
             {
+                if let Ok(Some(report)) = service.handle_pending_user_question_request(
+                    &app,
+                    &task_card_id,
+                    tool_run_id.as_deref(),
+                    &error,
+                ) {
+                    if let Some(task) = report.task {
+                        let _ = emit(&app, "task:status-changed", &task);
+                    }
+                    for tool_run in report.cancelled_tool_runs {
+                        let _ = emit(&app, "tool:run-completed", &tool_run);
+                    }
+                    if let Some(message) = report.message {
+                        let _ = emit(&app, "chat:message-created", &message);
+                    }
+                    let _ = emit(&app, "audit:event-created", &report.audit_event);
+                    return;
+                }
                 if let Ok(report) = service.handle_task_execution_failure(&task_card_id, &error) {
                     if let Some(task) = report.task {
                         let _ = emit(&app, "task:status-changed", &task);
@@ -84,7 +104,11 @@ impl AppService {
         let messages = self.storage.list_messages_for_group(&work_group.id)?;
         let memory_context = self.load_memory_context(&agent, &work_group)?;
         self.record_memory_context(&app, &task, &memory_context)?;
-        let approved_tool = if let Some(id) = tool_run_id {
+        if let Some(progress_message) = self.build_agent_progress_message(&task, &agent).await? {
+            self.storage.insert_message(&progress_message)?;
+            emit(&app, "chat:message-created", &progress_message)?;
+        }
+        let mut approved_tool = if let Some(id) = tool_run_id {
             let mut tool_run = self.storage.get_tool_run(id)?;
             tool_run.state = ToolRunState::Running;
             tool_run.started_at = Some(now());
@@ -95,13 +119,25 @@ impl AppService {
             self.tool_runtime
                 .select_tool_for_text(&task.input_payload, &auto_runnable_tool_ids)
         };
+        if approved_tool
+            .as_ref()
+            .is_some_and(|tool| should_skip_implicit_todowrite_fallback(&task.input_payload, tool))
+        {
+            approved_tool = None;
+        }
+        let normalized_tool_input = approved_tool.as_ref().map(|tool| {
+            self.tool_runtime
+                .normalize_compat_input(tool, &task.input_payload)
+        });
         let tool_call_id = approved_tool.as_ref().map(|_| new_id());
 
         if let Some(tool) = approved_tool.clone() {
             let decision = self.tool_runtime.authorize_tool_call(
                 &agent,
                 &tool,
-                &task.input_payload,
+                normalized_tool_input
+                    .as_deref()
+                    .unwrap_or(task.input_payload.as_str()),
                 &work_group.working_directory,
             )?;
             if !decision.allowed {
@@ -140,7 +176,9 @@ impl AppService {
                 content: execution_payloads::structured_tool_call_content(
                     &tool,
                     tool_call_id.as_deref().unwrap_or(tool.id.as_str()),
-                    &task.input_payload,
+                    normalized_tool_input
+                        .as_deref()
+                        .unwrap_or(task.input_payload.as_str()),
                 ),
                 mentions: vec![agent.id.clone()],
                 task_card_id: Some(task.id.clone()),
@@ -407,6 +445,15 @@ impl AppService {
             emit(&app, "chat:stream-done", &done_event)?;
         }
 
+        let narrative_kind =
+            self.storage
+                .get_task_dispatch(&task.id)?
+                .map(|dispatch| match dispatch.route_mode {
+                    RequestRouteMode::OwnerOrchestrated => NarrativeMessageType::AgentDelivery,
+                    RequestRouteMode::DirectAgentAssign => NarrativeMessageType::DirectResult,
+                    RequestRouteMode::DirectAnswer => NarrativeMessageType::DirectResult,
+                });
+
         let summary_message = ConversationMessage {
             id: summary_stream_state.current_stream_id,
             conversation_id: work_group.id.clone(),
@@ -416,7 +463,11 @@ impl AppService {
             sender_name: agent.name.clone(),
             kind: MessageKind::Summary,
             visibility: Visibility::Main,
-            content: execution.summary.clone(),
+            content: if let Some(kind) = narrative_kind {
+                self.build_task_narrative_content(&task, kind, execution.summary.clone())?
+            } else {
+                execution.summary.clone()
+            },
             mentions: vec![],
             task_card_id: Some(task.id.clone()),
             execution_mode: Some(execution.execution_mode.clone()),
@@ -528,10 +579,61 @@ impl AppService {
             &task.id,
             json!({ "ownerAgentId": agent.id }),
         )?;
+        self.handle_narrative_task_completion(&app, &task, &summary_message.id)?;
         if let Some(parent_id) = task.parent_id.clone() {
             self.reconcile_parent_task(&app, &parent_id)?;
         }
         Ok(())
+    }
+
+    async fn build_agent_progress_message(
+        &self,
+        task: &TaskCard,
+        agent: &AgentProfile,
+    ) -> Result<Option<ConversationMessage>> {
+        let Some(dispatch) = self.storage.get_task_dispatch(&task.id)? else {
+            return Ok(None);
+        };
+
+        if dispatch.route_mode == RequestRouteMode::DirectAnswer {
+            return Ok(None);
+        }
+        let decision = self
+            .build_agent_progress_decision_async(task, agent)
+            .await?;
+        let progress_text = decision
+            .text
+            .ok_or_else(|| anyhow!("agent progress text missing"))?;
+
+        let mut envelope = crate::core::workflow::NarrativeEnvelope::new(
+            NarrativeMessageType::AgentProgress,
+            progress_text,
+        );
+        envelope.task_id = Some(task.id.clone());
+        envelope.workflow_id = dispatch.workflow_id.clone();
+        envelope.stage_id = dispatch.stage_id.clone();
+        envelope.stage_title = dispatch.narrative_stage_label.clone();
+        envelope.task_title = dispatch
+            .narrative_task_label
+            .clone()
+            .or_else(|| Some(task.title.clone()));
+        envelope.progress_percent = decision.progress_percent;
+
+        Ok(Some(ConversationMessage {
+            id: new_id(),
+            conversation_id: task.work_group_id.clone(),
+            work_group_id: task.work_group_id.clone(),
+            sender_kind: SenderKind::Agent,
+            sender_id: agent.id.clone(),
+            sender_name: agent.name.clone(),
+            kind: MessageKind::Status,
+            visibility: Visibility::Main,
+            content: serde_json::to_string(&envelope)?,
+            mentions: vec![],
+            task_card_id: Some(task.id.clone()),
+            execution_mode: None,
+            created_at: now(),
+        }))
     }
 
     pub(super) fn spawn_subtask<R: Runtime>(
@@ -573,10 +675,16 @@ impl AppService {
         let active_loads = self
             .storage
             .counts_for_agents(&work_group.member_agent_ids)?;
-        let selected_tool = self.tool_runtime.select_tool_for_text(
+        let mut selected_tool = self.tool_runtime.select_tool_for_text(
             content,
             &collect_allowed_tools(&self.tool_runtime, &members),
         );
+        if selected_tool
+            .as_ref()
+            .is_some_and(|tool| should_skip_implicit_todowrite_fallback(content, tool))
+        {
+            selected_tool = None;
+        }
         let mentioned_agent_ids =
             crate::core::coordinator::Coordinator::extract_mentions(content, &members);
         let claim_plan = self.coordinator.score(ClaimContext {

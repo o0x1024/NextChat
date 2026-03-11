@@ -2,8 +2,8 @@ use anyhow::Result;
 
 use super::AppService;
 use crate::core::domain::{
-    AgentPermissionPolicy, AgentProfile, ConversationMessage, CreateAgentInput, MemoryPolicy,
-    ModelPolicy, SenderKind,
+    AIProviderConfig, AgentPermissionPolicy, AgentProfile, ConversationMessage, CreateAgentInput,
+    MemoryPolicy, ModelPolicy, SenderKind,
 };
 
 const BUILTIN_GROUP_OWNER_NAME: &str = "群主";
@@ -59,28 +59,36 @@ impl AppService {
     }
 
     pub(super) fn ensure_builtin_group_owner(&self) -> Result<AgentProfile> {
+        let owner_model_policy = self.resolve_builtin_owner_model_policy()?;
         if let Some(existing) = self
             .storage
             .list_agents()?
             .into_iter()
             .find(|agent| self.is_builtin_group_owner_profile(agent))
         {
+            if existing.model_policy.provider == "mock"
+                || existing.model_policy.model == "simulation"
+            {
+                let mut upgraded = existing.clone();
+                upgraded.model_policy = owner_model_policy;
+                self.storage.insert_agent(&upgraded)?;
+                return Ok(upgraded);
+            }
             return Ok(existing);
         }
-
-        let model_policy = ModelPolicy::default();
 
         self.create_agent_profile(CreateAgentInput {
             name: BUILTIN_GROUP_OWNER_NAME.into(),
             avatar: "GM".into(),
             role: BUILTIN_GROUP_OWNER_ROLE.into(),
             objective: "你是内置群主，负责拆解需求、组织群员协作、跟踪阻塞并汇总最终结果。".into(),
-            provider: model_policy.provider,
-            model: model_policy.model,
-            temperature: 0.2,
+            provider: owner_model_policy.provider,
+            model: owner_model_policy.model,
+            temperature: owner_model_policy.temperature,
             skill_ids: vec![],
             tool_ids: vec![
                 "Task".into(),
+                "AskUserQuestion".into(),
                 "TodoWrite".into(),
                 "Skills".into(),
                 "Read".into(),
@@ -99,4 +107,43 @@ impl AppService {
             permission_policy: AgentPermissionPolicy::default(),
         })
     }
+
+    fn resolve_builtin_owner_model_policy(&self) -> Result<ModelPolicy> {
+        let settings = self.storage.get_settings()?;
+        if let Some(provider) = settings
+            .providers
+            .iter()
+            .find(|provider| provider.id == settings.global_config.default_llm_provider)
+            .filter(|provider| provider_available_for_completion(provider))
+        {
+            let model = if provider
+                .models
+                .iter()
+                .any(|item| item == &settings.global_config.default_llm_model)
+            {
+                settings.global_config.default_llm_model.clone()
+            } else if provider.models.contains(&provider.default_model) {
+                provider.default_model.clone()
+            } else {
+                provider
+                    .models
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| settings.global_config.default_llm_model.clone())
+            };
+            return Ok(ModelPolicy {
+                provider: provider.id.clone(),
+                model,
+                temperature: provider.temperature,
+            });
+        }
+
+        Ok(ModelPolicy::default())
+    }
+}
+
+fn provider_available_for_completion(provider: &AIProviderConfig) -> bool {
+    provider.enabled
+        && !provider.models.is_empty()
+        && (provider.rig_provider_type == "Ollama" || !provider.api_key.trim().is_empty())
 }

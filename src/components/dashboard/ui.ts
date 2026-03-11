@@ -30,6 +30,7 @@ export function statusBadgeClass(status: TaskStatus) {
     case "cancelled":
       return "badge-error";
     case "waiting_approval":
+    case "waiting_user_input":
     case "needs_review":
       return "badge-warning";
     default:

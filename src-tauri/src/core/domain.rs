@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
+use crate::core::workflow::TaskBlockerRecord;
+
 pub fn new_id() -> String {
     Uuid::new_v4().to_string()
 }
@@ -85,6 +87,7 @@ pub enum TaskStatus {
     Leased,
     WaitingChildren,
     WaitingApproval,
+    WaitingUserInput,
     InProgress,
     Paused,
     Cancelled,
@@ -404,6 +407,33 @@ pub struct ToolRun {
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub result_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingUserQuestionStatus {
+    Pending,
+    Answered,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingUserQuestion {
+    pub id: String,
+    pub work_group_id: String,
+    pub task_card_id: String,
+    pub agent_id: String,
+    pub tool_run_id: Option<String>,
+    pub question: String,
+    pub options: Vec<String>,
+    pub context: Option<String>,
+    pub allow_free_form: bool,
+    pub asked_message_id: String,
+    pub answer_message_id: Option<String>,
+    pub status: PendingUserQuestionStatus,
+    pub created_at: String,
+    pub answered_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -850,6 +880,7 @@ pub struct DashboardState {
     pub work_groups: Vec<WorkGroup>,
     pub messages: Vec<ConversationMessage>,
     pub task_cards: Vec<TaskCard>,
+    pub task_blockers: Vec<TaskBlockerRecord>,
     pub claim_bids: Vec<ClaimBid>,
     pub leases: Vec<Lease>,
     pub tool_runs: Vec<ToolRun>,

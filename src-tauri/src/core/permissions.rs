@@ -29,21 +29,39 @@ impl ToolAuthorizationDecision {
 }
 
 pub fn is_tool_enabled_for_agent(agent: &AgentProfile, tool_id: &str) -> bool {
-    agent.tool_ids.iter().any(|id| id == tool_id) && agent.permission_policy.allows_tool_id(tool_id)
+    agent
+        .tool_ids
+        .iter()
+        .any(|id| tool_binding_matches(id, tool_id))
+        && (agent.permission_policy.allow_tool_ids.is_empty()
+            || agent
+                .permission_policy
+                .allow_tool_ids
+                .iter()
+                .any(|id| tool_binding_matches(id, tool_id)))
+        && !agent
+            .permission_policy
+            .deny_tool_ids
+            .iter()
+            .any(|id| tool_binding_matches(id, tool_id))
 }
 
 pub fn base_tool_authorization(
     agent: &AgentProfile,
     tool: &ToolManifest,
 ) -> ToolAuthorizationDecision {
-    if !agent.tool_ids.iter().any(|id| id == &tool.id) {
+    if !agent
+        .tool_ids
+        .iter()
+        .any(|id| tool_binding_matches(id, &tool.id))
+    {
         return ToolAuthorizationDecision::denied(format!(
             "agent '{}' is not bound to tool '{}'",
             agent.name, tool.name
         ));
     }
 
-    if !agent.permission_policy.allows_tool_id(&tool.id) {
+    if !is_tool_enabled_for_agent(agent, &tool.id) {
         return ToolAuthorizationDecision::denied(format!(
             "agent policy blocks tool '{}'",
             tool.name
@@ -58,4 +76,30 @@ pub fn base_tool_authorization(
 
 pub fn is_permission_guard_error(error: &str) -> bool {
     error.starts_with(PERMISSION_DENIED_PREFIX) || error.starts_with(APPROVAL_REQUIRED_PREFIX)
+}
+
+fn tool_binding_matches(bound_tool_id: &str, requested_tool_id: &str) -> bool {
+    bound_tool_id == requested_tool_id
+        || compat_requested_ids(bound_tool_id)
+            .iter()
+            .any(|candidate| *candidate == requested_tool_id)
+        || compat_requested_ids(requested_tool_id)
+            .iter()
+            .any(|candidate| *candidate == bound_tool_id)
+}
+
+fn compat_requested_ids(tool_id: &str) -> &'static [&'static str] {
+    match tool_id {
+        "shell.exec" => &["Bash"],
+        "file.readwrite" => &["Read", "Write", "Edit", "MultiEdit"],
+        "project.search" => &["Grep", "Glob", "LS"],
+        "http.request" => &["WebFetch", "WebSearch"],
+        "plan.summarize" => &["TodoWrite"],
+        "Bash" => &["shell.exec"],
+        "Read" | "Write" | "Edit" | "MultiEdit" => &["file.readwrite"],
+        "Grep" | "Glob" | "LS" => &["project.search"],
+        "WebFetch" | "WebSearch" => &["http.request"],
+        "TodoWrite" => &["plan.summarize"],
+        _ => &[],
+    }
 }

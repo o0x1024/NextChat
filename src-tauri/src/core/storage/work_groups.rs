@@ -104,6 +104,18 @@ impl Storage {
                 params![work_group_id],
             )?;
             conn.execute(
+                "DELETE FROM task_blockers
+                 WHERE workflow_id IN (SELECT id FROM workflows WHERE work_group_id = ?1)
+                 OR task_id IN (SELECT id FROM task_cards WHERE work_group_id = ?1)",
+                params![work_group_id],
+            )?;
+            conn.execute(
+                "DELETE FROM task_dispatches
+                 WHERE workflow_id IN (SELECT id FROM workflows WHERE work_group_id = ?1)
+                 OR task_id IN (SELECT id FROM task_cards WHERE work_group_id = ?1)",
+                params![work_group_id],
+            )?;
+            conn.execute(
                 "DELETE FROM claim_bids
                  WHERE task_card_id IN (SELECT id FROM task_cards WHERE work_group_id = ?1)",
                 params![work_group_id],
@@ -115,6 +127,15 @@ impl Storage {
             )?;
             conn.execute(
                 "DELETE FROM task_cards WHERE work_group_id = ?1",
+                params![work_group_id],
+            )?;
+            conn.execute(
+                "DELETE FROM workflow_stages
+                 WHERE workflow_id IN (SELECT id FROM workflows WHERE work_group_id = ?1)",
+                params![work_group_id],
+            )?;
+            conn.execute(
+                "DELETE FROM workflows WHERE work_group_id = ?1",
                 params![work_group_id],
             )?;
             conn.execute(
@@ -156,6 +177,18 @@ impl Storage {
                 params![work_group_id],
             )?;
             conn.execute(
+                "DELETE FROM task_blockers
+                 WHERE workflow_id IN (SELECT id FROM workflows WHERE work_group_id = ?1)
+                 OR task_id IN (SELECT id FROM task_cards WHERE work_group_id = ?1)",
+                params![work_group_id],
+            )?;
+            conn.execute(
+                "DELETE FROM task_dispatches
+                 WHERE workflow_id IN (SELECT id FROM workflows WHERE work_group_id = ?1)
+                 OR task_id IN (SELECT id FROM task_cards WHERE work_group_id = ?1)",
+                params![work_group_id],
+            )?;
+            conn.execute(
                 "DELETE FROM claim_bids
                  WHERE task_card_id IN (SELECT id FROM task_cards WHERE work_group_id = ?1)",
                 params![work_group_id],
@@ -167,6 +200,15 @@ impl Storage {
             )?;
             conn.execute(
                 "DELETE FROM task_cards WHERE work_group_id = ?1",
+                params![work_group_id],
+            )?;
+            conn.execute(
+                "DELETE FROM workflow_stages
+                 WHERE workflow_id IN (SELECT id FROM workflows WHERE work_group_id = ?1)",
+                params![work_group_id],
+            )?;
+            conn.execute(
+                "DELETE FROM workflows WHERE work_group_id = ?1",
                 params![work_group_id],
             )?;
             conn.execute(

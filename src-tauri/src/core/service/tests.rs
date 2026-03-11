@@ -4,6 +4,11 @@ use crate::core::domain::{
     MemoryItem, MemoryPolicy, MemoryScope, MessageKind, SendHumanMessageInput, TaskCard,
     TaskStatus, ToolRun, ToolRunState, WorkGroupKind,
 };
+use crate::core::workflow::{
+    BlockerCategory, BlockerResolutionTarget, NarrativeEnvelope, RaiseTaskBlockerInput,
+    RequestRouteMode, StageStatus, TaskDispatchRecord, TaskDispatchSource, WorkflowExecutionMode,
+    WorkflowRecord, WorkflowStageRecord, WorkflowStatus,
+};
 use anyhow::anyhow;
 use std::{
     fs,
@@ -28,6 +33,37 @@ fn setup_service() -> (AppService, PathBuf, PathBuf) {
     fs::create_dir_all(&data_root).expect("data");
     let service = AppService::new(workspace_root.clone(), data_root.clone()).expect("service");
     (service, workspace_root, data_root)
+}
+
+fn create_agent(service: &AppService, name: &str, role: &str) -> String {
+    service
+        .create_agent_profile(CreateAgentInput {
+            name: name.into(),
+            avatar: name.chars().take(2).collect(),
+            role: role.into(),
+            objective: role.into(),
+            provider: "mock".into(),
+            model: "simulation".into(),
+            temperature: 0.2,
+            skill_ids: vec![],
+            tool_ids: vec!["plan.summarize".into()],
+            max_parallel_runs: 2,
+            can_spawn_subtasks: false,
+            memory_policy: MemoryPolicy::default(),
+            permission_policy: AgentPermissionPolicy::default(),
+        })
+        .expect("agent")
+        .id
+}
+
+fn parse_narrative(content: &str) -> Option<NarrativeEnvelope> {
+    serde_json::from_str::<NarrativeEnvelope>(content).ok()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn block_on_service_future_is_safe_inside_runtime() {
+    let value = super::block_on_service_future(async { 7usize });
+    assert_eq!(value, 7);
 }
 
 #[test]
@@ -256,6 +292,872 @@ fn permission_denial_moves_task_to_review_and_records_audit() {
         })
         .expect("permission denial audit");
     assert!(audit.payload_json.contains("allowFsRoots"));
+}
+
+#[test]
+fn direct_assign_route_skips_owner_plan_messages() {
+    let (service, _, _) = setup_service();
+    let app = tauri::test::mock_app();
+    let app_handle = app.handle().clone();
+
+    let frontend_id = create_agent(&service, "前端开发1", "Frontend Engineer");
+    let work_group = service
+        .create_work_group(CreateWorkGroupInput {
+            name: "Direct Group".into(),
+            goal: "Verify direct assignment.".into(),
+            working_directory: ".".into(),
+            kind: WorkGroupKind::Persistent,
+            default_visibility: "summary".into(),
+            auto_archive: false,
+            member_agent_ids: None,
+        })
+        .expect("group");
+    service
+        .add_agent_to_work_group(&work_group.id, &frontend_id)
+        .expect("add frontend");
+
+    service
+        .send_human_message(
+            app_handle,
+            SendHumanMessageInput {
+                work_group_id: work_group.id.clone(),
+                content: "@前端开发1 做一个登录页".into(),
+            },
+        )
+        .expect("send");
+
+    let messages = service
+        .storage
+        .list_messages_for_group(&work_group.id)
+        .expect("messages");
+    assert!(
+        messages.iter().any(|message| {
+            parse_narrative(&message.content).is_some_and(|item| {
+                item.narrative_type == crate::core::workflow::NarrativeMessageType::AgentAck
+            })
+        }),
+        "expected direct agent ack narrative",
+    );
+    assert!(
+        !messages.iter().any(|message| {
+            parse_narrative(&message.content).is_some_and(|item| {
+                matches!(
+                    item.narrative_type,
+                    crate::core::workflow::NarrativeMessageType::OwnerAck
+                        | crate::core::workflow::NarrativeMessageType::OwnerPlan
+                )
+            })
+        }),
+        "direct assignment should not emit owner plan messages",
+    );
+    assert!(
+        messages.iter().any(|message| {
+            matches!(
+                message.visibility,
+                crate::core::domain::Visibility::Backstage
+            ) && parse_narrative(&message.content).is_some_and(|item| {
+                item.narrative_type == crate::core::workflow::NarrativeMessageType::DirectAssign
+            })
+        }),
+        "expected backstage direct assign narrative",
+    );
+    let has_progress = (0..40).any(|_| {
+        let messages = service
+            .storage
+            .list_messages_for_group(&work_group.id)
+            .expect("messages");
+        if messages.iter().any(|message| {
+            matches!(message.visibility, crate::core::domain::Visibility::Main)
+                && parse_narrative(&message.content).is_some_and(|item| {
+                    item.narrative_type
+                        == crate::core::workflow::NarrativeMessageType::AgentProgress
+                })
+        }) {
+            true
+        } else {
+            thread::sleep(Duration::from_millis(25));
+            false
+        }
+    });
+    assert!(
+        has_progress,
+        "expected direct assignment progress narrative"
+    );
+    let direct_ack = messages
+        .iter()
+        .filter_map(|message| parse_narrative(&message.content))
+        .find(|item| item.narrative_type == crate::core::workflow::NarrativeMessageType::AgentAck)
+        .expect("direct ack narrative");
+    assert!(
+        direct_ack.text.contains("关键问题开始推进"),
+        "expected llm-generated direct ack text"
+    );
+    let direct_progress = service
+        .storage
+        .list_messages_for_group(&work_group.id)
+        .expect("messages")
+        .into_iter()
+        .filter_map(|message| parse_narrative(&message.content))
+        .find(|item| {
+            item.narrative_type == crate::core::workflow::NarrativeMessageType::AgentProgress
+        })
+        .expect("direct progress narrative");
+    assert_eq!(direct_progress.progress_percent, Some(35));
+    assert!(
+        direct_progress.text.contains("推进关键部分"),
+        "expected llm-generated progress text"
+    );
+}
+
+#[test]
+fn owner_orchestrated_route_emits_owner_plan() {
+    let (service, _, _) = setup_service();
+    let app = tauri::test::mock_app();
+    let app_handle = app.handle().clone();
+
+    let product_id = create_agent(&service, "产品经理", "Product Manager");
+    let architect_id = create_agent(&service, "架构师", "Architect");
+    let backend_id = create_agent(&service, "后端开发1", "Backend Engineer");
+
+    let work_group = service
+        .create_work_group(CreateWorkGroupInput {
+            name: "Project Group".into(),
+            goal: "Verify owner orchestration.".into(),
+            working_directory: ".".into(),
+            kind: WorkGroupKind::Persistent,
+            default_visibility: "summary".into(),
+            auto_archive: false,
+            member_agent_ids: None,
+        })
+        .expect("group");
+    for agent_id in [product_id, architect_id, backend_id] {
+        service
+            .add_agent_to_work_group(&work_group.id, &agent_id)
+            .expect("add member");
+    }
+
+    service
+        .send_human_message(
+            app_handle,
+            SendHumanMessageInput {
+                work_group_id: work_group.id.clone(),
+                content: "帮我开发一个图书管理系统".into(),
+            },
+        )
+        .expect("send");
+
+    let messages = service
+        .storage
+        .list_messages_for_group(&work_group.id)
+        .expect("messages");
+    assert!(
+        messages.iter().any(|message| {
+            parse_narrative(&message.content).is_some_and(|item| {
+                item.narrative_type == crate::core::workflow::NarrativeMessageType::OwnerAck
+            })
+        }),
+        "expected owner ack narrative",
+    );
+    assert!(
+        messages.iter().any(|message| {
+            parse_narrative(&message.content).is_some_and(|item| {
+                item.narrative_type == crate::core::workflow::NarrativeMessageType::OwnerPlan
+            })
+        }),
+        "expected owner plan narrative",
+    );
+}
+
+#[test]
+fn single_task_owner_route_emits_narrative_dispatch_in_main_chat() {
+    let (service, _, _) = setup_service();
+    let app = tauri::test::mock_app();
+    let app_handle = app.handle().clone();
+
+    let auditor_id = create_agent(&service, "CodeAuditor", "Security Code Reviewer");
+    let work_group = service
+        .create_work_group(CreateWorkGroupInput {
+            name: "Audit Group".into(),
+            goal: "Verify single-task owner narration.".into(),
+            working_directory: ".".into(),
+            kind: WorkGroupKind::Persistent,
+            default_visibility: "summary".into(),
+            auto_archive: false,
+            member_agent_ids: None,
+        })
+        .expect("group");
+    service
+        .add_agent_to_work_group(&work_group.id, &auditor_id)
+        .expect("add auditor");
+
+    service
+        .send_human_message(
+            app_handle,
+            SendHumanMessageInput {
+                work_group_id: work_group.id.clone(),
+                content: "审计一下当前项目".into(),
+            },
+        )
+        .expect("send");
+
+    let main_messages = service
+        .storage
+        .list_messages_for_group(&work_group.id)
+        .expect("messages")
+        .into_iter()
+        .filter(|message| matches!(message.visibility, crate::core::domain::Visibility::Main))
+        .collect::<Vec<_>>();
+
+    assert!(
+        main_messages.iter().any(|message| {
+            parse_narrative(&message.content).is_some_and(|item| {
+                item.narrative_type == crate::core::workflow::NarrativeMessageType::OwnerAck
+            })
+        }),
+        "expected owner ack narrative in main chat",
+    );
+    assert!(
+        main_messages.iter().any(|message| {
+            parse_narrative(&message.content).is_some_and(|item| {
+                item.narrative_type == crate::core::workflow::NarrativeMessageType::OwnerDispatch
+            })
+        }),
+        "expected owner dispatch narrative in main chat",
+    );
+    assert!(
+        main_messages
+            .iter()
+            .all(|message| { !message.content.contains("Task card created and leased to") }),
+        "legacy coordinator status should not stay in main chat",
+    );
+    let agent_ack = main_messages
+        .iter()
+        .filter_map(|message| parse_narrative(&message.content))
+        .find(|item| item.narrative_type == crate::core::workflow::NarrativeMessageType::AgentAck)
+        .expect("owner route agent ack");
+    assert!(
+        agent_ack.text.contains("关键点梳理清楚"),
+        "expected llm-generated owner-route agent ack text"
+    );
+}
+
+#[test]
+fn owner_blocker_resolution_resumes_blocked_task() {
+    let (service, _, _) = setup_service();
+    let app = tauri::test::mock_app();
+    let app_handle = app.handle().clone();
+
+    let worker_id = create_agent(&service, "后端开发2", "Backend Engineer");
+    let work_group = service
+        .create_work_group(CreateWorkGroupInput {
+            name: "Blocker Group".into(),
+            goal: "Verify owner blocker resolution.".into(),
+            working_directory: ".".into(),
+            kind: WorkGroupKind::Persistent,
+            default_visibility: "summary".into(),
+            auto_archive: false,
+            member_agent_ids: None,
+        })
+        .expect("group");
+    service
+        .add_agent_to_work_group(&work_group.id, &worker_id)
+        .expect("add worker");
+
+    let owner_id = service
+        .storage
+        .get_work_group_owner_id(&work_group.id)
+        .expect("owner query")
+        .expect("owner");
+
+    let workflow = WorkflowRecord {
+        id: new_id(),
+        work_group_id: work_group.id.clone(),
+        source_message_id: new_id(),
+        route_mode: RequestRouteMode::OwnerOrchestrated,
+        title: "借阅系统".into(),
+        normalized_intent: "借阅系统".into(),
+        status: WorkflowStatus::Running,
+        owner_agent_id: owner_id,
+        current_stage_id: Some("stage-1".into()),
+        created_at: now(),
+    };
+    service
+        .storage
+        .insert_workflow(&workflow)
+        .expect("workflow");
+    service
+        .storage
+        .insert_workflow_stage(&WorkflowStageRecord {
+            id: "stage-1".into(),
+            workflow_id: workflow.id.clone(),
+            title: "实施开发".into(),
+            goal: "实现借阅模块".into(),
+            order_index: 1,
+            execution_mode: WorkflowExecutionMode::Serial,
+            status: StageStatus::Running,
+            entry_message_id: None,
+            completion_message_id: None,
+            created_at: now(),
+        })
+        .expect("stage");
+
+    let task = TaskCard {
+        id: new_id(),
+        parent_id: None,
+        source_message_id: workflow.source_message_id.clone(),
+        title: "实现借阅状态流转".into(),
+        normalized_goal: "实现借阅状态流转".into(),
+        input_payload: "实现借阅状态流转".into(),
+        priority: 80,
+        status: TaskStatus::Leased,
+        work_group_id: work_group.id.clone(),
+        created_by: "human".into(),
+        assigned_agent_id: Some(worker_id.clone()),
+        created_at: now(),
+    };
+    service.storage.insert_task_card(&task).expect("task");
+    service
+        .storage
+        .insert_task_dispatch(&TaskDispatchRecord {
+            task_id: task.id.clone(),
+            workflow_id: Some(workflow.id.clone()),
+            stage_id: Some("stage-1".into()),
+            dispatch_source: TaskDispatchSource::OwnerAssign,
+            depends_on_task_ids: vec![],
+            acknowledged_at: Some(now()),
+            result_message_id: None,
+            locked_by_user_mention: false,
+            target_agent_id: worker_id.clone(),
+            route_mode: RequestRouteMode::OwnerOrchestrated,
+            narrative_stage_label: Some("实施开发".into()),
+            narrative_task_label: Some(task.title.clone()),
+        })
+        .expect("dispatch");
+    service
+        .storage
+        .insert_lease(&Lease {
+            id: new_id(),
+            task_card_id: task.id.clone(),
+            owner_agent_id: worker_id.clone(),
+            state: LeaseState::Active,
+            granted_at: now(),
+            expires_at: None,
+            preempt_requested_at: None,
+            released_at: None,
+        })
+        .expect("lease");
+
+    let blocker = service
+        .raise_task_blocker(
+            app_handle,
+            &task.id,
+            RaiseTaskBlockerInput {
+                raised_by_agent_id: worker_id.clone(),
+                resolution_target: BlockerResolutionTarget::Owner,
+                category: BlockerCategory::MissingDependency,
+                summary: "缺少借阅状态流转规则".into(),
+                details: "需要先补接口与状态约束".into(),
+            },
+        )
+        .expect("raise blocker");
+
+    let resolved = service
+        .storage
+        .get_task_blocker(&blocker.id)
+        .expect("blocker");
+    assert_eq!(
+        resolved.status,
+        crate::core::workflow::BlockerStatus::Resolved
+    );
+    assert_ne!(
+        service
+            .storage
+            .get_workflow(&workflow.id)
+            .expect("workflow")
+            .status,
+        WorkflowStatus::Blocked
+    );
+    assert!(
+        service
+            .storage
+            .list_messages_for_group(&work_group.id)
+            .expect("messages")
+            .into_iter()
+            .any(|message| {
+                parse_narrative(&message.content).is_some_and(|item| {
+                    item.narrative_type
+                        == crate::core::workflow::NarrativeMessageType::BlockerResolved
+                })
+            }),
+        "expected blocker resolved narrative",
+    );
+}
+
+#[test]
+fn owner_blocker_can_escalate_to_user_and_resume_after_answer() {
+    let (service, _, _) = setup_service();
+    let app = tauri::test::mock_app();
+    let app_handle = app.handle().clone();
+
+    let worker_id = create_agent(&service, "前端开发1", "Frontend Engineer");
+    let work_group = service
+        .create_work_group(CreateWorkGroupInput {
+            name: "User Escalation Group".into(),
+            goal: "Verify owner escalates blockers to user.".into(),
+            working_directory: ".".into(),
+            kind: WorkGroupKind::Persistent,
+            default_visibility: "summary".into(),
+            auto_archive: false,
+            member_agent_ids: None,
+        })
+        .expect("group");
+    service
+        .add_agent_to_work_group(&work_group.id, &worker_id)
+        .expect("add worker");
+
+    let owner_id = service
+        .storage
+        .get_work_group_owner_id(&work_group.id)
+        .expect("owner query")
+        .expect("owner");
+
+    let workflow = WorkflowRecord {
+        id: new_id(),
+        work_group_id: work_group.id.clone(),
+        source_message_id: new_id(),
+        route_mode: RequestRouteMode::OwnerOrchestrated,
+        title: "登录页项目".into(),
+        normalized_intent: "登录页项目".into(),
+        status: WorkflowStatus::Running,
+        owner_agent_id: owner_id,
+        current_stage_id: Some("stage-1".into()),
+        created_at: now(),
+    };
+    service
+        .storage
+        .insert_workflow(&workflow)
+        .expect("workflow");
+    service
+        .storage
+        .insert_workflow_stage(&WorkflowStageRecord {
+            id: "stage-1".into(),
+            workflow_id: workflow.id.clone(),
+            title: "实施开发".into(),
+            goal: "开发登录页".into(),
+            order_index: 1,
+            execution_mode: WorkflowExecutionMode::Serial,
+            status: StageStatus::Running,
+            entry_message_id: None,
+            completion_message_id: None,
+            created_at: now(),
+        })
+        .expect("stage");
+
+    let task = TaskCard {
+        id: new_id(),
+        parent_id: None,
+        source_message_id: workflow.source_message_id.clone(),
+        title: "开发登录页".into(),
+        normalized_goal: "开发登录页".into(),
+        input_payload: "开发登录页".into(),
+        priority: 80,
+        status: TaskStatus::Leased,
+        work_group_id: work_group.id.clone(),
+        created_by: "human".into(),
+        assigned_agent_id: Some(worker_id.clone()),
+        created_at: now(),
+    };
+    service.storage.insert_task_card(&task).expect("task");
+    service
+        .storage
+        .insert_task_dispatch(&TaskDispatchRecord {
+            task_id: task.id.clone(),
+            workflow_id: Some(workflow.id.clone()),
+            stage_id: Some("stage-1".into()),
+            dispatch_source: TaskDispatchSource::OwnerAssign,
+            depends_on_task_ids: vec![],
+            acknowledged_at: Some(now()),
+            result_message_id: None,
+            locked_by_user_mention: false,
+            target_agent_id: worker_id.clone(),
+            route_mode: RequestRouteMode::OwnerOrchestrated,
+            narrative_stage_label: Some("实施开发".into()),
+            narrative_task_label: Some(task.title.clone()),
+        })
+        .expect("dispatch");
+    service
+        .storage
+        .insert_lease(&Lease {
+            id: new_id(),
+            task_card_id: task.id.clone(),
+            owner_agent_id: worker_id.clone(),
+            state: LeaseState::Active,
+            granted_at: now(),
+            expires_at: None,
+            preempt_requested_at: None,
+            released_at: None,
+        })
+        .expect("lease");
+
+    service
+        .raise_task_blocker(
+            app_handle.clone(),
+            &task.id,
+            RaiseTaskBlockerInput {
+                raised_by_agent_id: worker_id.clone(),
+                resolution_target: BlockerResolutionTarget::Owner,
+                category: BlockerCategory::NeedUserDecision,
+                summary: "缺少页面风格决策".into(),
+                details: "需要确认是管理后台风格还是读者端风格".into(),
+            },
+        )
+        .expect("raise blocker");
+
+    assert_eq!(
+        service
+            .storage
+            .get_task_card(&task.id)
+            .expect("task")
+            .status,
+        TaskStatus::WaitingUserInput
+    );
+    assert_eq!(
+        service
+            .storage
+            .get_workflow(&workflow.id)
+            .expect("workflow")
+            .status,
+        WorkflowStatus::NeedsUserInput
+    );
+    let pending = service
+        .storage
+        .latest_pending_user_question_for_group(&work_group.id)
+        .expect("pending query")
+        .expect("pending question");
+    assert!(pending.question.contains("登录页要采用"));
+
+    service
+        .send_human_message(
+            app_handle,
+            SendHumanMessageInput {
+                work_group_id: work_group.id.clone(),
+                content: "采用管理后台风格".into(),
+            },
+        )
+        .expect("answer question");
+
+    let final_task = (0..40)
+        .find_map(|_| {
+            let current = service.storage.get_task_card(&task.id).expect("task");
+            if !matches!(
+                current.status,
+                TaskStatus::WaitingUserInput | TaskStatus::Paused
+            ) {
+                Some(current)
+            } else {
+                thread::sleep(Duration::from_millis(25));
+                None
+            }
+        })
+        .expect("task resumed");
+    assert_ne!(final_task.status, TaskStatus::WaitingUserInput);
+    assert_ne!(
+        service
+            .storage
+            .get_workflow(&workflow.id)
+            .expect("workflow")
+            .status,
+        WorkflowStatus::NeedsUserInput
+    );
+}
+
+#[test]
+fn owner_blocker_can_create_dependency_task() {
+    let (service, _, _) = setup_service();
+    let app = tauri::test::mock_app();
+    let app_handle = app.handle().clone();
+
+    let worker_id = create_agent(&service, "后端开发2", "Backend Engineer");
+    let architect_id = create_agent(&service, "架构师", "Architect");
+    let work_group = service
+        .create_work_group(CreateWorkGroupInput {
+            name: "Dependency Group".into(),
+            goal: "Verify dependency task creation.".into(),
+            working_directory: ".".into(),
+            kind: WorkGroupKind::Persistent,
+            default_visibility: "summary".into(),
+            auto_archive: false,
+            member_agent_ids: None,
+        })
+        .expect("group");
+    service
+        .add_agent_to_work_group(&work_group.id, &worker_id)
+        .expect("add worker");
+    service
+        .add_agent_to_work_group(&work_group.id, &architect_id)
+        .expect("add architect");
+
+    let owner_id = service
+        .storage
+        .get_work_group_owner_id(&work_group.id)
+        .expect("owner query")
+        .expect("owner");
+
+    let workflow = WorkflowRecord {
+        id: new_id(),
+        work_group_id: work_group.id.clone(),
+        source_message_id: new_id(),
+        route_mode: RequestRouteMode::OwnerOrchestrated,
+        title: "图书系统".into(),
+        normalized_intent: "图书系统".into(),
+        status: WorkflowStatus::Running,
+        owner_agent_id: owner_id,
+        current_stage_id: Some("stage-1".into()),
+        created_at: now(),
+    };
+    service
+        .storage
+        .insert_workflow(&workflow)
+        .expect("workflow");
+    service
+        .storage
+        .insert_workflow_stage(&WorkflowStageRecord {
+            id: "stage-1".into(),
+            workflow_id: workflow.id.clone(),
+            title: "实施开发".into(),
+            goal: "实现借阅逻辑".into(),
+            order_index: 1,
+            execution_mode: WorkflowExecutionMode::Serial,
+            status: StageStatus::Running,
+            entry_message_id: None,
+            completion_message_id: None,
+            created_at: now(),
+        })
+        .expect("stage");
+
+    let task = TaskCard {
+        id: new_id(),
+        parent_id: None,
+        source_message_id: workflow.source_message_id.clone(),
+        title: "实现借阅模块".into(),
+        normalized_goal: "实现借阅模块".into(),
+        input_payload: "实现借阅模块".into(),
+        priority: 80,
+        status: TaskStatus::Leased,
+        work_group_id: work_group.id.clone(),
+        created_by: "human".into(),
+        assigned_agent_id: Some(worker_id.clone()),
+        created_at: now(),
+    };
+    service.storage.insert_task_card(&task).expect("task");
+    service
+        .storage
+        .insert_task_dispatch(&TaskDispatchRecord {
+            task_id: task.id.clone(),
+            workflow_id: Some(workflow.id.clone()),
+            stage_id: Some("stage-1".into()),
+            dispatch_source: TaskDispatchSource::OwnerAssign,
+            depends_on_task_ids: vec![],
+            acknowledged_at: Some(now()),
+            result_message_id: None,
+            locked_by_user_mention: false,
+            target_agent_id: worker_id.clone(),
+            route_mode: RequestRouteMode::OwnerOrchestrated,
+            narrative_stage_label: Some("实施开发".into()),
+            narrative_task_label: Some(task.title.clone()),
+        })
+        .expect("dispatch");
+    service
+        .storage
+        .insert_lease(&Lease {
+            id: new_id(),
+            task_card_id: task.id.clone(),
+            owner_agent_id: worker_id.clone(),
+            state: LeaseState::Active,
+            granted_at: now(),
+            expires_at: None,
+            preempt_requested_at: None,
+            released_at: None,
+        })
+        .expect("lease");
+
+    service
+        .raise_task_blocker(
+            app_handle.clone(),
+            &task.id,
+            RaiseTaskBlockerInput {
+                raised_by_agent_id: worker_id.clone(),
+                resolution_target: BlockerResolutionTarget::Owner,
+                category: BlockerCategory::MissingDependency,
+                summary: "缺少架构层借阅状态规则".into(),
+                details: "需要先补接口与状态约束".into(),
+            },
+        )
+        .expect("raise blocker");
+
+    let dependency = service
+        .storage
+        .list_task_cards(Some(&work_group.id))
+        .expect("tasks")
+        .into_iter()
+        .find(|item| item.id != task.id)
+        .expect("dependency task");
+    assert_eq!(
+        dependency.assigned_agent_id.as_deref(),
+        Some(architect_id.as_str())
+    );
+    assert_eq!(
+        service
+            .storage
+            .get_task_card(&task.id)
+            .expect("task")
+            .status,
+        TaskStatus::Pending
+    );
+    let original_dispatch = service
+        .storage
+        .get_task_dispatch(&task.id)
+        .expect("dispatch query")
+        .expect("dispatch");
+    assert!(original_dispatch
+        .depends_on_task_ids
+        .contains(&dependency.id));
+}
+
+#[test]
+fn owner_blocker_can_request_approval() {
+    let (service, _, _) = setup_service();
+    let app = tauri::test::mock_app();
+    let app_handle = app.handle().clone();
+
+    let worker_id = create_agent(&service, "Builder", "Systems Engineer");
+    let work_group = service
+        .create_work_group(CreateWorkGroupInput {
+            name: "Approval Group".into(),
+            goal: "Verify owner approval escalation.".into(),
+            working_directory: ".".into(),
+            kind: WorkGroupKind::Persistent,
+            default_visibility: "summary".into(),
+            auto_archive: false,
+            member_agent_ids: None,
+        })
+        .expect("group");
+    service
+        .add_agent_to_work_group(&work_group.id, &worker_id)
+        .expect("add worker");
+
+    let owner_id = service
+        .storage
+        .get_work_group_owner_id(&work_group.id)
+        .expect("owner query")
+        .expect("owner");
+
+    let workflow = WorkflowRecord {
+        id: new_id(),
+        work_group_id: work_group.id.clone(),
+        source_message_id: new_id(),
+        route_mode: RequestRouteMode::OwnerOrchestrated,
+        title: "部署审批".into(),
+        normalized_intent: "部署审批".into(),
+        status: WorkflowStatus::Running,
+        owner_agent_id: owner_id,
+        current_stage_id: Some("stage-1".into()),
+        created_at: now(),
+    };
+    service
+        .storage
+        .insert_workflow(&workflow)
+        .expect("workflow");
+    service
+        .storage
+        .insert_workflow_stage(&WorkflowStageRecord {
+            id: "stage-1".into(),
+            workflow_id: workflow.id.clone(),
+            title: "发布收尾".into(),
+            goal: "执行发布".into(),
+            order_index: 1,
+            execution_mode: WorkflowExecutionMode::Serial,
+            status: StageStatus::Running,
+            entry_message_id: None,
+            completion_message_id: None,
+            created_at: now(),
+        })
+        .expect("stage");
+
+    let task = TaskCard {
+        id: new_id(),
+        parent_id: None,
+        source_message_id: workflow.source_message_id.clone(),
+        title: "执行生产发布".into(),
+        normalized_goal: "执行生产发布".into(),
+        input_payload: "执行生产发布".into(),
+        priority: 80,
+        status: TaskStatus::Leased,
+        work_group_id: work_group.id.clone(),
+        created_by: "human".into(),
+        assigned_agent_id: Some(worker_id.clone()),
+        created_at: now(),
+    };
+    service.storage.insert_task_card(&task).expect("task");
+    service
+        .storage
+        .insert_task_dispatch(&TaskDispatchRecord {
+            task_id: task.id.clone(),
+            workflow_id: Some(workflow.id.clone()),
+            stage_id: Some("stage-1".into()),
+            dispatch_source: TaskDispatchSource::OwnerAssign,
+            depends_on_task_ids: vec![],
+            acknowledged_at: Some(now()),
+            result_message_id: None,
+            locked_by_user_mention: false,
+            target_agent_id: worker_id.clone(),
+            route_mode: RequestRouteMode::OwnerOrchestrated,
+            narrative_stage_label: Some("发布收尾".into()),
+            narrative_task_label: Some(task.title.clone()),
+        })
+        .expect("dispatch");
+    service
+        .storage
+        .insert_lease(&Lease {
+            id: new_id(),
+            task_card_id: task.id.clone(),
+            owner_agent_id: worker_id.clone(),
+            state: LeaseState::Active,
+            granted_at: now(),
+            expires_at: None,
+            preempt_requested_at: None,
+            released_at: None,
+        })
+        .expect("lease");
+
+    service
+        .raise_task_blocker(
+            app_handle.clone(),
+            &task.id,
+            RaiseTaskBlockerInput {
+                raised_by_agent_id: worker_id,
+                resolution_target: BlockerResolutionTarget::Owner,
+                category: BlockerCategory::PermissionRequired,
+                summary: "生产发布需要额外审批".into(),
+                details: "请确认是否批准当前发布时间窗".into(),
+            },
+        )
+        .expect("raise blocker");
+
+    assert_eq!(
+        service
+            .storage
+            .get_task_card(&task.id)
+            .expect("task")
+            .status,
+        TaskStatus::WaitingApproval
+    );
+    let pending = service
+        .storage
+        .latest_pending_user_question_for_group(&work_group.id)
+        .expect("pending query")
+        .expect("pending approval");
+    assert!(pending.question.contains("是否批准"));
 }
 
 #[test]

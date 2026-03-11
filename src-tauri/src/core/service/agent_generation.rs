@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashSet;
 
 use crate::core::{
     domain::{
@@ -26,6 +27,14 @@ struct GeneratedAgentDraft {
 
 impl AppService {
     pub async fn generate_agent_profile(&self, prompt: &str) -> Result<CreateAgentInput> {
+        let generated = self.generate_agent_profiles(prompt).await?;
+        generated
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("agent generation did not produce any profiles"))
+    }
+
+    pub async fn generate_agent_profiles(&self, prompt: &str) -> Result<Vec<CreateAgentInput>> {
         let trimmed_prompt = prompt.trim();
         if trimmed_prompt.is_empty() {
             return Err(anyhow!("agent generation prompt cannot be empty"));
@@ -62,43 +71,33 @@ impl AppService {
         };
 
         let preamble =
-            "You design agent profiles for a multi-agent workspace. Output valid JSON only.";
+            "You design agent profiles for a multi-agent workspace. Output only valid JSON. Do not output Markdown, explanatory text, or code block fences.";
         let generation_prompt = format!(
-            "User request:\n{}\n\nReturn exactly one JSON object with keys name, avatar, role, objective, skillIds, toolIds, maxParallelRuns, canSpawnSubtasks.\nRules:\n- name/role/objective should be concise and practical.\n- avatar should be 1-2 uppercase letters.\n- skillIds must come from this list:\n{}\n- toolIds must come from this list:\n{}\n- maxParallelRuns should be 1-8.\n- No markdown, comments, or extra keys.",
+            "User request:\n{}\n\nReturn a JSON array containing 1-8 agent objects. Each object must use exactly these keys: name, avatar, role, objective, skillIds, toolIds, maxParallelRuns, canSpawnSubtasks.\nRules:\n- If the user asks for a team, return multiple complementary roles that cover the workflow.\n- If the user asks for a single agent, return an array with exactly one object.\n- name/role/objective should be concise and practical.\n- avatar should be 1-2 uppercase letters.\n- skillIds must come from this list:\n{}\n- toolIds must come from this list:\n{}\n- maxParallelRuns should be 1-8.\n- No markdown, comments, or extra keys.",
             trimmed_prompt, skill_catalog, tool_catalog
         );
 
         let (reply, model_policy) =
             complete_with_best_provider(&settings, preamble, &generation_prompt).await?;
-        let draft = parse_generated_agent_draft(&reply)?;
-
-        let mut skill_ids = Vec::new();
-        for skill_id in draft.skill_ids.unwrap_or_default() {
-            if skills.iter().any(|skill| skill.id == skill_id) && !skill_ids.contains(&skill_id) {
-                skill_ids.push(skill_id);
-            }
-        }
-
-        let mut tool_ids = Vec::new();
-        for tool_id in draft.tool_ids.unwrap_or_default() {
-            if tools.iter().any(|tool| tool.id == tool_id) && !tool_ids.contains(&tool_id) {
-                tool_ids.push(tool_id);
-            }
-        }
-
-        let name = non_empty_or_default(
-            draft.name,
-            truncated_chars(trimmed_prompt.lines().next().unwrap_or("AI Agent"), 40),
-        );
-        let role = non_empty_or_default(draft.role, "General-purpose specialist".to_string());
-        let objective = non_empty_or_default(
-            draft.objective,
-            format!(
-                "Handle requests related to: {}",
-                truncated_chars(trimmed_prompt, 120)
-            ),
-        );
-        let avatar = non_empty_or_default(draft.avatar, initials(&name));
+        let drafts = parse_generated_agent_drafts(&reply)?;
+        let draft_count = drafts.len();
+        let mut used_names = HashSet::new();
+        let generated = drafts
+            .into_iter()
+            .enumerate()
+            .map(|(index, draft)| {
+                build_generated_agent_input(
+                    draft,
+                    trimmed_prompt,
+                    draft_count,
+                    index,
+                    &model_policy,
+                    &skills,
+                    &tools,
+                    &mut used_names,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         self.record_audit(
             "agent.generated",
@@ -107,44 +106,104 @@ impl AppService {
             json!({
                 "provider": model_policy.provider,
                 "model": model_policy.model,
-                "name": name,
-                "skillCount": skill_ids.len(),
-                "toolCount": tool_ids.len(),
+                "count": generated.len(),
+                "names": generated.iter().map(|agent| agent.name.clone()).collect::<Vec<_>>(),
             }),
         )?;
 
-        Ok(CreateAgentInput {
-            name,
-            avatar: truncated_chars(&avatar.to_uppercase(), 2),
-            role,
-            objective,
-            provider: model_policy.provider,
-            model: model_policy.model,
-            temperature: model_policy.temperature,
-            skill_ids,
-            tool_ids,
-            max_parallel_runs: draft.max_parallel_runs.unwrap_or(2).clamp(1, 8),
-            can_spawn_subtasks: draft.can_spawn_subtasks.unwrap_or(true),
-            memory_policy: Default::default(),
-            permission_policy: Default::default(),
-        })
+        Ok(generated)
     }
 }
 
-fn parse_generated_agent_draft(raw: &str) -> Result<GeneratedAgentDraft> {
-    let payload = extract_json_object(raw)
-        .ok_or_else(|| anyhow!("model did not return a valid JSON object"))?;
-    serde_json::from_str(payload)
-        .with_context(|| "failed to parse generated agent profile JSON".to_string())
+fn build_generated_agent_input(
+    draft: GeneratedAgentDraft,
+    prompt: &str,
+    total_drafts: usize,
+    index: usize,
+    model_policy: &ModelPolicy,
+    skills: &[crate::core::domain::SkillPack],
+    tools: &[crate::core::domain::ToolManifest],
+    used_names: &mut HashSet<String>,
+) -> Result<CreateAgentInput> {
+    let mut skill_ids = Vec::new();
+    for skill_id in draft.skill_ids.unwrap_or_default() {
+        if skills.iter().any(|skill| skill.id == skill_id) && !skill_ids.contains(&skill_id) {
+            skill_ids.push(skill_id);
+        }
+    }
+
+    let mut tool_ids = Vec::new();
+    for tool_id in draft.tool_ids.unwrap_or_default() {
+        if tools.iter().any(|tool| tool.id == tool_id) && !tool_ids.contains(&tool_id) {
+            tool_ids.push(tool_id);
+        }
+    }
+
+    let role = non_empty_or_default(draft.role, "General-purpose specialist".to_string());
+    let fallback_name = default_generated_name(prompt, &role, total_drafts, index);
+    let name = unique_name(non_empty_or_default(draft.name, fallback_name), used_names);
+    let objective = non_empty_or_default(
+        draft.objective,
+        format!(
+            "Handle requests related to: {}",
+            truncated_chars(prompt, 120)
+        ),
+    );
+    let avatar = non_empty_or_default(draft.avatar, initials(&name));
+
+    Ok(CreateAgentInput {
+        name,
+        avatar: truncated_chars(&avatar.to_uppercase(), 2),
+        role,
+        objective,
+        provider: model_policy.provider.clone(),
+        model: model_policy.model.clone(),
+        temperature: model_policy.temperature,
+        skill_ids,
+        tool_ids,
+        max_parallel_runs: draft.max_parallel_runs.unwrap_or(2).clamp(1, 8),
+        can_spawn_subtasks: draft.can_spawn_subtasks.unwrap_or(true),
+        memory_policy: Default::default(),
+        permission_policy: Default::default(),
+    })
 }
 
-fn extract_json_object(raw: &str) -> Option<&str> {
+fn parse_generated_agent_drafts(raw: &str) -> Result<Vec<GeneratedAgentDraft>> {
+    let payload =
+        extract_json_payload(raw).ok_or_else(|| anyhow!("model did not return valid JSON"))?;
+    let trimmed = payload.trim();
+    let drafts = if trimmed.starts_with('[') {
+        serde_json::from_str(trimmed)
+            .with_context(|| "failed to parse generated agent profile JSON array".to_string())?
+    } else {
+        vec![serde_json::from_str(trimmed)
+            .with_context(|| "failed to parse generated agent profile JSON object".to_string())?]
+    };
+
+    if drafts.is_empty() {
+        return Err(anyhow!("agent generation returned an empty list"));
+    }
+
+    Ok(drafts)
+}
+
+fn extract_json_payload(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
-    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    {
         return Some(trimmed);
     }
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
+    let array_start = trimmed.find('[');
+    let object_start = trimmed.find('{');
+    let (start, end) = match (array_start, object_start) {
+        (Some(array_index), Some(object_index)) if array_index < object_index => {
+            (array_index, trimmed.rfind(']')?)
+        }
+        (Some(array_index), None) => (array_index, trimmed.rfind(']')?),
+        (_, Some(object_index)) => (object_index, trimmed.rfind('}')?),
+        (None, None) => return None,
+    };
     (end > start).then_some(&trimmed[start..=end])
 }
 
@@ -181,6 +240,36 @@ fn initials(name: &str) -> String {
     } else {
         letters.to_uppercase()
     }
+}
+
+fn default_generated_name(prompt: &str, role: &str, total_drafts: usize, index: usize) -> String {
+    if total_drafts == 1 {
+        return truncated_chars(prompt.lines().next().unwrap_or("AI Agent"), 40);
+    }
+    let trimmed_role = role.trim();
+    if !trimmed_role.is_empty() {
+        return truncated_chars(trimmed_role, 40);
+    }
+    format!("Agent {}", index + 1)
+}
+
+fn unique_name(name: String, used_names: &mut HashSet<String>) -> String {
+    let trimmed = name.trim();
+    let base = if trimmed.is_empty() {
+        "AI Agent"
+    } else {
+        trimmed
+    };
+    let mut candidate = truncated_chars(base, 40);
+    let mut suffix = 2;
+
+    while !used_names.insert(candidate.to_lowercase()) {
+        let numbered = format!("{} {}", base, suffix);
+        candidate = truncated_chars(&numbered, 40);
+        suffix += 1;
+    }
+
+    candidate
 }
 
 fn provider_available_for_completion(provider: &AIProviderConfig) -> bool {
@@ -279,5 +368,30 @@ async fn complete_with_best_provider(
         Err(anyhow!(
             "no available provider is configured for agent generation"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_json_payload, parse_generated_agent_drafts};
+
+    #[test]
+    fn parses_single_object_as_one_draft() {
+        let drafts = parse_generated_agent_drafts(
+            r#"{"name":"PM","avatar":"PM","role":"Product Manager","objective":"Define scope"}"#,
+        )
+        .expect("drafts");
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].name.as_deref(), Some("PM"));
+    }
+
+    #[test]
+    fn parses_array_wrapped_in_extra_text() {
+        let payload = extract_json_payload(
+            "Here is the plan:\n[{\"name\":\"PM\",\"role\":\"Product Manager\"},{\"name\":\"QA\",\"role\":\"Tester\"}]",
+        )
+        .expect("payload");
+        let drafts = parse_generated_agent_drafts(payload).expect("drafts");
+        assert_eq!(drafts.len(), 2);
     }
 }

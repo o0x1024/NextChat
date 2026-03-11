@@ -15,6 +15,7 @@ import {
   pauseLease,
   readInstalledSkillFile,
   removeAgentFromWorkGroup,
+  resolveOwnerBlocker,
   resumeTaskCard,
   sendHumanMessage,
   installSkillFromGithub,
@@ -40,10 +41,12 @@ import type {
   CreateWorkGroupInput,
   DashboardState,
   Lease,
+  OwnerBlockerResolution,
   SendHumanMessageInput,
   SkillDetail,
   SystemSettings,
   TaskCard,
+  TaskBlockerRecord,
   ToolRun,
   UpdateAgentInput,
   UpdateSkillDetailInput,
@@ -80,6 +83,7 @@ interface AppStore extends DashboardState {
   sendMessage: (input: SendHumanMessageInput) => Promise<void>;
   approveRun: (toolRunId: string, approved: boolean) => Promise<void>;
   cancelTask: (taskCardId: string) => Promise<void>;
+  resolveBlocker: (blockerId: string, resolution: OwnerBlockerResolution) => Promise<void>;
   pauseLeaseById: (leaseId: string) => Promise<void>;
   resumeTask: (taskCardId: string) => Promise<void>;
   updateSettings: (settings: SystemSettings) => Promise<void>;
@@ -108,6 +112,7 @@ const emptyState: DashboardState = {
   claimBids: [],
   leases: [],
   toolRuns: [],
+  taskBlockers: [],
   auditEvents: [],
   skills: [],
   tools: [],
@@ -430,6 +435,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
   async cancelTask(taskCardId) {
     await withRefresh(() => cancelTaskCard(taskCardId), get().refresh);
+  },
+  async resolveBlocker(blockerId, resolution) {
+    await withRefresh(() => resolveOwnerBlocker(blockerId, resolution), get().refresh);
   },
   async pauseLeaseById(leaseId) {
     await withRefresh(() => pauseLease(leaseId), get().refresh);

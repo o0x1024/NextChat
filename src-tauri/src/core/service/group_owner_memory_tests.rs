@@ -216,6 +216,41 @@ fn builtin_group_owner_is_reused_across_groups() {
 }
 
 #[test]
+fn group_owner_charter_memory_includes_runtime_environment() {
+    let (service, _, _) = setup_service();
+
+    let group = service
+        .create_work_group(CreateWorkGroupInput {
+            name: "Owner Context".into(),
+            goal: "Coordinate work with environment awareness.".into(),
+            working_directory: "/Users/a1024/code/NextChat".into(),
+            kind: WorkGroupKind::Persistent,
+            default_visibility: "summary".into(),
+            auto_archive: false,
+            member_agent_ids: None,
+        })
+        .expect("group");
+
+    let charter = service
+        .storage
+        .list_memory_items()
+        .expect("memory")
+        .into_iter()
+        .find(|item| {
+            item.scope == MemoryScope::WorkGroup
+                && item.scope_id == group.id
+                && item.tags.iter().any(|tag| tag == "group_charter")
+        })
+        .expect("group charter");
+
+    assert!(charter
+        .content
+        .contains("Working directory: /Users/a1024/code/NextChat"));
+    assert!(charter.content.contains("Shell execution:"));
+    assert!(charter.content.contains("Platform:"));
+}
+
+#[test]
 fn delete_group_does_not_delete_builtin_owner_agent() {
     let (service, _, _) = setup_service();
 

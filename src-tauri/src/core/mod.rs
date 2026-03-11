@@ -1,4 +1,6 @@
 pub mod agent_runtime;
+#[path = "buildin-tools/mod.rs"]
+pub mod buildin_tools;
 pub mod coordinator;
 pub mod domain;
 pub mod llm_rig;
@@ -6,10 +8,11 @@ pub mod logging;
 pub mod memory;
 pub mod permissions;
 pub mod rig_tools;
+pub mod runtime_environment;
 pub mod service;
 pub mod skill_policy;
 pub mod storage;
 pub mod stream_text;
-pub mod tool_catalog;
 pub mod tool_runtime;
 pub mod tool_worker;
+pub mod workflow;

@@ -1,12 +1,15 @@
 import type {
   AgentProfile,
+  AuditEvent,
   ChatStreamTrack,
   ClaimBid,
   ConversationMessage,
   CreateWorkGroupInput,
   Lease,
+  OwnerBlockerResolution,
   SystemSettings,
   TaskCard,
+  TaskBlockerRecord,
   ToolManifest,
   ToolRun,
   UpdateWorkGroupInput,
@@ -20,10 +23,12 @@ export interface ChatManagementProps {
   messages: ConversationMessage[];
   chatStreamTracks: ChatStreamTrack[];
   taskCards: TaskCard[];
+  taskBlockers: TaskBlockerRecord[];
   leases: Lease[];
   claimBids: ClaimBid[];
   toolRuns: ToolRun[];
   tools: ToolManifest[];
+  auditEvents: AuditEvent[];
   settings: SystemSettings;
   selectedWorkGroupId?: string;
   language: Language;
@@ -37,10 +42,12 @@ export interface ChatManagementProps {
   onRemoveAgent: (workGroupId: string, agentId: string) => Promise<void>;
   onApproveRun: (toolRunId: string, approved: boolean) => Promise<void>;
   onCancelTask: (taskCardId: string) => Promise<void>;
+  onResolveBlocker: (blockerId: string, resolution: OwnerBlockerResolution) => Promise<void>;
 }
 
 export type PanelTarget =
   | { section: "tasks"; taskId?: string }
+  | { section: "blockers"; blockerId: string }
   | { section: "approvals" };
 
 export const emptyGroupForm: CreateWorkGroupInput = {

@@ -10,6 +10,7 @@ use crate::core::memory::{
     build_memory_snapshot, memory_context_for_task, scope_key, writable_scope_enabled,
     HUMAN_MEMORY_SCOPE_ID,
 };
+use crate::core::runtime_environment::runtime_environment_lines;
 
 impl AppService {
     pub(super) fn seed_work_group_memory(
@@ -18,13 +19,18 @@ impl AppService {
         owner: &AgentProfile,
     ) -> Result<()> {
         let content = format!(
-            "群聊协作章程\n- 群主: {}\n- 群目标: {}\n- 机制: 群主先拆解任务，再组织成员并行执行，最后汇总交付。",
+            "群聊协作章程\n- 群主: {}\n- 群目标: {}\n{}\n- 机制: 群主先拆解任务，再组织成员并行执行，最后汇总交付。",
             owner.name,
             if work_group.goal.trim().is_empty() {
                 "待补充"
             } else {
                 work_group.goal.trim()
-            }
+            },
+            runtime_environment_lines(work_group)
+                .into_iter()
+                .map(|line| format!("- {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         self.storage.insert_memory_item(&MemoryItem {
             id: new_id(),

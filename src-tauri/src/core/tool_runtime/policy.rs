@@ -16,6 +16,7 @@ impl ToolRuntime {
         input: &str,
         working_directory: &str,
     ) -> Result<ToolAuthorizationDecision> {
+        let input = self.normalize_compat_input(tool, input);
         let execution_root = self.resolve_execution_root(working_directory)?;
         let selected_skills = selected_skills_for_agent(agent, &self.all_skills());
         if matches!(
@@ -35,7 +36,7 @@ impl ToolRuntime {
 
         match tool.id.as_str() {
             "Read" | "Edit" | "MultiEdit" | "Write" | "NotebookEdit" | "LS" => {
-                let parsed = serde_json::from_str::<serde_json::Value>(input).ok();
+                let parsed = serde_json::from_str::<serde_json::Value>(&input).ok();
                 let path = match tool.id.as_str() {
                     "Read" | "Edit" | "MultiEdit" | "Write" | "LS" => parsed
                         .as_ref()
@@ -67,7 +68,7 @@ impl ToolRuntime {
                 }
             }
             "WebFetch" | "WebSearch" => {
-                let parsed = serde_json::from_str::<serde_json::Value>(input).ok();
+                let parsed = serde_json::from_str::<serde_json::Value>(&input).ok();
                 let url = if tool.id == "WebFetch" {
                     parsed
                         .as_ref()

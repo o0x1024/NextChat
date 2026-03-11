@@ -1,195 +1,87 @@
-import { type ChangeEvent, type FormEvent, useMemo, useState } from "react";
+import { type ChangeEvent, type FormEvent, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type {
     AgentProfile,
-    AIProviderConfig,
     CreateAgentInput,
     SkillPack,
     SystemSettings,
     ToolManifest,
     UpdateAgentInput,
+    WorkGroup,
 } from "../../types";
+import { joinPolicyList, splitPolicyList } from "./agentPermissions";
+import { generateAgentProfiles } from "../../lib/tauri";
+import { AgentAiCreateModal } from "./AgentAiCreateModal";
+import { AgentBulkActionsBar } from "./AgentBulkActionsBar";
+import { AgentBulkAddToGroupModal } from "./AgentBulkAddToGroupModal";
+import { AgentBatchReviewModal } from "./AgentBatchReviewModal";
+import { AgentBulkEditModal, type AgentBulkEditDraft } from "./AgentBulkEditModal";
+import { AgentDeleteConfirmModal } from "./AgentDeleteConfirmModal";
+import { AgentManagementTable } from "./AgentManagementTable";
 import {
-    emptyMemoryPolicy,
-    emptyPermissionPolicy,
-    joinPolicyList,
-    splitPolicyList,
-} from "./agentPermissions";
-import { runtimeSupportedRigProviderTypes } from "../../constants/providers";
-import { generateAgentProfile } from "../../lib/tauri";
-
+    buildProviderAvailability,
+    type ProviderAvailability,
+    buildCreateForm,
+    emptyForm,
+    isBuiltinGroupOwner,
+    normalizeGeneratedAgentInput,
+    normalizeModelForm,
+    serializeAgentConfig,
+} from "./agentManagementUtils";
 interface AgentManagementProps {
     agents: AgentProfile[];
+    workGroups: WorkGroup[];
     skills: SkillPack[];
     tools: ToolManifest[];
     settings: SystemSettings;
     onCreateAgent: (input: CreateAgentInput) => Promise<void>;
     onUpdateAgent: (input: UpdateAgentInput) => Promise<void>;
     onDeleteAgent: (id: string) => Promise<void>;
+    onAddAgentToWorkGroup: (workGroupId: string, agentId: string) => Promise<void>;
 }
-
-const emptyForm: CreateAgentInput = {
-    name: "",
-    avatar: "AX",
-    role: "",
-    objective: "",
-    provider: "openai",
-    model: "gpt-4o",
-    temperature: 0.7,
-    skillIds: [],
-    toolIds: [],
-    maxParallelRuns: 2,
-    canSpawnSubtasks: true,
-    memoryPolicy: emptyMemoryPolicy,
-    permissionPolicy: emptyPermissionPolicy,
-};
-
-type ProviderAvailability = {
-    provider: AIProviderConfig;
-    available: boolean;
-    reason: "disabled" | "missingApiKey" | "unsupported" | "noModels" | null;
-};
-
-function requiresApiKey(provider: AIProviderConfig): boolean {
-    return provider.rigProviderType !== "Ollama";
-}
-
-function isProviderAvailable(provider: AIProviderConfig): boolean {
-    return (
-        provider.enabled &&
-        runtimeSupportedRigProviderTypes.has(provider.rigProviderType) &&
-        provider.models.length > 0 &&
-        (!requiresApiKey(provider) || provider.apiKey.trim().length > 0)
-    );
-}
-
-function normalizeProviderValue(value: string | null | undefined): string {
-    return typeof value === "string" ? value.trim().toLowerCase() : "";
-}
-
-function findProviderMatch(providers: AIProviderConfig[], rawProvider: string): AIProviderConfig | undefined {
-    const normalizedProvider = normalizeProviderValue(rawProvider);
-    if (!normalizedProvider) {
-        return undefined;
-    }
-
-    return providers.find((provider) => {
-        const candidates = [provider.id, provider.name, provider.rigProviderType];
-        return candidates.some((candidate) => normalizeProviderValue(candidate) === normalizedProvider);
-    });
-}
-
-function resolveProviderModel(
-    provider: AIProviderConfig | undefined,
-    rawModel: string | null | undefined,
-    globalDefaultModel: string
-): string {
-    const model = typeof rawModel === "string" ? rawModel.trim() : "";
-    const normalizedGlobalDefaultModel = globalDefaultModel.trim();
-
-    if (!provider) {
-        return model || normalizedGlobalDefaultModel;
-    }
-
-    if (provider.models.includes(model)) {
-        return model;
-    }
-
-    if (!model || normalizeProviderValue(model) === "simulation") {
-        if (
-            normalizedGlobalDefaultModel &&
-            provider.models.includes(normalizedGlobalDefaultModel)
-        ) {
-            return normalizedGlobalDefaultModel;
-        }
-        return provider.defaultModel || provider.models[0] || normalizedGlobalDefaultModel || "";
-    }
-
-    return model;
-}
-
-function normalizeModelForm(
-    settings: SystemSettings,
-    overrides: Partial<Pick<CreateAgentInput, "provider" | "model" | "temperature">> = {}
-): Pick<CreateAgentInput, "provider" | "model" | "temperature"> {
-    const globalDefaultProvider = settings.globalConfig?.defaultLLMProvider ?? "";
-    const globalDefaultModel = settings.globalConfig?.defaultLLMModel ?? "";
-    const availableProviders = settings.providers.filter(isProviderAvailable);
-    const preferredProvider =
-        findProviderMatch(settings.providers, overrides.provider ?? globalDefaultProvider) ??
-        settings.providers.find((provider) => normalizeProviderValue(provider.id) === normalizeProviderValue(globalDefaultProvider));
-
-    const selectedProvider = [preferredProvider, ...availableProviders].find(
-        (provider): provider is AIProviderConfig => Boolean(provider && isProviderAvailable(provider))
-    );
-
-    const fallbackProvider = selectedProvider ?? availableProviders[0];
-    const provider = fallbackProvider?.id ?? "";
-    const model = resolveProviderModel(
-        fallbackProvider,
-        overrides.model ?? "",
-        globalDefaultModel
-    );
-    const temperature = overrides.temperature ?? fallbackProvider?.temperature ?? emptyForm.temperature;
-
-    return { provider, model, temperature };
-}
-
-function buildCreateForm(settings: SystemSettings): CreateAgentInput {
-    const modelForm = normalizeModelForm(settings);
-
-    return {
-        ...emptyForm,
-        ...modelForm,
-    };
-}
-
-function isBuiltinGroupOwner(agent: AgentProfile): boolean {
-    const role = agent.role.trim().toLowerCase();
-    return role === "group owner" || agent.name === "群主";
-}
-
 export function AgentManagement({
     agents,
+    workGroups,
     skills,
     tools,
     settings,
     onCreateAgent,
     onUpdateAgent,
     onDeleteAgent,
+    onAddAgentToWorkGroup,
 }: AgentManagementProps) {
     const { t } = useTranslation();
     const [modalOpen, setModalOpen] = useState(false);
-    const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+    const [confirmDeleteIds, setConfirmDeleteIds] = useState<string[]>([]);
     const [editingAgent, setEditingAgent] = useState<AgentProfile | null>(null);
     const [form, setForm] = useState<CreateAgentInput>(emptyForm);
     const [search, setSearch] = useState("");
+    const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([]);
     const [creatingAiAgent, setCreatingAiAgent] = useState(false);
+    const [creatingReviewedAgents, setCreatingReviewedAgents] = useState(false);
     const [aiCreateModalOpen, setAiCreateModalOpen] = useState(false);
     const [aiPrompt, setAiPrompt] = useState("");
     const [aiPromptError, setAiPromptError] = useState<string | null>(null);
-
+    const [generatedAgentDrafts, setGeneratedAgentDrafts] = useState<CreateAgentInput[]>([]);
+    const [batchReviewModalOpen, setBatchReviewModalOpen] = useState(false);
+    const [bulkActionPending, setBulkActionPending] = useState(false);
+    const [bulkAddModalOpen, setBulkAddModalOpen] = useState(false);
+    const [bulkEditModalOpen, setBulkEditModalOpen] = useState(false);
+    const [bulkAddWorkGroupId, setBulkAddWorkGroupId] = useState("");
+    const [bulkEditDraft, setBulkEditDraft] = useState<AgentBulkEditDraft>({
+        applyModelPolicy: false,
+        provider: "",
+        model: "",
+        temperature: emptyForm.temperature,
+        applyPermissionPolicy: false,
+        allowToolIds: "",
+        denyToolIds: "",
+        requireApprovalToolIds: "",
+        allowFsRoots: "",
+        allowNetworkDomains: "",
+    });
     const providerAvailability = useMemo<ProviderAvailability[]>(
-        () =>
-            settings.providers.map((provider) => {
-                if (!provider.enabled) {
-                    return { provider, available: false, reason: "disabled" };
-                }
-
-                if (!runtimeSupportedRigProviderTypes.has(provider.rigProviderType)) {
-                    return { provider, available: false, reason: "unsupported" };
-                }
-
-                if (provider.models.length === 0) {
-                    return { provider, available: false, reason: "noModels" };
-                }
-
-                if (requiresApiKey(provider) && provider.apiKey.trim().length === 0) {
-                    return { provider, available: false, reason: "missingApiKey" };
-                }
-
-                return { provider, available: true, reason: null };
-            }),
+        () => settings.providers.map(buildProviderAvailability),
         [settings.providers]
     );
 
@@ -197,7 +89,6 @@ export function AgentManagement({
         () => new Map(providerAvailability.map((item) => [item.provider.id, item])),
         [providerAvailability]
     );
-
     const selectedProviderInfo = providerAvailabilityById.get(form.provider) ?? null;
     const selectedProvider = selectedProviderInfo?.provider ?? null;
     const selectedProviderModels = selectedProvider?.models ?? [];
@@ -220,23 +111,56 @@ export function AgentManagement({
                 a.objective.toLowerCase().includes(q)
         );
     }, [agents, search]);
-    const confirmDeleteAgent = useMemo(
-        () => agents.find((agent) => agent.id === confirmDeleteId) ?? null,
-        [agents, confirmDeleteId]
+    const filteredSelectableAgentIds = useMemo(
+        () => filteredAgents.filter((agent) => !isBuiltinGroupOwner(agent)).map((agent) => agent.id),
+        [filteredAgents]
     );
-
+    const allFilteredSelected = filteredSelectableAgentIds.length > 0 &&
+        filteredSelectableAgentIds.every((agentId) => selectedAgentIds.includes(agentId));
+    const confirmDeleteAgents = useMemo(
+        () => agents.filter((agent) => confirmDeleteIds.includes(agent.id)),
+        [agents, confirmDeleteIds]
+    );
+    const selectedAgents = useMemo(
+        () => agents.filter((agent) => selectedAgentIds.includes(agent.id)),
+        [agents, selectedAgentIds]
+    );
+    const selectedBulkEditProvider = useMemo(
+        () =>
+            settings.providers.find((provider) => provider.id === bulkEditDraft.provider) ?? null,
+        [settings.providers, bulkEditDraft.provider]
+    );
+    useEffect(() => {
+        setSelectedAgentIds((current) =>
+            current.filter((agentId) => {
+                const agent = agents.find((item) => item.id === agentId);
+                return Boolean(agent && !isBuiltinGroupOwner(agent));
+            })
+        );
+        setConfirmDeleteIds((current) =>
+            current.filter((agentId) => {
+                const agent = agents.find((item) => item.id === agentId);
+                return Boolean(agent && !isBuiltinGroupOwner(agent));
+            })
+        );
+    }, [agents]);
     function openCreate() {
         setEditingAgent(null);
         setForm(buildCreateForm(settings));
         setModalOpen(true);
     }
-
     function openCreateWithAI() {
         setAiPrompt("");
         setAiPromptError(null);
         setAiCreateModalOpen(true);
     }
-
+    function closeBatchReviewModal() {
+        if (creatingReviewedAgents) {
+            return;
+        }
+        setBatchReviewModalOpen(false);
+        setGeneratedAgentDrafts([]);
+    }
     async function handleGenerateAiAgent() {
         const prompt = aiPrompt.trim();
         if (!prompt) {
@@ -246,19 +170,22 @@ export function AgentManagement({
         setCreatingAiAgent(true);
         setAiPromptError(null);
         try {
-            const generated = await generateAgentProfile(prompt);
-            const normalizedModel = normalizeModelForm(settings, {
-                provider: generated.provider,
-                model: generated.model,
-                temperature: generated.temperature,
-            });
-            setEditingAgent(null);
-            setForm({
-                ...generated,
-                ...normalizedModel,
-            });
+            const generatedProfiles = await generateAgentProfiles(prompt);
+            if (generatedProfiles.length === 0) {
+                throw new Error("empty result");
+            }
+            if (generatedProfiles.length === 1) {
+                setEditingAgent(null);
+                setForm(normalizeGeneratedAgentInput(settings, generatedProfiles[0]));
+                setAiCreateModalOpen(false);
+                setModalOpen(true);
+                return;
+            }
+            setGeneratedAgentDrafts(
+                generatedProfiles.map((generated) => normalizeGeneratedAgentInput(settings, generated))
+            );
+            setBatchReviewModalOpen(true);
             setAiCreateModalOpen(false);
-            setModalOpen(true);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             setAiPromptError(t("aiCreateAgentFailed", { message }));
@@ -266,7 +193,163 @@ export function AgentManagement({
             setCreatingAiAgent(false);
         }
     }
+    function updateGeneratedAgentDraft(index: number, nextDraft: CreateAgentInput) {
+        setGeneratedAgentDrafts((current) =>
+            current.map((draft, draftIndex) => (draftIndex === index ? nextDraft : draft))
+        );
+    }
+    function removeGeneratedAgentDraft(index: number) {
+        setGeneratedAgentDrafts((current) => current.filter((_, draftIndex) => draftIndex !== index));
+    }
+    function updateGeneratedAgentProvider(index: number, providerId: string) {
+        setGeneratedAgentDrafts((current) =>
+            current.map((draft, draftIndex) => {
+                if (draftIndex !== index) {
+                    return draft;
+                }
+                return {
+                    ...draft,
+                    ...normalizeModelForm(settings, {
+                        provider: providerId,
+                        temperature: draft.temperature,
+                    }),
+                };
+            })
+        );
+    }
+    async function handleCreateReviewedAgents() {
+        const drafts = generatedAgentDrafts.filter(
+            (draft) =>
+                draft.name.trim() &&
+                draft.role.trim() &&
+                draft.provider.trim() &&
+                draft.model.trim()
+        );
+        if (drafts.length === 0) {
+            return;
+        }
+        setCreatingReviewedAgents(true);
+        try {
+            for (const draft of drafts) {
+                await onCreateAgent(draft);
+            }
+            setBatchReviewModalOpen(false);
+            setGeneratedAgentDrafts([]);
+        } finally {
+            setCreatingReviewedAgents(false);
+        }
+    }
+    function openBulkAddToGroup() {
+        setBulkAddWorkGroupId("");
+        setBulkAddModalOpen(true);
+    }
 
+    function openBulkEdit() {
+        const modelForm = normalizeModelForm(settings);
+        setBulkEditDraft({
+            applyModelPolicy: false,
+            provider: modelForm.provider,
+            model: modelForm.model,
+            temperature: modelForm.temperature,
+            applyPermissionPolicy: false,
+            allowToolIds: "",
+            denyToolIds: "",
+            requireApprovalToolIds: "",
+            allowFsRoots: "",
+            allowNetworkDomains: "",
+        });
+        setBulkEditModalOpen(true);
+    }
+
+    async function handleBulkAddToGroup() {
+        if (!bulkAddWorkGroupId) {
+            return;
+        }
+        const workGroup = workGroups.find((item) => item.id === bulkAddWorkGroupId);
+        if (!workGroup) {
+            return;
+        }
+        setBulkActionPending(true);
+        try {
+            for (const agent of selectedAgents) {
+                if (!workGroup.memberAgentIds.includes(agent.id)) {
+                    await onAddAgentToWorkGroup(workGroup.id, agent.id);
+                }
+            }
+            setBulkAddModalOpen(false);
+            setBulkAddWorkGroupId("");
+        } finally {
+            setBulkActionPending(false);
+        }
+    }
+    async function handleBulkEditSubmit() {
+        if (!bulkEditDraft.applyModelPolicy && !bulkEditDraft.applyPermissionPolicy) {
+            return;
+        }
+        setBulkActionPending(true);
+        try {
+            for (const agent of selectedAgents) {
+                const modelPolicy = bulkEditDraft.applyModelPolicy
+                    ? normalizeModelForm(settings, {
+                          provider: bulkEditDraft.provider,
+                          model: bulkEditDraft.model,
+                          temperature: bulkEditDraft.temperature,
+                      })
+                    : {
+                          provider: agent.modelPolicy.provider,
+                          model: agent.modelPolicy.model,
+                          temperature: agent.modelPolicy.temperature,
+                      };
+                const permissionPolicy = bulkEditDraft.applyPermissionPolicy
+                    ? {
+                          allowToolIds: splitPolicyList(bulkEditDraft.allowToolIds),
+                          denyToolIds: splitPolicyList(bulkEditDraft.denyToolIds),
+                          requireApprovalToolIds: splitPolicyList(bulkEditDraft.requireApprovalToolIds),
+                          allowFsRoots: splitPolicyList(bulkEditDraft.allowFsRoots),
+                          allowNetworkDomains: splitPolicyList(bulkEditDraft.allowNetworkDomains),
+                      }
+                    : agent.permissionPolicy;
+
+                await onUpdateAgent({
+                    id: agent.id,
+                    name: agent.name,
+                    avatar: agent.avatar,
+                    role: agent.role,
+                    objective: agent.objective,
+                    provider: modelPolicy.provider,
+                    model: modelPolicy.model,
+                    temperature: modelPolicy.temperature,
+                    skillIds: [...agent.skillIds],
+                    toolIds: [...agent.toolIds],
+                    maxParallelRuns: agent.maxParallelRuns,
+                    canSpawnSubtasks: agent.canSpawnSubtasks,
+                    memoryPolicy: {
+                        readScope: [...agent.memoryPolicy.readScope],
+                        writeScope: [...agent.memoryPolicy.writeScope],
+                        pinnedMemoryIds: [...agent.memoryPolicy.pinnedMemoryIds],
+                    },
+                    permissionPolicy,
+                });
+            }
+            setBulkEditModalOpen(false);
+        } finally {
+            setBulkActionPending(false);
+        }
+    }
+    async function handleCopySelectedConfig() {
+        const payload = JSON.stringify(selectedAgents.map(serializeAgentConfig), null, 2);
+        await navigator.clipboard.writeText(payload);
+    }
+    function handleExportSelectedConfig() {
+        const payload = JSON.stringify(selectedAgents.map(serializeAgentConfig), null, 2);
+        const blob = new Blob([payload], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `nextchat-agents-${new Date().toISOString().slice(0, 10)}.json`;
+        link.click();
+        URL.revokeObjectURL(url);
+    }
     function openEdit(agent: AgentProfile) {
         setEditingAgent(agent);
         const modelForm = normalizeModelForm(settings, {
@@ -315,17 +398,46 @@ export function AgentManagement({
         setForm(emptyForm);
     }
 
-    async function handleDelete() {
-        if (confirmDeleteId) {
-            if (confirmDeleteAgent && isBuiltinGroupOwner(confirmDeleteAgent)) {
-                setConfirmDeleteId(null);
-                return;
+    function requestDelete(agentIds: string[]) {
+        const nextIds = agentIds.filter((agentId, index, array) => {
+            if (array.indexOf(agentId) !== index) {
+                return false;
             }
-            await onDeleteAgent(confirmDeleteId);
-            setConfirmDeleteId(null);
+            const agent = agents.find((item) => item.id === agentId);
+            return Boolean(agent && !isBuiltinGroupOwner(agent));
+        });
+        if (nextIds.length > 0) {
+            setConfirmDeleteIds(nextIds);
         }
     }
 
+    async function handleDelete() {
+        if (confirmDeleteIds.length === 0) {
+            return;
+        }
+        for (const agentId of confirmDeleteIds) {
+            await onDeleteAgent(agentId);
+        }
+        setSelectedAgentIds((current) => current.filter((agentId) => !confirmDeleteIds.includes(agentId)));
+        setConfirmDeleteIds([]);
+    }
+
+    function toggleAgentSelection(agentId: string) {
+        setSelectedAgentIds((current) =>
+            current.includes(agentId)
+                ? current.filter((item) => item !== agentId)
+                : [...current, agentId]
+        );
+    }
+
+    function toggleSelectAllFilteredAgents() {
+        setSelectedAgentIds((current) => {
+            if (allFilteredSelected) {
+                return current.filter((agentId) => !filteredSelectableAgentIds.includes(agentId));
+            }
+            return Array.from(new Set([...current, ...filteredSelectableAgentIds]));
+        });
+    }
 
     function toggleArrayItem(arr: string[], item: string): string[] {
         return arr.includes(item) ? arr.filter((i) => i !== item) : [...arr, item];
@@ -372,13 +484,21 @@ export function AgentManagement({
 
     return (
         <div className="flex h-full flex-col animate-in fade-in duration-500">
-            {/* Header Area */}
             <div className="flex items-center justify-between border-b border-base-content/10 px-6 py-5 bg-base-100/50 backdrop-blur-md sticky top-0 z-10">
                 <div>
                     <h1 className="text-xl font-bold tracking-tight">{t("agentManagement")}</h1>
                     <p className="text-sm text-base-content/50 mt-1 font-medium">{t("agentManagementDesc")}</p>
                 </div>
                 <div className="flex items-center gap-3">
+                    <AgentBulkActionsBar
+                        selectedCount={selectedAgentIds.length}
+                        onClearSelection={() => setSelectedAgentIds([])}
+                        onDelete={() => requestDelete(selectedAgentIds)}
+                        onAddToGroup={openBulkAddToGroup}
+                        onBulkEdit={openBulkEdit}
+                        onCopyConfig={() => void handleCopySelectedConfig()}
+                        onExportConfig={handleExportSelectedConfig}
+                    />
                     <div className="relative group">
                         <i className="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-base-content/30 group-focus-within:text-primary transition-colors text-xs" />
                         <input
@@ -401,156 +521,43 @@ export function AgentManagement({
                     </button>
                 </div>
             </div>
-
-            {/* Content Body: Table */}
             <div className="flex-1 overflow-auto px-6 py-6 overflow-x-hidden">
-                <div className="bg-base-100 rounded-xl border border-base-content/10 shadow-sm overflow-hidden">
-                    <table className="table w-full border-separate border-spacing-0">
-                        <thead>
-                            <tr className="bg-base-200/50">
-                                <th className="bg-transparent border-b border-base-content/10 py-4 font-semibold text-xs opacity-60">{t("avatar")}</th>
-                                <th className="bg-transparent border-b border-base-content/10 py-4 font-semibold text-xs opacity-60">{t("agentName")}</th>
-                                <th className="bg-transparent border-b border-base-content/10 py-4 font-semibold text-xs opacity-60">{t("role")}</th>
-                                <th className="bg-transparent border-b border-base-content/10 py-4 font-semibold text-xs opacity-60">{t("model")}</th>
-                                <th className="bg-transparent border-b border-base-content/10 py-4 font-semibold text-xs opacity-60">{t("tools")}</th>
-                                <th className="bg-transparent border-b border-base-content/10 py-4 font-semibold text-xs opacity-60">{t("skills")}</th>
-                                <th className="bg-transparent border-b border-base-content/10 py-4 font-semibold text-xs opacity-60 text-right pr-6">{t("actions")}</th>
-                            </tr>
-                        </thead>
-                        <tbody className="divide-y divide-base-content/5">
-                            {filteredAgents.map((agent) => (
-                                <tr key={agent.id} className="group hover:bg-base-200/30 transition-colors">
-                                    <td className="py-4">
-                                        <div className="grid h-10 w-10 place-items-center rounded-xl bg-primary/10 text-primary text-xs font-bold ring-1 ring-primary/20 ring-inset">
-                                            {agent.avatar}
-                                        </div>
-                                    </td>
-                                    <td className="py-4">
-                                        <div className="font-semibold text-sm">{agent.name}</div>
-                                        <div className="text-[10px] opacity-40 font-mono mt-0.5 truncate max-w-24">ID: {agent.id.slice(0, 8)}...</div>
-                                    </td>
-                                    <td className="py-4">
-                                        <span className="badge badge-outline badge-sm text-[10px] font-bold py-2 px-2.5 opacity-80 uppercase tracking-widest">{agent.role}</span>
-                                    </td>
-                                    <td className="py-4">
-                                        <div className="flex items-center gap-1.5">
-                                            <i className="fas fa-microchip text-[10px] opacity-40" />
-                                            <span className="text-xs font-medium opacity-80">{agent.modelPolicy.model}</span>
-                                        </div>
-                                        <div className="mt-1">
-                                            <span
-                                                className={`badge badge-xs border-none ${providerAvailabilityById.get(agent.modelPolicy.provider)?.available
-                                                    ? "bg-success/10 text-success"
-                                                    : "bg-warning/10 text-warning"
-                                                    }`}
-                                                title={providerReasonHint(providerAvailabilityById.get(agent.modelPolicy.provider)?.reason ?? null)}
-                                            >
-                                                {providerRuntimeLabel(agent.modelPolicy.provider)}
-                                            </span>
-                                        </div>
-                                    </td>
-                                    <td className="py-4 text-center">
-                                        <div className="badge badge-primary/10 text-primary border-none font-bold text-[10px] px-2.5 py-2">{agent.toolIds.length}</div>
-                                    </td>
-                                    <td className="py-4 text-center">
-                                        <div className="badge badge-secondary/10 text-secondary border-none font-bold text-[10px] px-2.5 py-2">{agent.skillIds.length}</div>
-                                    </td>
-                                    <td className="py-4 text-right pr-6">
-                                        <div className="flex items-center justify-end gap-1.5">
-                                            <button
-                                                className="btn btn-ghost btn-xs w-8 h-8 rounded-lg hover:bg-primary/10 hover:text-primary transition-all p-0"
-                                                onClick={() => openEdit(agent)}
-                                                title={t("edit")}
-                                            >
-                                                <i className="fas fa-pen text-[10px]" />
-                                            </button>
-                                            <button
-                                                className={`btn btn-ghost btn-xs h-8 w-8 rounded-lg p-0 transition-all ${
-                                                    isBuiltinGroupOwner(agent)
-                                                        ? "cursor-not-allowed text-base-content/30"
-                                                        : "hover:bg-error/10 hover:text-error"
-                                                    }`}
-                                                onClick={() => {
-                                                    if (!isBuiltinGroupOwner(agent)) {
-                                                        setConfirmDeleteId(agent.id);
-                                                    }
-                                                }}
-                                                title={isBuiltinGroupOwner(agent) ? t("groupOwnerLocked") : t("delete")}
-                                                disabled={isBuiltinGroupOwner(agent)}
-                                            >
-                                                <i className="fas fa-trash-alt text-[10px]" />
-                                            </button>
-                                        </div>
-                                    </td>
-                                </tr>
-                            ))}
-                            {filteredAgents.length === 0 && (
-                                <tr>
-                                    <td colSpan={7} className="text-center text-base-content/40 py-16 bg-base-100">
-                                        <div className="flex flex-col items-center gap-3">
-                                            <i className="fas fa-robot text-4xl opacity-10" />
-                                            <span className="text-sm font-medium">{t("noAgentsYet")}</span>
-                                        </div>
-                                    </td>
-                                </tr>
-                            )}
-                        </tbody>
-                    </table>
-                </div>
+                <AgentManagementTable
+                    agents={filteredAgents}
+                    selectedAgentIds={selectedAgentIds}
+                    allVisibleSelected={allFilteredSelected}
+                    onToggleSelectAll={toggleSelectAllFilteredAgents}
+                    onToggleSelect={toggleAgentSelection}
+                    onEdit={openEdit}
+                    onDelete={(agent) => requestDelete([agent.id])}
+                    isBuiltinGroupOwner={isBuiltinGroupOwner}
+                    providerInfoById={providerAvailabilityById}
+                    providerReasonHint={providerReasonHint}
+                    providerRuntimeLabel={providerRuntimeLabel}
+                />
             </div>
-
-            {/* AI Create Modal */}
-            {aiCreateModalOpen && (
-                <dialog
-                    className="modal modal-open bg-base-300/40 backdrop-blur-md"
-                    onClick={() => {
-                        if (!creatingAiAgent) {
-                            setAiCreateModalOpen(false);
-                        }
-                    }}
-                >
-                    <div
-                        className="modal-box max-w-xl rounded-2xl border border-base-content/10 shadow-2xl"
-                        onClick={(e) => e.stopPropagation()}
-                    >
-                        <h3 className="text-lg font-bold">{t("aiCreateAgent")}</h3>
-                        <p className="mt-2 text-sm text-base-content/60">{t("aiCreateAgentPrompt")}</p>
-                        <textarea
-                            rows={6}
-                            className="textarea textarea-bordered mt-4 w-full bg-base-200/50"
-                            placeholder={t("aiCreateAgentInputPlaceholder")}
-                            value={aiPrompt}
-                            onChange={(e: ChangeEvent<HTMLTextAreaElement>) => setAiPrompt(e.target.value)}
-                        />
-                        {aiPromptError && (
-                            <div className="mt-3 rounded-lg border border-error/20 bg-error/10 px-3 py-2 text-xs text-error">
-                                {aiPromptError}
-                            </div>
-                        )}
-                        <div className="modal-action">
-                            <button
-                                className="btn btn-ghost"
-                                type="button"
-                                disabled={creatingAiAgent}
-                                onClick={() => setAiCreateModalOpen(false)}
-                            >
-                                {t("cancel")}
-                            </button>
-                            <button
-                                className="btn btn-secondary"
-                                type="button"
-                                disabled={creatingAiAgent}
-                                onClick={() => void handleGenerateAiAgent()}
-                            >
-                                <i className={`fas ${creatingAiAgent ? "fa-spinner fa-spin" : "fa-wand-magic-sparkles"} text-xs`} />
-                                {creatingAiAgent ? t("aiCreatingAgent") : t("aiCreateAgent")}
-                            </button>
-                        </div>
-                    </div>
-                </dialog>
-            )}
-
-            {/* Create/Edit Modal */}
+            <AgentAiCreateModal
+                open={aiCreateModalOpen}
+                prompt={aiPrompt}
+                error={aiPromptError}
+                loading={creatingAiAgent}
+                onClose={() => setAiCreateModalOpen(false)}
+                onChangePrompt={setAiPrompt}
+                onSubmit={() => void handleGenerateAiAgent()}
+            />
+            <AgentBatchReviewModal
+                drafts={generatedAgentDrafts}
+                open={batchReviewModalOpen}
+                submitting={creatingReviewedAgents}
+                providerAvailability={providerAvailability}
+                providerAvailabilityById={providerAvailabilityById}
+                onClose={closeBatchReviewModal}
+                onChange={updateGeneratedAgentDraft}
+                onRemove={removeGeneratedAgentDraft}
+                onSubmit={handleCreateReviewedAgents}
+                onProviderChange={updateGeneratedAgentProvider}
+                providerReasonHint={providerReasonHint}
+            />
             {modalOpen && (
                 <dialog className="modal modal-open bg-base-300/40 backdrop-blur-md" onClick={() => setModalOpen(false)}>
                     <div
@@ -570,7 +577,6 @@ export function AgentManagement({
                         </div>
 
                         <form className="p-6 space-y-6" onSubmit={handleSubmit}>
-                            {/* Basic Info Section */}
                             <div className="space-y-4">
                                 <div className="grid gap-4 md:grid-cols-2">
                                     <div className="form-control">
@@ -961,26 +967,34 @@ export function AgentManagement({
                 </dialog>
             )}
 
-            {/* Confirm Delete Modal */}
-            {confirmDeleteId && (
-                <dialog className="modal modal-open animate-in zoom-in duration-200" onClick={() => setConfirmDeleteId(null)}>
-                    <div className="modal-box max-w-sm rounded-2xl border border-error/20" onClick={(e) => e.stopPropagation()}>
-                        <div className="flex flex-col items-center text-center gap-4 py-4">
-                            <div className="w-16 h-16 rounded-full bg-error/10 flex items-center justify-center mb-2">
-                                <i className="fas fa-exclamation-triangle text-error text-2xl" />
-                            </div>
-                            <h3 className="text-xl font-bold">{t("areYouSure")}</h3>
-                            <p className="text-base-content/60 text-sm">
-                                {t("deleteAgentConfirmHint")}
-                            </p>
-                            <div className="flex gap-3 w-full mt-4">
-                                <button className="btn btn-ghost flex-1" onClick={() => setConfirmDeleteId(null)}>{t("cancel")}</button>
-                                <button className="btn btn-error flex-1" onClick={handleDelete}>{t("delete")}</button>
-                            </div>
-                        </div>
-                    </div>
-                </dialog>
-            )}
+            <AgentDeleteConfirmModal
+                open={confirmDeleteIds.length > 0}
+                agents={confirmDeleteAgents}
+                onClose={() => setConfirmDeleteIds([])}
+                onConfirm={() => void handleDelete()}
+            />
+            <AgentBulkAddToGroupModal
+                open={bulkAddModalOpen}
+                submitting={bulkActionPending}
+                selectedCount={selectedAgentIds.length}
+                workGroups={workGroups}
+                selectedWorkGroupId={bulkAddWorkGroupId}
+                onClose={() => !bulkActionPending && setBulkAddModalOpen(false)}
+                onSelectWorkGroup={setBulkAddWorkGroupId}
+                onSubmit={() => void handleBulkAddToGroup()}
+            />
+            <AgentBulkEditModal
+                open={bulkEditModalOpen}
+                submitting={bulkActionPending}
+                selectedCount={selectedAgentIds.length}
+                draft={bulkEditDraft}
+                providerAvailability={providerAvailability}
+                selectedProvider={selectedBulkEditProvider}
+                onClose={() => !bulkActionPending && setBulkEditModalOpen(false)}
+                onChange={setBulkEditDraft}
+                onSubmit={() => void handleBulkEditSubmit()}
+                providerReasonHint={providerReasonHint}
+            />
         </div>
     );
 }

@@ -411,6 +411,8 @@ function describeTaskStatus({
       return t("taskStatusReason.waiting_children", { count: childTaskCount });
     case "waiting_approval":
       return t("taskStatusReason.waiting_approval", { count: pendingApprovalCount || 1 });
+    case "waiting_user_input":
+      return t("taskStatusReason.waiting_user_input");
     case "in_progress":
       return runningToolNames.length > 0
         ? t("taskStatusReason.in_progress_tools", { names: runningToolNames.join(", ") })
