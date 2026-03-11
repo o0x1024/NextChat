@@ -4,9 +4,6 @@ use reqwest::Url;
 use super::ToolRuntime;
 use crate::core::domain::{AgentProfile, ToolManifest};
 use crate::core::permissions::{base_tool_authorization, ToolAuthorizationDecision};
-use crate::core::skill_policy::{
-    selected_skills_for_agent, tool_exposure_reason, ToolExposureReason,
-};
 
 impl ToolRuntime {
     pub fn authorize_tool_call(
@@ -18,16 +15,6 @@ impl ToolRuntime {
     ) -> Result<ToolAuthorizationDecision> {
         let input = self.normalize_compat_input(tool, input);
         let execution_root = self.resolve_execution_root(working_directory)?;
-        let selected_skills = selected_skills_for_agent(agent, &self.all_skills());
-        if matches!(
-            tool_exposure_reason(agent, tool, &selected_skills),
-            ToolExposureReason::BlockedBySkill
-        ) {
-            return Ok(ToolAuthorizationDecision::denied(format!(
-                "agent skills do not allow tool category '{}'",
-                tool.category
-            )));
-        }
 
         let mut decision = base_tool_authorization(agent, tool);
         if !decision.allowed {

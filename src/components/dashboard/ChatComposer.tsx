@@ -5,8 +5,9 @@ import type {
   RefObject,
 } from "react";
 import { useTranslation } from "react-i18next";
-import type { AgentProfile } from "../../types";
+import type { AgentProfile, PendingUserQuestion } from "../../types";
 import type { MentionDraft } from "./mentions";
+import { PendingUserQuestionPanel } from "./PendingUserQuestionPanel";
 
 interface ChatComposerProps {
   value: string;
@@ -15,6 +16,8 @@ interface ChatComposerProps {
   mentionOptions: AgentProfile[];
   mentionIndex: number;
   mentionError: string | null;
+  pendingQuestion: PendingUserQuestion | null;
+  pendingQuestionAgentName: string | null;
   currentApprovalsCount: number;
   activeTasksCount: number;
   stoppableTasksCount: number;
@@ -25,6 +28,7 @@ interface ChatComposerProps {
   onSetMentionIndex: (index: number | ((current: number) => number)) => void;
   onApplyMention: (agent: AgentProfile) => void;
   onOpenMentionPicker: () => void;
+  onAnswerPendingQuestion: (answer: string) => void;
   onJumpToApprovals: () => void;
   onJumpToTaskBoard: () => void;
   onStopExecution: () => void;
@@ -38,6 +42,8 @@ export function ChatComposer({
   mentionOptions,
   mentionIndex,
   mentionError,
+  pendingQuestion,
+  pendingQuestionAgentName,
   currentApprovalsCount,
   activeTasksCount,
   stoppableTasksCount,
@@ -48,12 +54,16 @@ export function ChatComposer({
   onSetMentionIndex,
   onApplyMention,
   onOpenMentionPicker,
+  onAnswerPendingQuestion,
   onJumpToApprovals,
   onJumpToTaskBoard,
   onStopExecution,
   onClearHistory,
 }: ChatComposerProps) {
   const { t } = useTranslation();
+  const inputLocked = Boolean(
+    pendingQuestion && !pendingQuestion.allowFreeForm && pendingQuestion.options.length > 0,
+  );
 
   function handleKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
     if (mentionDraft && mentionOptions.length > 0) {
@@ -85,7 +95,7 @@ export function ChatComposer({
 
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      if (value.trim() && !sendingMessage) {
+      if (value.trim() && !sendingMessage && !inputLocked) {
         event.currentTarget.form?.requestSubmit();
       }
     }
@@ -96,20 +106,28 @@ export function ChatComposer({
       <form
         className="flex flex-col rounded-2xl border border-primary/20 bg-base-100 p-1 pt-2 shadow-sm transition-all focus-within:ring-2 focus-within:ring-primary/10"
         onSubmit={(event) => {
-          if (value.trim() && !sendingMessage) {
+          if (value.trim() && !sendingMessage && !inputLocked) {
             onSubmit(event);
           } else {
             event.preventDefault();
           }
         }}
       >
+        {pendingQuestion ? (
+          <PendingUserQuestionPanel
+            question={pendingQuestion}
+            agentName={pendingQuestionAgentName}
+            sendingMessage={sendingMessage}
+            onSelectOption={onAnswerPendingQuestion}
+          />
+        ) : null}
         <textarea
           ref={textareaRef as RefObject<HTMLTextAreaElement>}
           className="textarea textarea-ghost min-h-[0px] w-full resize-none bg-transparent text-sm leading-relaxed placeholder:opacity-30 focus:outline-none"
-          placeholder={t("taskPlaceholder")}
+          placeholder={inputLocked ? pendingQuestion?.question ?? t("taskPlaceholder") : t("taskPlaceholder")}
           rows={2}
           value={value}
-          disabled={sendingMessage}
+          disabled={sendingMessage || inputLocked}
           onChange={(event: ChangeEvent<HTMLTextAreaElement>) => onChangeValue(event.target.value)}
           onKeyDown={handleKeyDown}
         />
@@ -219,11 +237,11 @@ export function ChatComposer({
             <button
               type="submit"
               className={`btn btn-circle h-7 min-h-0 w-7 btn-xs border-none transition-all ${
-                value.trim()
+                value.trim() && !inputLocked
                   ? "bg-primary text-primary-content shadow-lg shadow-primary/20 hover:scale-110"
                   : "bg-base-200 text-base-content/20"
               }`}
-              disabled={!value.trim() || sendingMessage}
+              disabled={!value.trim() || sendingMessage || inputLocked}
             >
               <i className="fas fa-arrow-up text-[10px]" />
             </button>

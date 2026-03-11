@@ -22,6 +22,7 @@ mod tests;
 mod todo_fallback_tests;
 mod tool_stream;
 mod work_group_owner;
+mod workflow_resume;
 use crate::core::{
     agent_runtime::AgentRuntime,
     coordinator::Coordinator,
@@ -40,6 +41,16 @@ use serde::Serialize;
 use serde_json::json;
 use std::{collections::HashSet, future::Future, sync::Arc};
 use tauri::{AppHandle, Emitter, Runtime};
+
+fn normalize_agent_tool_ids(tool_ids: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for tool_id in std::iter::once("Skills".to_string()).chain(tool_ids.into_iter()) {
+        if !normalized.contains(&tool_id) {
+            normalized.push(tool_id);
+        }
+    }
+    normalized
+}
 
 #[derive(Clone)]
 pub struct AppService {
@@ -230,6 +241,7 @@ impl AppService {
     }
 
     pub fn create_agent_profile(&self, input: CreateAgentInput) -> Result<AgentProfile> {
+        let tool_ids = normalize_agent_tool_ids(input.tool_ids);
         let agent = AgentProfile {
             id: new_id(),
             name: input.name,
@@ -242,7 +254,7 @@ impl AppService {
                 temperature: input.temperature,
             },
             skill_ids: input.skill_ids,
-            tool_ids: input.tool_ids,
+            tool_ids,
             max_parallel_runs: input.max_parallel_runs,
             can_spawn_subtasks: input.can_spawn_subtasks,
             memory_policy: input.memory_policy,
@@ -620,6 +632,74 @@ impl AppService {
             self.reconcile_parent_task(app, &parent_id)?;
         }
         Ok(())
+    }
+
+    fn request_tool_approval<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        work_group_id: &str,
+        task: &mut TaskCard,
+        lease: Option<&mut Lease>,
+        agent: &AgentProfile,
+        tool: &crate::core::domain::ToolManifest,
+        input: &str,
+    ) -> Result<ToolRun> {
+        task.status = TaskStatus::WaitingApproval;
+        self.storage.update_task_card(task)?;
+        emit(app, "task:status-changed", task)?;
+
+        if let Some(lease) = lease {
+            if lease.state != LeaseState::Paused {
+                lease.state = LeaseState::Paused;
+                lease.preempt_requested_at = None;
+                self.storage.update_lease(lease)?;
+            }
+        }
+
+        let tool_run = ToolRun {
+            id: new_id(),
+            tool_id: tool.id.clone(),
+            task_card_id: task.id.clone(),
+            agent_id: agent.id.clone(),
+            state: ToolRunState::PendingApproval,
+            approval_required: true,
+            started_at: None,
+            finished_at: None,
+            result_ref: Some(input.to_string()),
+        };
+        self.storage.insert_tool_run(&tool_run)?;
+
+        let mut approval_message = ConversationMessage {
+            id: new_id(),
+            conversation_id: work_group_id.into(),
+            work_group_id: work_group_id.into(),
+            sender_kind: SenderKind::System,
+            sender_id: "coordinator".into(),
+            sender_name: "Coordinator".into(),
+            kind: MessageKind::Approval,
+            visibility: Visibility::Main,
+            content: format!("Approval required for {} before execution.", tool.name),
+            mentions: vec![agent.id.clone()],
+            task_card_id: Some(task.id.clone()),
+            execution_mode: None,
+            created_at: now(),
+        };
+        self.assign_group_owner_sender(&mut approval_message)?;
+        self.storage.insert_message(&approval_message)?;
+        emit(app, "chat:message-created", &approval_message)?;
+        emit(app, "approval:requested", &tool_run)?;
+        self.record_audit(
+            "tool_run.approval_requested",
+            "tool_run",
+            &tool_run.id,
+            json!({
+                "taskCardId": task.id.clone(),
+                "agentId": agent.id.clone(),
+                "toolId": tool.id.clone(),
+            }),
+        )?;
+
+        Ok(tool_run)
     }
 
     pub fn approve_tool_run<R: Runtime>(

@@ -453,27 +453,28 @@ impl AppService {
                 )?;
                 self.storage.insert_message(&approval_message)?;
                 emit(&app, "chat:message-created", &approval_message)?;
-                self.storage
-                    .insert_pending_user_question(&PendingUserQuestion {
-                        id: new_id(),
-                        work_group_id: work_group.id.clone(),
-                        task_card_id: task.id.clone(),
-                        agent_id: owner.id.clone(),
-                        tool_run_id: None,
-                        question: question.clone(),
-                        options: if options.is_empty() {
-                            vec!["批准".into(), "拒绝".into()]
-                        } else {
-                            options.clone()
-                        },
-                        context: context.clone(),
-                        allow_free_form: allow_free_form.unwrap_or(false),
-                        asked_message_id: approval_message.id.clone(),
-                        answer_message_id: None,
-                        status: PendingUserQuestionStatus::Pending,
-                        created_at: now(),
-                        answered_at: None,
-                    })?;
+                let pending_question = PendingUserQuestion {
+                    id: new_id(),
+                    work_group_id: work_group.id.clone(),
+                    task_card_id: task.id.clone(),
+                    agent_id: owner.id.clone(),
+                    tool_run_id: None,
+                    question: question.clone(),
+                    options: if options.is_empty() {
+                        vec!["批准".into(), "拒绝".into()]
+                    } else {
+                        options.clone()
+                    },
+                    context: context.clone(),
+                    allow_free_form: allow_free_form.unwrap_or(false),
+                    asked_message_id: approval_message.id.clone(),
+                    answer_message_id: None,
+                    status: PendingUserQuestionStatus::Pending,
+                    created_at: now(),
+                    answered_at: None,
+                };
+                self.storage.insert_pending_user_question(&pending_question)?;
+                emit(&app, "pending-user-question:updated", &pending_question)?;
             }
             OwnerBlockerResolution::AskUser {
                 question,
@@ -512,23 +513,24 @@ impl AppService {
                 )?;
                 self.storage.insert_message(&question_message)?;
                 emit(&app, "chat:message-created", &question_message)?;
-                self.storage
-                    .insert_pending_user_question(&PendingUserQuestion {
-                        id: new_id(),
-                        work_group_id: work_group.id.clone(),
-                        task_card_id: task.id.clone(),
-                        agent_id: owner.id.clone(),
-                        tool_run_id: None,
-                        question: question.clone(),
-                        options: options.clone(),
-                        context: context.clone(),
-                        allow_free_form: allow_free_form.unwrap_or(true),
-                        asked_message_id: question_message.id.clone(),
-                        answer_message_id: None,
-                        status: PendingUserQuestionStatus::Pending,
-                        created_at: now(),
-                        answered_at: None,
-                    })?;
+                let pending_question = PendingUserQuestion {
+                    id: new_id(),
+                    work_group_id: work_group.id.clone(),
+                    task_card_id: task.id.clone(),
+                    agent_id: owner.id.clone(),
+                    tool_run_id: None,
+                    question: question.clone(),
+                    options: options.clone(),
+                    context: context.clone(),
+                    allow_free_form: allow_free_form.unwrap_or(true),
+                    asked_message_id: question_message.id.clone(),
+                    answer_message_id: None,
+                    status: PendingUserQuestionStatus::Pending,
+                    created_at: now(),
+                    answered_at: None,
+                };
+                self.storage.insert_pending_user_question(&pending_question)?;
+                emit(&app, "pending-user-question:updated", &pending_question)?;
             }
             OwnerBlockerResolution::PauseTask { message } => {
                 blocker.status = BlockerStatus::Cancelled;

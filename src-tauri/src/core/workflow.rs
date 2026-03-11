@@ -199,6 +199,54 @@ pub struct TaskBlockerRecord {
     pub resolved_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowCheckpointStatus {
+    WorkflowPlanned,
+    WorkflowRunning,
+    WorkflowCompleted,
+    StagePending,
+    StageRunning,
+    StageCompleted,
+    TaskReady,
+    TaskRunning,
+    TaskRetryableFailure,
+    TaskRetryScheduled,
+    TaskReassigned,
+    TaskCompleted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowRepoSnapshot {
+    pub entry_count: i64,
+    pub is_empty: bool,
+    pub top_level_entries: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowCheckpointRecord {
+    pub id: String,
+    pub workflow_id: Option<String>,
+    pub stage_id: Option<String>,
+    pub task_id: Option<String>,
+    pub stage_title: Option<String>,
+    pub task_title: Option<String>,
+    pub assignee_agent_id: Option<String>,
+    pub assignee_name: Option<String>,
+    pub status: WorkflowCheckpointStatus,
+    pub working_directory: String,
+    pub repo_snapshot: WorkflowRepoSnapshot,
+    pub artifact_summary: Vec<String>,
+    pub todo_snapshot: Vec<String>,
+    pub resume_hint: Option<String>,
+    pub failure_count: i64,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlannedTask {

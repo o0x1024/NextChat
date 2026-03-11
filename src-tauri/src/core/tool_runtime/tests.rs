@@ -26,6 +26,7 @@ fn agent() -> AgentProfile {
         model_policy: ModelPolicy::default(),
         skill_ids: vec![],
         tool_ids: vec![
+            "Skills".into(),
             "Read".into(),
             "Write".into(),
             "Grep".into(),
@@ -109,34 +110,29 @@ async fn grep_returns_matches() {
 }
 
 #[test]
-fn skill_allowlist_blocks_network_tool_authorization() {
+fn enabled_tools_are_not_filtered_by_skills() {
     let workspace_root = unique_root("skill-workspace");
     let data_root = unique_root("skill-data");
     fs::create_dir_all(&workspace_root).expect("workspace");
     fs::create_dir_all(&data_root).expect("data");
     let runtime = ToolRuntime::new(workspace_root, data_root).expect("runtime");
     let tool = runtime.tool_by_id("WebFetch").expect("tool");
-    let mut restricted_agent = agent();
-    restricted_agent.skill_ids = vec!["skill.builder".into()];
+    let allowed_agent = agent();
 
     let decision = runtime
         .authorize_tool_call(
-            &restricted_agent,
+            &allowed_agent,
             &tool,
             r#"{"url":"https://example.com","prompt":"summarize"}"#,
             ".",
         )
         .expect("decision");
 
-    assert!(!decision.allowed);
-    assert!(decision
-        .reason
-        .expect("reason")
-        .contains("skills do not allow tool category"));
+    assert!(decision.allowed);
     assert!(runtime
-        .available_tools_for_agent(&restricted_agent)
+        .available_tools_for_agent(&allowed_agent)
         .into_iter()
-        .all(|candidate| candidate.id != "WebFetch"));
+        .any(|candidate| candidate.id == "WebFetch"));
 }
 
 #[test]

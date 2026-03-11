@@ -178,32 +178,6 @@ export function InspectorPanel({
             </fieldset>
 
             <fieldset className="fieldset rounded-box bg-base-100 p-4">
-              <legend className="fieldset-legend">{t("skills")}</legend>
-              <div className="flex flex-wrap gap-2">
-                {skills.map((skill) => {
-                  const active = agentForm.skillIds.includes(skill.id);
-                  return (
-                    <button
-                      type="button"
-                      key={skill.id}
-                      className={`btn btn-sm rounded-full ${active ? "btn-primary" : "btn-soft"}`}
-                      onClick={() =>
-                        onAgentFormChange((state) => ({
-                          ...state,
-                          skillIds: active
-                            ? state.skillIds.filter((id) => id !== skill.id)
-                            : [...state.skillIds, skill.id],
-                        }))
-                      }
-                    >
-                      {skill.name}
-                    </button>
-                  );
-                })}
-              </div>
-            </fieldset>
-
-            <fieldset className="fieldset rounded-box bg-base-100 p-4">
               <legend className="fieldset-legend">{t("tools")}</legend>
               <div className="flex flex-wrap gap-2">
                 {tools.map((tool) => {

@@ -33,6 +33,7 @@ function App() {
     chatStreamTracks,
     taskCards,
     taskBlockers,
+    workflowCheckpoints,
     leases,
     claimBids,
     toolRuns,
@@ -203,7 +204,9 @@ function App() {
                   messages={messages}
                   chatStreamTracks={chatStreamTracks}
                   taskCards={taskCards}
+                  pendingUserQuestions={store.pendingUserQuestions}
                   taskBlockers={taskBlockers}
+                  workflowCheckpoints={workflowCheckpoints}
                   leases={leases}
                   claimBids={claimBids}
                   toolRuns={toolRuns}

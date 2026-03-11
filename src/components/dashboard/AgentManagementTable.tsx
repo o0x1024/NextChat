@@ -56,7 +56,6 @@ export function AgentManagementTable({
                         <th className="bg-transparent border-b border-base-content/10 py-4 font-semibold text-xs opacity-60">{t("role")}</th>
                         <th className="bg-transparent border-b border-base-content/10 py-4 font-semibold text-xs opacity-60">{t("model")}</th>
                         <th className="bg-transparent border-b border-base-content/10 py-4 font-semibold text-xs opacity-60">{t("tools")}</th>
-                        <th className="bg-transparent border-b border-base-content/10 py-4 font-semibold text-xs opacity-60">{t("skills")}</th>
                         <th className="bg-transparent border-b border-base-content/10 py-4 font-semibold text-xs opacity-60 text-right pr-6">{t("actions")}</th>
                     </tr>
                 </thead>
@@ -113,9 +112,6 @@ export function AgentManagementTable({
                                 <td className="py-4 text-center">
                                     <div className="badge badge-primary/10 text-primary border-none font-bold text-[10px] px-2.5 py-2">{agent.toolIds.length}</div>
                                 </td>
-                                <td className="py-4 text-center">
-                                    <div className="badge badge-secondary/10 text-secondary border-none font-bold text-[10px] px-2.5 py-2">{agent.skillIds.length}</div>
-                                </td>
                                 <td className="py-4 text-right pr-6">
                                     <div className="flex items-center justify-end gap-1.5">
                                         <button
@@ -148,7 +144,7 @@ export function AgentManagementTable({
                     })}
                     {agents.length === 0 && (
                         <tr>
-                            <td colSpan={8} className="text-center text-base-content/40 py-16 bg-base-100">
+                            <td colSpan={7} className="text-center text-base-content/40 py-16 bg-base-100">
                                 <div className="flex flex-col items-center gap-3">
                                     <i className="fas fa-robot text-4xl opacity-10" />
                                     <span className="text-sm font-medium">{t("noAgentsYet")}</span>

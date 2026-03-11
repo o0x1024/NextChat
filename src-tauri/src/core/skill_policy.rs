@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use crate::core::domain::{AgentProfile, SkillPack, ToolManifest};
 use crate::core::permissions::is_tool_enabled_for_agent;
 
@@ -8,44 +6,28 @@ pub enum ToolExposureReason {
     Available,
     NotBound,
     BlockedByPermission,
-    BlockedBySkill,
 }
 
 pub fn selected_skills_for_agent(agent: &AgentProfile, skills: &[SkillPack]) -> Vec<SkillPack> {
+    if !is_tool_enabled_for_agent(agent, "Skills") {
+        return Vec::new();
+    }
+
     skills
         .iter()
-        .filter(|skill| agent.skill_ids.contains(&skill.id) && skill.enabled)
+        .filter(|skill| skill.enabled)
         .cloned()
         .collect()
-}
-
-pub fn allowed_skill_categories(skills: &[SkillPack]) -> Option<HashSet<String>> {
-    let categories = skills
-        .iter()
-        .flat_map(|skill| skill.allowed_tool_tags.iter().cloned())
-        .collect::<HashSet<_>>();
-    if categories.is_empty() {
-        None
-    } else {
-        Some(categories)
-    }
 }
 
 pub fn effective_tools_for_agent(
     agent: &AgentProfile,
     tools: &[ToolManifest],
-    skills: &[SkillPack],
+    _skills: &[SkillPack],
 ) -> Vec<ToolManifest> {
-    let allowed_categories = allowed_skill_categories(skills);
     tools
         .iter()
-        .filter(|tool| {
-            is_tool_enabled_for_agent(agent, &tool.id)
-                && allowed_categories
-                    .as_ref()
-                    .map(|categories| categories.contains(&tool.category))
-                    .unwrap_or(true)
-        })
+        .filter(|tool| is_tool_enabled_for_agent(agent, &tool.id))
         .cloned()
         .collect()
 }
@@ -53,7 +35,7 @@ pub fn effective_tools_for_agent(
 pub fn tool_exposure_reason(
     agent: &AgentProfile,
     tool: &ToolManifest,
-    skills: &[SkillPack],
+    _skills: &[SkillPack],
 ) -> ToolExposureReason {
     if !is_tool_enabled_for_agent(agent, &tool.id)
         && !agent
@@ -65,15 +47,6 @@ pub fn tool_exposure_reason(
     }
     if !is_tool_enabled_for_agent(agent, &tool.id) {
         return ToolExposureReason::BlockedByPermission;
-    }
-
-    let allowed_categories = allowed_skill_categories(skills);
-    if allowed_categories
-        .as_ref()
-        .map(|categories| !categories.contains(&tool.category))
-        .unwrap_or(false)
-    {
-        return ToolExposureReason::BlockedBySkill;
     }
 
     ToolExposureReason::Available
@@ -106,8 +79,9 @@ mod tests {
             role: "Research".into(),
             objective: "Find facts".into(),
             model_policy: ModelPolicy::default(),
-            skill_ids: vec!["skill.research".into()],
+            skill_ids: vec![],
             tool_ids: vec![
+                "Skills".into(),
                 "project.search".into(),
                 "http.request".into(),
                 "shell.exec".into(),
@@ -178,13 +152,14 @@ mod tests {
     #[test]
     fn selected_skills_filter_visible_tools() {
         let available = effective_tools_for_agent(&agent(), &tools(), &skills());
-        assert_eq!(available.len(), 2);
-        assert!(available.iter().all(|tool| tool.id != "shell.exec"));
+        assert_eq!(available.len(), 3);
     }
 
     #[test]
-    fn blocked_tool_reports_skill_reason() {
-        let reason = tool_exposure_reason(&agent(), &tools()[2], &skills());
-        assert_eq!(reason, ToolExposureReason::BlockedBySkill);
+    fn missing_tool_reports_not_bound() {
+        let mut agent = agent();
+        agent.tool_ids.retain(|tool_id| tool_id != "shell.exec");
+        let reason = tool_exposure_reason(&agent, &tools()[2], &skills());
+        assert_eq!(reason, ToolExposureReason::NotBound);
     }
 }

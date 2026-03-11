@@ -19,7 +19,6 @@ struct GeneratedAgentDraft {
     avatar: Option<String>,
     role: Option<String>,
     objective: Option<String>,
-    skill_ids: Option<Vec<String>>,
     tool_ids: Option<Vec<String>>,
     max_parallel_runs: Option<i64>,
     can_spawn_subtasks: Option<bool>,
@@ -41,18 +40,8 @@ impl AppService {
         }
 
         let settings = self.storage.get_settings()?;
-        let skills = self.tool_runtime.all_skills();
         let tools = self.tool_runtime.builtin_tools();
 
-        let skill_catalog = if skills.is_empty() {
-            "- none".to_string()
-        } else {
-            skills
-                .iter()
-                .map(|skill| format!("- {}: {}", skill.id, truncate_text(&skill.name, 80)))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
         let tool_catalog = if tools.is_empty() {
             "- none".to_string()
         } else {
@@ -73,8 +62,8 @@ impl AppService {
         let preamble =
             "You design agent profiles for a multi-agent workspace. Output only valid JSON. Do not output Markdown, explanatory text, or code block fences.";
         let generation_prompt = format!(
-            "User request:\n{}\n\nReturn a JSON array containing 1-8 agent objects. Each object must use exactly these keys: name, avatar, role, objective, skillIds, toolIds, maxParallelRuns, canSpawnSubtasks.\nRules:\n- If the user asks for a team, return multiple complementary roles that cover the workflow.\n- If the user asks for a single agent, return an array with exactly one object.\n- name/role/objective should be concise and practical.\n- avatar should be 1-2 uppercase letters.\n- skillIds must come from this list:\n{}\n- toolIds must come from this list:\n{}\n- maxParallelRuns should be 1-8.\n- No markdown, comments, or extra keys.",
-            trimmed_prompt, skill_catalog, tool_catalog
+            "User request:\n{}\n\nReturn a JSON array containing 1-8 agent objects. Each object must use exactly these keys: name, avatar, role, objective, toolIds, maxParallelRuns, canSpawnSubtasks.\nRules:\n- If the user asks for a team, return multiple complementary roles that cover the workflow.\n- If the user asks for a single agent, return an array with exactly one object.\n- name/role/objective should be concise and practical.\n- avatar should be 1-2 uppercase letters.\n- toolIds must come from this list:\n{}\n- Always include the Skills tool in toolIds.\n- maxParallelRuns should be 1-8.\n- No markdown, comments, or extra keys.",
+            trimmed_prompt, tool_catalog
         );
 
         let (reply, model_policy) =
@@ -92,7 +81,6 @@ impl AppService {
                     draft_count,
                     index,
                     &model_policy,
-                    &skills,
                     &tools,
                     &mut used_names,
                 )
@@ -121,18 +109,10 @@ fn build_generated_agent_input(
     total_drafts: usize,
     index: usize,
     model_policy: &ModelPolicy,
-    skills: &[crate::core::domain::SkillPack],
     tools: &[crate::core::domain::ToolManifest],
     used_names: &mut HashSet<String>,
 ) -> Result<CreateAgentInput> {
-    let mut skill_ids = Vec::new();
-    for skill_id in draft.skill_ids.unwrap_or_default() {
-        if skills.iter().any(|skill| skill.id == skill_id) && !skill_ids.contains(&skill_id) {
-            skill_ids.push(skill_id);
-        }
-    }
-
-    let mut tool_ids = Vec::new();
+    let mut tool_ids = vec!["Skills".to_string()];
     for tool_id in draft.tool_ids.unwrap_or_default() {
         if tools.iter().any(|tool| tool.id == tool_id) && !tool_ids.contains(&tool_id) {
             tool_ids.push(tool_id);
@@ -159,7 +139,7 @@ fn build_generated_agent_input(
         provider: model_policy.provider.clone(),
         model: model_policy.model.clone(),
         temperature: model_policy.temperature,
-        skill_ids,
+        skill_ids: vec![],
         tool_ids,
         max_parallel_runs: draft.max_parallel_runs.unwrap_or(2).clamp(1, 8),
         can_spawn_subtasks: draft.can_spawn_subtasks.unwrap_or(true),

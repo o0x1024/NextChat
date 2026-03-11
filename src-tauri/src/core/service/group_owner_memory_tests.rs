@@ -38,7 +38,7 @@ fn create_work_group_supports_initial_members_and_rejects_unknown_agents() {
             provider: "mock".into(),
             model: "simulation".into(),
             temperature: 0.2,
-            skill_ids: vec!["skill.builder".into()],
+            skill_ids: vec![],
             tool_ids: vec!["plan.summarize".into()],
             max_parallel_runs: 1,
             can_spawn_subtasks: true,
@@ -55,7 +55,7 @@ fn create_work_group_supports_initial_members_and_rejects_unknown_agents() {
             provider: "mock".into(),
             model: "simulation".into(),
             temperature: 0.2,
-            skill_ids: vec!["skill.reviewer".into()],
+            skill_ids: vec![],
             tool_ids: vec!["plan.summarize".into()],
             max_parallel_runs: 1,
             can_spawn_subtasks: false,
@@ -217,13 +217,14 @@ fn builtin_group_owner_is_reused_across_groups() {
 
 #[test]
 fn group_owner_charter_memory_includes_runtime_environment() {
-    let (service, _, _) = setup_service();
+    let (service, workspace_root, _) = setup_service();
+    let working_directory = workspace_root.to_string_lossy().into_owned();
 
     let group = service
         .create_work_group(CreateWorkGroupInput {
             name: "Owner Context".into(),
             goal: "Coordinate work with environment awareness.".into(),
-            working_directory: "/Users/a1024/code/NextChat".into(),
+            working_directory: working_directory.clone(),
             kind: WorkGroupKind::Persistent,
             default_visibility: "summary".into(),
             auto_archive: false,
@@ -245,7 +246,7 @@ fn group_owner_charter_memory_includes_runtime_environment() {
 
     assert!(charter
         .content
-        .contains("Working directory: /Users/a1024/code/NextChat"));
+        .contains(&format!("Working directory: {}", group.working_directory)));
     assert!(charter.content.contains("Shell execution:"));
     assert!(charter.content.contains("Platform:"));
 }

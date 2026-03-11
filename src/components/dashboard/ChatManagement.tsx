@@ -14,11 +14,9 @@ import type {
   UpdateWorkGroupInput,
   WorkGroup,
 } from "../../types";
-import { AgentExecutionDetailsPanel } from "./AgentExecutionDetailsPanel";
 import { ChatComposer } from "./ChatComposer";
-import { ChatMembersPanel } from "./ChatMembersPanel";
 import { ChatMessageList } from "./ChatMessageList";
-import { ChatRunningPanel } from "./ChatRunningPanel";
+import { ChatRightPanel } from "./ChatRightPanel";
 import {
   type ChatManagementProps,
   type PanelTarget,
@@ -31,6 +29,7 @@ import {
   mentionCandidates,
   validateMentions,
 } from "./mentions";
+import { isBuiltinGroupOwner } from "./agentManagementUtils";
 import { WorkGroupDialogs } from "./WorkGroupDialogs";
 import { roleAccent } from "./ui";
 import { findLatestNarrativeMessageId } from "./narrativeTargeting";
@@ -43,7 +42,9 @@ export function ChatManagement({
   messages,
   chatStreamTracks,
   taskCards,
+  pendingUserQuestions,
   taskBlockers,
+  workflowCheckpoints,
   leases,
   claimBids,
   toolRuns,
@@ -171,6 +172,13 @@ export function ChatManagement({
   const currentTaskTitles = useMemo(() => new Map(currentGroupTasks.map((task) => [task.id, task.title])), [currentGroupTasks]);
   const currentTaskAssignees = useMemo(() => new Map(currentGroupTasks.filter((task) => Boolean(task.assignedAgentId)).map((task) => [task.id, task.assignedAgentId as string])), [currentGroupTasks]);
   const currentMemberNames = useMemo(() => new Map(currentMembers.map((member) => [member.id, member.name])), [currentMembers]);
+  const currentPendingQuestion = useMemo(
+    () =>
+      !currentGroup
+        ? null
+        : pendingUserQuestions.find((question) => question.workGroupId === currentGroup.id) ?? null,
+    [currentGroup, pendingUserQuestions],
+  );
   const currentLeases = useMemo(
     () =>
       leases.filter(
@@ -198,14 +206,13 @@ export function ChatManagement({
   );
   const sidePanelOpen = sidePanelMode !== null;
 
-  async function handleSend(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function submitMessage(content: string) {
     if (!currentGroup || sendingMessage) return;
 
-    const trimmedContent = composerValue.trim();
+    const trimmedContent = content.trim();
     if (!trimmedContent) return;
 
-    const validation = validateMentions(composerValue, currentMembers);
+    const validation = validateMentions(trimmedContent, currentMembers);
     if (validation.invalidMentions.length > 0) {
       setMentionError(
         t("mentionUnknownAgents", {
@@ -233,6 +240,22 @@ export function ChatManagement({
       const message = error instanceof Error ? error.message : String(error);
       setComposerValue(trimmedContent);
       setMentionError(message);
+      throw error;
+    }
+  }
+
+  async function handleSend(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    try {
+      await submitMessage(composerValue);
+    } finally {
+      setSendingMessage(false);
+    }
+  }
+
+  async function handleAnswerPendingQuestion(answer: string) {
+    try {
+      await submitMessage(answer);
     } finally {
       setSendingMessage(false);
     }
@@ -263,7 +286,11 @@ export function ChatManagement({
   async function handleCreateGroup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     try {
-      await onCreateGroup(groupForm);
+      const sanitizedMemberAgentIds = (groupForm.memberAgentIds ?? []).filter((agentId) => {
+        const agent = agents.find((candidate) => candidate.id === agentId);
+        return !agent || !isBuiltinGroupOwner(agent);
+      });
+      await onCreateGroup({ ...groupForm, memberAgentIds: sanitizedMemberAgentIds });
       setGroupForm((form) => ({ ...emptyGroupForm, workingDirectory: defaultWorkingDirectory }));
       setDirectoryPickerError(null);
       setCreateModalOpen(false);
@@ -315,6 +342,10 @@ export function ChatManagement({
   }
 
   function handleToggleCreateMember(agentId: string) {
+    const agent = agents.find((candidate) => candidate.id === agentId);
+    if (agent && isBuiltinGroupOwner(agent)) {
+      return;
+    }
     setGroupForm((form) => {
       const memberIds = form.memberAgentIds ?? [];
       const alreadySelected = memberIds.includes(agentId);
@@ -873,6 +904,8 @@ export function ChatManagement({
                   mentionOptions={mentionOptions}
                   mentionIndex={mentionIndex}
                   mentionError={mentionError}
+                  pendingQuestion={currentPendingQuestion}
+                  pendingQuestionAgentName={currentPendingQuestion ? currentMemberNames.get(currentPendingQuestion.agentId) ?? null : null}
                   currentApprovalsCount={currentApprovals.length}
                   activeTasksCount={activeTasks.length}
                   stoppableTasksCount={stoppableTasks.length}
@@ -883,6 +916,7 @@ export function ChatManagement({
                   onSetMentionIndex={setMentionIndex}
                   onApplyMention={applyMention}
                   onOpenMentionPicker={openMentionPicker}
+                  onAnswerPendingQuestion={(answer) => void handleAnswerPendingQuestion(answer)}
                   onJumpToApprovals={jumpToApprovals}
                   onJumpToTaskBoard={() => jumpToTaskBoard()}
                   onStopExecution={() => void handleStopExecution()}
@@ -890,82 +924,53 @@ export function ChatManagement({
                 />
               </div>
 
-              {sidePanelOpen && (
-                <>
-                  <div
-                    className={`-ml-2 hidden w-2 shrink-0 cursor-col-resize border-l border-transparent bg-transparent transition-colors hover:border-primary/20 hover:bg-primary/20 xl:block ${
-                      resizingRightPanel ? "border-primary/30 bg-primary/30" : ""
-                    }`}
-                    onPointerDown={handleRightPanelResizeStart}
-                    onPointerMove={handleRightPanelResizeMove}
-                    onPointerUp={handleRightPanelResizeEnd}
-                    onPointerCancel={handleRightPanelResizeEnd}
-                  />
-                  <aside className="flex min-h-0 w-full shrink-0 flex-col gap-3 overflow-y-auto xl:w-[var(--chat-right-panel-width,360px)]">
-                    {sidePanelMode === "execution" && (
-                      <AgentExecutionDetailsPanel
-                        language={language}
-                        focusAgentId={focusAgentId}
-                        onFocusAgentIdChange={setFocusAgentId}
-                        onJumpToTask={jumpToTaskBoard}
-                        onJumpToBlocker={jumpToBlocker}
-                        onJumpToNarrative={jumpToNarrative}
-                        currentMembers={currentMembers}
-                        agents={agents}
-                        currentGroupTasks={currentGroupTasks}
-                        groupMessages={currentGroupMessages}
-                        streamTracks={currentGroupStreamTracks}
-                        toolRuns={toolRuns}
-                        auditEvents={auditEvents}
-                        tools={tools}
-                      />
-                    )}
-
-                    {sidePanelMode === "running" && (
-                      <ChatRunningPanel
-                        activeTasks={activeTasks}
-                        currentLeases={currentLeases}
-                        currentApprovals={currentApprovals}
-                        currentGroupTasks={currentGroupTasks}
-                        taskBlockers={currentTaskBlockers}
-                        claimBids={claimBids}
-                        agents={agents}
-                        tools={tools}
-                        highlightedTaskId={highlightedTaskId}
-                        highlightedBlockerId={highlightedBlockerId}
-                        targetBlockerId={panelTarget?.section === "blockers" ? panelTarget.blockerId : null}
-                        onTaskBoardRef={(node) => { taskBoardRef.current = node; }}
-                        onApprovalsRef={(node) => { approvalsRef.current = node; }}
-                        onSetTaskCardRef={(taskId, node) => { taskCardRefs.current[taskId] = node; }}
-                        onSetBlockerCardRef={(blockerId, node) => { blockerCardRefs.current[blockerId] = node; }}
-                        onJumpToTaskBoard={jumpToTaskBoard}
-                        onApproveRun={onApproveRun}
-                        onResolveBlocker={onResolveBlocker}
-                      />
-                    )}
-
-                    {sidePanelMode === "members" && (
-                      <ChatMembersPanel
-                        currentGroup={currentGroup}
-                        currentMembers={currentMembers}
-                        availableAgents={availableAgentsForCurrentGroup}
-                        currentGroupTasks={currentGroupTasks}
-                        onCancelTask={onCancelTask}
-                        onAddAgent={handleAddMember}
-                        onRemoveAgent={handleRemoveMember}
-                      />
-                    )}
-                  </aside>
-                </>
-              )}
+              <ChatRightPanel
+                sidePanelOpen={sidePanelOpen}
+                sidePanelMode={sidePanelMode}
+                resizingRightPanel={resizingRightPanel}
+                language={language}
+                focusAgentId={focusAgentId}
+                currentMembers={currentMembers}
+                agents={agents}
+                currentGroupTasks={currentGroupTasks}
+                currentGroupMessages={currentGroupMessages}
+                currentGroupStreamTracks={currentGroupStreamTracks}
+                toolRuns={toolRuns}
+                auditEvents={auditEvents}
+                tools={tools}
+                activeTasks={activeTasks}
+                currentLeases={currentLeases}
+                currentApprovals={currentApprovals}
+                currentTaskBlockers={currentTaskBlockers}
+                claimBids={claimBids}
+                workflowCheckpoints={workflowCheckpoints}
+                highlightedTaskId={highlightedTaskId}
+                highlightedBlockerId={highlightedBlockerId}
+                panelTarget={panelTarget}
+                currentGroup={currentGroup}
+                availableAgentsForCurrentGroup={availableAgentsForCurrentGroup}
+                onRightPanelResizeStart={handleRightPanelResizeStart}
+                onRightPanelResizeMove={handleRightPanelResizeMove}
+                onRightPanelResizeEnd={handleRightPanelResizeEnd}
+                onFocusAgentIdChange={setFocusAgentId}
+                onJumpToTask={jumpToTaskBoard}
+                onJumpToBlocker={jumpToBlocker}
+                onJumpToNarrative={jumpToNarrative}
+                onTaskBoardRef={(node) => { taskBoardRef.current = node; }}
+                onApprovalsRef={(node) => { approvalsRef.current = node; }}
+                onSetTaskCardRef={(taskId, node) => { taskCardRefs.current[taskId] = node; }}
+                onSetBlockerCardRef={(blockerId, node) => { blockerCardRefs.current[blockerId] = node; }}
+                onApproveRun={onApproveRun}
+                onResolveBlocker={onResolveBlocker}
+                onCancelTask={onCancelTask}
+                onAddAgent={handleAddMember}
+                onRemoveAgent={handleRemoveMember}
+              />
             </div>
           </>
         ) : (
           <div className="flex flex-1 items-center justify-center">
-            <div className="text-center text-base-content/50">
-              <div className="mb-3 text-4xl">💬</div>
-              <div>{t("noWorkGroupSelected")}</div>
-            </div>
+            <div className="text-center text-base-content/50"><div className="mb-3 text-4xl">💬</div><div>{t("noWorkGroupSelected")}</div></div>
           </div>
         )}
       </div>
@@ -981,19 +986,14 @@ export function ChatManagement({
         agents={agents}
         groupForm={groupForm}
         editGroupForm={editGroupForm}
-        directoryPickerError={directoryPickerError}
-        onSetCreateModalOpen={setCreateModalOpen}
+        directoryPickerError={directoryPickerError} onSetCreateModalOpen={setCreateModalOpen}
         onSetEditModalOpen={setEditModalOpen}
-        onSetDeleteTargetGroup={setDeleteTargetGroup}
-        onSetClearHistoryTargetGroup={setClearHistoryTargetGroup}
-        onSetGroupForm={setGroupForm}
-        onSetEditGroupForm={setEditGroupForm}
-        onHandleCreateGroup={handleCreateGroup}
-        onHandleUpdateGroup={handleUpdateGroup}
+        onSetDeleteTargetGroup={setDeleteTargetGroup} onSetClearHistoryTargetGroup={setClearHistoryTargetGroup}
+        onSetGroupForm={setGroupForm} onSetEditGroupForm={setEditGroupForm}
+        onHandleCreateGroup={handleCreateGroup} onHandleUpdateGroup={handleUpdateGroup}
         onHandlePickWorkingDirectory={handlePickWorkingDirectory}
         onHandleToggleCreateMember={handleToggleCreateMember}
-        onConfirmDeleteGroup={confirmDeleteGroup}
-        onConfirmClearHistory={confirmClearHistory}
+        onConfirmDeleteGroup={confirmDeleteGroup} onConfirmClearHistory={confirmClearHistory}
       />
     </div>
   );

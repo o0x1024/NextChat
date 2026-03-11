@@ -309,6 +309,7 @@ impl AppService {
         pending.answer_message_id = Some(human_message.id.clone());
         pending.answered_at = Some(now());
         self.storage.insert_pending_user_question(&pending)?;
+        emit(app, "pending-user-question:updated", &pending)?;
 
         let mut task = self.storage.get_task_card(&pending.task_card_id)?;
         task.status = TaskStatus::Leased;
@@ -415,6 +416,10 @@ impl AppService {
         let mut stage = self.storage.get_workflow_stage(&stage_id)?;
         stage.status = StageStatus::Completed;
         self.storage.insert_workflow_stage(&stage)?;
+        self.record_stage_checkpoint(
+            &stage.id,
+            crate::core::workflow::WorkflowCheckpointStatus::StageCompleted,
+        )?;
 
         let stages = self.storage.list_workflow_stages(&workflow_id)?;
         let next_stage = stages
@@ -427,6 +432,10 @@ impl AppService {
             workflow.current_stage_id = Some(next_stage.id.clone());
             workflow.status = WorkflowStatus::Running;
             self.storage.insert_workflow(&workflow)?;
+            self.record_workflow_checkpoint(
+                &workflow.id,
+                crate::core::workflow::WorkflowCheckpointStatus::WorkflowRunning,
+            )?;
             let mut transition = NarrativeEnvelope::new(
                 NarrativeMessageType::OwnerStageTransition,
                 self.build_owner_stage_transition_text(&workflow, &stage, &next_stage)?,
@@ -448,6 +457,10 @@ impl AppService {
         let mut workflow = self.storage.get_workflow(&workflow_id)?;
         workflow.status = WorkflowStatus::Completed;
         self.storage.insert_workflow(&workflow)?;
+        self.record_workflow_checkpoint(
+            &workflow.id,
+            crate::core::workflow::WorkflowCheckpointStatus::WorkflowCompleted,
+        )?;
         let mut summary = NarrativeEnvelope::new(
             NarrativeMessageType::OwnerSummary,
             self.build_owner_workflow_summary_text(&workflow)?,
@@ -818,9 +831,17 @@ impl AppService {
         plan: WorkflowPlan,
     ) -> Result<()> {
         self.storage.insert_workflow(&plan.workflow)?;
+        self.record_workflow_checkpoint(
+            &plan.workflow.id,
+            crate::core::workflow::WorkflowCheckpointStatus::WorkflowPlanned,
+        )?;
 
         for stage in &plan.stages {
             self.storage.insert_workflow_stage(&stage.stage)?;
+            self.record_stage_checkpoint(
+                &stage.stage.id,
+                crate::core::workflow::WorkflowCheckpointStatus::StagePending,
+            )?;
             for task in &stage.tasks {
                 let task_card = TaskCard {
                     id: task.id.clone(),
@@ -881,6 +902,10 @@ impl AppService {
         workflow.current_stage_id = Some(first_stage_id.clone());
         workflow.status = WorkflowStatus::Running;
         self.storage.insert_workflow(&workflow)?;
+        self.record_workflow_checkpoint(
+            &workflow.id,
+            crate::core::workflow::WorkflowCheckpointStatus::WorkflowRunning,
+        )?;
         self.activate_next_stage(&app, &workflow.id, &first_stage_id)
     }
 
@@ -929,6 +954,10 @@ impl AppService {
             let mut next_stage = stage.clone();
             next_stage.status = StageStatus::Running;
             self.storage.insert_workflow_stage(&next_stage)?;
+            self.record_stage_checkpoint(
+                &next_stage.id,
+                crate::core::workflow::WorkflowCheckpointStatus::StageRunning,
+            )?;
         }
 
         let dispatch_text =
@@ -956,6 +985,13 @@ impl AppService {
             let mut active_task = task.clone();
             active_task.status = TaskStatus::Leased;
             self.storage.update_task_card(&active_task)?;
+            self.record_task_checkpoint(
+                &active_task,
+                crate::core::workflow::WorkflowCheckpointStatus::TaskReady,
+                0,
+                None,
+                None,
+            )?;
             emit(app, "task:status-changed", &active_task)?;
             self.storage.insert_lease(&crate::core::domain::Lease {
                 id: new_id(),

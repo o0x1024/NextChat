@@ -79,6 +79,7 @@ impl AppService {
                 available_tools: vec![],
                 available_skills: selected_skills_for_agent(agent, &self.tool_runtime.all_skills()),
                 approved_tool: None,
+                approved_tool_input: None,
                 settings: self.storage.get_settings()?,
                 summary_stream: None,
                 tool_stream: None,

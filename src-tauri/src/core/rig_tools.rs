@@ -8,8 +8,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::core::domain::{
-    TaskExecutionContext, ToolExecutionRequest, ToolHandler, ToolManifest, ToolRiskLevel,
-    ToolStreamChunk,
+    TaskExecutionContext, ToolExecutionRequest, ToolHandler, ToolManifest, ToolStreamChunk,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -234,12 +233,7 @@ where
 }
 
 pub fn allowed_rig_tools(context: &TaskExecutionContext) -> Vec<ToolManifest> {
-    let mut tools = context
-        .available_tools
-        .iter()
-        .filter(|tool| tool.risk_level != ToolRiskLevel::High)
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut tools = context.available_tools.clone();
 
     if let Some(tool) = context.approved_tool.clone() {
         if !tools.iter().any(|candidate| candidate.id == tool.id) {
@@ -368,6 +362,7 @@ mod tests {
             ],
             available_skills: vec![],
             approved_tool,
+            approved_tool_input: None,
             settings: SystemSettings::default(),
             summary_stream: None,
             tool_stream: None,
@@ -376,10 +371,11 @@ mod tests {
     }
 
     #[test]
-    fn high_risk_tool_requires_approval_to_be_exposed() {
+    fn approved_tool_is_prioritized_when_exposed() {
         let tools = allowed_rig_tools(&context(None));
-        assert_eq!(tools.len(), 1);
+        assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].id, "project.search");
+        assert_eq!(tools[1].id, "file.readwrite");
 
         let tools = allowed_rig_tools(&context(Some(manifest(
             "file.readwrite",

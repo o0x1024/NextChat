@@ -15,6 +15,7 @@ use crate::core::domain::{
     ToolRun, ToolRunState, ToolStreamChunk, Visibility,
 };
 use crate::core::skill_policy::selected_skills_for_agent;
+use crate::core::tool_approval::parse_pending_approval_request;
 use crate::core::workflow::{NarrativeMessageType, RequestRouteMode};
 
 impl AppService {
@@ -31,6 +32,24 @@ impl AppService {
                 .await
             {
                 if let Ok(Some(report)) = service.handle_pending_user_question_request(
+                    &app,
+                    &task_card_id,
+                    tool_run_id.as_deref(),
+                    &error,
+                ) {
+                    if let Some(task) = report.task {
+                        let _ = emit(&app, "task:status-changed", &task);
+                    }
+                    for tool_run in report.cancelled_tool_runs {
+                        let _ = emit(&app, "tool:run-completed", &tool_run);
+                    }
+                    if let Some(message) = report.message {
+                        let _ = emit(&app, "chat:message-created", &message);
+                    }
+                    let _ = emit(&app, "audit:event-created", &report.audit_event);
+                    return;
+                }
+                if let Ok(Some(report)) = service.handle_retryable_task_execution_failure(
                     &app,
                     &task_card_id,
                     tool_run_id.as_deref(),
@@ -81,6 +100,13 @@ impl AppService {
 
         task.status = TaskStatus::InProgress;
         self.storage.update_task_card(&task)?;
+        self.record_task_checkpoint(
+            &task,
+            crate::core::workflow::WorkflowCheckpointStatus::TaskRunning,
+            0,
+            None,
+            None,
+        )?;
         emit(&app, "task:status-changed", &task)?;
 
         let work_group = self.storage.get_work_group(&task.work_group_id)?;
@@ -108,12 +134,14 @@ impl AppService {
             self.storage.insert_message(&progress_message)?;
             emit(&app, "chat:message-created", &progress_message)?;
         }
+        let mut approved_tool_input = None;
         let mut approved_tool = if let Some(id) = tool_run_id {
             let mut tool_run = self.storage.get_tool_run(id)?;
             tool_run.state = ToolRunState::Running;
             tool_run.started_at = Some(now());
             self.storage.insert_tool_run(&tool_run)?;
             emit(&app, "tool:run-started", &tool_run)?;
+            approved_tool_input = tool_run.result_ref.clone();
             self.tool_runtime.tool_by_id(&tool_run.tool_id)
         } else {
             self.tool_runtime
@@ -126,8 +154,12 @@ impl AppService {
             approved_tool = None;
         }
         let normalized_tool_input = approved_tool.as_ref().map(|tool| {
-            self.tool_runtime
-                .normalize_compat_input(tool, &task.input_payload)
+            self.tool_runtime.normalize_compat_input(
+                tool,
+                approved_tool_input
+                    .as_deref()
+                    .unwrap_or(task.input_payload.as_str()),
+            )
         });
         let tool_call_id = approved_tool.as_ref().map(|_| new_id());
 
@@ -196,10 +228,6 @@ impl AppService {
         }
 
         let available_skills = selected_skills_for_agent(&agent, &self.tool_runtime.all_skills());
-        let available_tools = available_tools
-            .into_iter()
-            .filter(|tool| !agent.permission_policy.requires_approval(&tool.id))
-            .collect();
 
         let summary_stream_id = new_id();
 
@@ -316,6 +344,7 @@ impl AppService {
                 available_tools,
                 available_skills,
                 approved_tool: approved_tool.clone(),
+                approved_tool_input: normalized_tool_input.clone(),
                 settings: self.storage.get_settings()?,
                 summary_stream: Some(summary_stream_tx.clone()),
                 tool_stream: Some(tool_stream_tx.clone()),
@@ -339,6 +368,38 @@ impl AppService {
         let execution = match execution_result {
             Ok(execution) => execution,
             Err(error) => {
+                if let Some(request) = parse_pending_approval_request(&error.to_string()) {
+                    if let Some(tool) = self.tool_runtime.tool_by_id(&request.tool_id) {
+                        if summary_stream_state.current_started {
+                            let done_event = ChatStreamEvent {
+                                stream_id: summary_stream_state.current_stream_id.clone(),
+                                phase: ChatStreamPhase::Done,
+                                conversation_id: work_group.id.clone(),
+                                work_group_id: work_group.id.clone(),
+                                sender_id: agent.id.clone(),
+                                sender_name: agent.name.clone(),
+                                kind: MessageKind::Summary,
+                                visibility: Visibility::Main,
+                                task_card_id: Some(task.id.clone()),
+                                sequence: summary_stream_state.current_sequence + 1,
+                                delta: None,
+                                full_content: Some(summary_stream_state.current_content.clone()),
+                                created_at: now(),
+                            };
+                            let _ = emit(&app, "chat:stream-done", &done_event);
+                        }
+                        self.request_tool_approval(
+                            &app,
+                            &work_group.id,
+                            &mut task,
+                            Some(&mut lease),
+                            &agent,
+                            &tool,
+                            &request.input,
+                        )?;
+                        return Ok(());
+                    }
+                }
                 if summary_stream_state.current_started {
                     let done_event = ChatStreamEvent {
                         stream_id: summary_stream_state.current_stream_id.clone(),
@@ -572,6 +633,13 @@ impl AppService {
 
         task.status = TaskStatus::Completed;
         self.storage.update_task_card(&task)?;
+        self.record_task_checkpoint(
+            &task,
+            crate::core::workflow::WorkflowCheckpointStatus::TaskCompleted,
+            0,
+            None,
+            None,
+        )?;
         emit(&app, "task:status-changed", &task)?;
         self.record_audit(
             "task.completed",

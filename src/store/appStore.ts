@@ -42,6 +42,7 @@ import type {
   DashboardState,
   Lease,
   OwnerBlockerResolution,
+  PendingUserQuestion,
   SendHumanMessageInput,
   SkillDetail,
   SystemSettings,
@@ -109,10 +110,12 @@ const emptyState: DashboardState = {
   workGroups: [],
   messages: [],
   taskCards: [],
+  pendingUserQuestions: [],
   claimBids: [],
   leases: [],
   toolRuns: [],
   taskBlockers: [],
+  workflowCheckpoints: [],
   auditEvents: [],
   skills: [],
   tools: [],
@@ -239,6 +242,10 @@ function sortAuditEvents(left: AuditEvent, right: AuditEvent) {
   return right.createdAt.localeCompare(left.createdAt);
 }
 
+function sortPendingUserQuestions(left: PendingUserQuestion, right: PendingUserQuestion) {
+  return right.createdAt.localeCompare(left.createdAt);
+}
+
 function reduceDashboardEventState(
   state: AppStore,
   eventName: DashboardEventName,
@@ -261,6 +268,23 @@ function reduceDashboardEventState(
       return {
         taskCards: upsertById(state.taskCards, payload as TaskCard, sortTaskCards),
       };
+    case "pending-user-question:updated": {
+      const nextQuestion = payload as PendingUserQuestion;
+      if (nextQuestion.status !== "pending") {
+        return {
+          pendingUserQuestions: state.pendingUserQuestions.filter(
+            (question) => question.id !== nextQuestion.id,
+          ),
+        };
+      }
+      return {
+        pendingUserQuestions: upsertById(
+          state.pendingUserQuestions,
+          nextQuestion,
+          sortPendingUserQuestions,
+        ),
+      };
+    }
     case "claim:bid-submitted":
       return {
         claimBids: upsertById(state.claimBids, payload as ClaimBid, sortClaimBids),

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
-use crate::core::workflow::TaskBlockerRecord;
+use crate::core::workflow::{TaskBlockerRecord, WorkflowCheckpointRecord};
 
 pub fn new_id() -> String {
     Uuid::new_v4().to_string()
@@ -241,6 +241,7 @@ pub struct AgentProfile {
     pub role: String,
     pub objective: String,
     pub model_policy: ModelPolicy,
+    #[serde(default)]
     pub skill_ids: Vec<String>,
     pub tool_ids: Vec<String>,
     pub max_parallel_runs: i64,
@@ -880,7 +881,9 @@ pub struct DashboardState {
     pub work_groups: Vec<WorkGroup>,
     pub messages: Vec<ConversationMessage>,
     pub task_cards: Vec<TaskCard>,
+    pub pending_user_questions: Vec<PendingUserQuestion>,
     pub task_blockers: Vec<TaskBlockerRecord>,
+    pub workflow_checkpoints: Vec<WorkflowCheckpointRecord>,
     pub claim_bids: Vec<ClaimBid>,
     pub leases: Vec<Lease>,
     pub tool_runs: Vec<ToolRun>,
@@ -901,6 +904,7 @@ pub struct CreateAgentInput {
     pub provider: String,
     pub model: String,
     pub temperature: f64,
+    #[serde(default)]
     pub skill_ids: Vec<String>,
     pub tool_ids: Vec<String>,
     pub max_parallel_runs: i64,
@@ -920,6 +924,7 @@ pub struct UpdateAgentInput {
     pub provider: String,
     pub model: String,
     pub temperature: f64,
+    #[serde(default)]
     pub skill_ids: Vec<String>,
     pub tool_ids: Vec<String>,
     pub max_parallel_runs: i64,
@@ -972,6 +977,7 @@ pub struct TaskExecutionContext {
     pub available_tools: Vec<ToolManifest>,
     pub available_skills: Vec<SkillPack>,
     pub approved_tool: Option<ToolManifest>,
+    pub approved_tool_input: Option<String>,
     pub settings: SystemSettings,
     #[serde(skip)]
     pub summary_stream: Option<UnboundedSender<SummaryStreamSignal>>,

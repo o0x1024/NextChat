@@ -6,6 +6,7 @@ import type {
   UpdateWorkGroupInput,
   WorkGroup,
 } from "../../types";
+import { isBuiltinGroupOwner } from "./agentManagementUtils";
 
 interface WorkGroupDialogsProps {
   createModalOpen: boolean;
@@ -59,6 +60,10 @@ export function WorkGroupDialogs({
   onConfirmClearHistory,
 }: WorkGroupDialogsProps) {
   const { t } = useTranslation();
+  const selectableAgents = agents.filter((agent) => !isBuiltinGroupOwner(agent));
+  const selectedMemberCount = (groupForm.memberAgentIds ?? []).filter((agentId) =>
+    selectableAgents.some((agent) => agent.id === agentId),
+  ).length;
 
   return (
     <>
@@ -133,16 +138,16 @@ export function WorkGroupDialogs({
                     {t("members")}
                   </div>
                   <div className="text-xs text-base-content/60">
-                    {(groupForm.memberAgentIds ?? []).length}/{agents.length}
+                    {selectedMemberCount}/{selectableAgents.length}
                   </div>
                 </div>
-                {agents.length === 0 ? (
+                {selectableAgents.length === 0 ? (
                   <div className="rounded-box border border-base-content/10 px-3 py-2 text-xs text-base-content/60">
                     {t("noAgentsYet")}
                   </div>
                 ) : (
                   <div className="max-h-48 space-y-2 overflow-y-auto rounded-box border border-base-content/10 p-2">
-                    {agents.map((agent) => {
+                    {selectableAgents.map((agent) => {
                       const isSelected = (groupForm.memberAgentIds ?? []).includes(agent.id);
                       return (
                         <div

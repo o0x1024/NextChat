@@ -58,10 +58,41 @@ impl AskUserQuestionSignal {
 }
 
 pub fn parse_signal_from_error(message: &str) -> Result<Option<AskUserQuestionSignal>> {
-    let Some(payload) = message.strip_prefix(ASK_USER_QUESTION_PREFIX) else {
+    let payload = if let Some(payload) = message.strip_prefix(ASK_USER_QUESTION_PREFIX) {
+        payload
+    } else if let Some(index) = message.find(ASK_USER_QUESTION_PREFIX) {
+        &message[index + ASK_USER_QUESTION_PREFIX.len()..]
+    } else {
         return Ok(None);
     };
     let signal = serde_json::from_str::<AskUserQuestionSignal>(payload)
         .map_err(|error| anyhow!("failed to parse AskUserQuestion payload: {error}"))?;
     Ok(Some(signal))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_signal_from_error, AskUserQuestionSignal};
+
+    #[test]
+    fn parse_signal_accepts_wrapped_tool_errors() {
+        let signal = AskUserQuestionSignal {
+            question: "继续吗？".into(),
+            options: vec!["是".into(), "否".into()],
+            context: None,
+            allow_free_form: false,
+        };
+        let message = format!(
+            "Toolset error: ToolCallError: {}",
+            signal.to_error_message().expect("serialize signal")
+        );
+
+        let parsed = parse_signal_from_error(&message)
+            .expect("parse signal")
+            .expect("signal present");
+
+        assert_eq!(parsed.question, signal.question);
+        assert_eq!(parsed.options, signal.options);
+        assert_eq!(parsed.allow_free_form, signal.allow_free_form);
+    }
 }

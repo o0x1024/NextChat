@@ -13,6 +13,7 @@ pub mod service;
 pub mod skill_policy;
 pub mod storage;
 pub mod stream_text;
+pub mod tool_approval;
 pub mod tool_runtime;
 pub mod tool_worker;
 pub mod workflow;

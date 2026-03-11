@@ -42,7 +42,6 @@ interface AgentManagementProps {
 export function AgentManagement({
     agents,
     workGroups,
-    skills,
     tools,
     settings,
     onCreateAgent,
@@ -319,7 +318,6 @@ export function AgentManagement({
                     provider: modelPolicy.provider,
                     model: modelPolicy.model,
                     temperature: modelPolicy.temperature,
-                    skillIds: [...agent.skillIds],
                     toolIds: [...agent.toolIds],
                     maxParallelRuns: agent.maxParallelRuns,
                     canSpawnSubtasks: agent.canSpawnSubtasks,
@@ -363,7 +361,6 @@ export function AgentManagement({
             role: agent.role,
             objective: agent.objective,
             ...modelForm,
-            skillIds: [...agent.skillIds],
             toolIds: [...agent.toolIds],
             maxParallelRuns: agent.maxParallelRuns,
             canSpawnSubtasks: agent.canSpawnSubtasks,
@@ -747,27 +744,10 @@ export function AgentManagement({
 
                                 <div className="space-y-4">
                                     <div className="flex items-center gap-2 text-xs font-bold text-accent uppercase tracking-widest">
-                                        <i className="fas fa-bullseye" /> {t("skillBinding")}
+                                        <i className="fas fa-bolt" /> {t("skills")}
                                     </div>
-                                    <div className="flex flex-wrap gap-2 max-h-48 overflow-y-auto p-1">
-                                        {skills.map((skill) => (
-                                            <label
-                                                key={skill.id}
-                                                className={`badge cursor-pointer gap-2 py-4 px-3 border-none transition-all ${form.skillIds.includes(skill.id) ? "bg-secondary text-secondary-content shadow-md shadow-secondary/20 scale-105" : "bg-base-200 hover:bg-base-300"
-                                                    }`}
-                                            >
-                                                <input
-                                                    type="checkbox"
-                                                    className="checkbox checkbox-xs checkbox-secondary hidden"
-                                                    checked={form.skillIds.includes(skill.id)}
-                                                    onChange={() =>
-                                                        setForm((f) => ({ ...f, skillIds: toggleArrayItem(f.skillIds, skill.id) }))
-                                                    }
-                                                />
-                                                <i className="fas fa-bolt text-[10px] opacity-60" />
-                                                <span className="text-xs font-medium">{skill.name}</span>
-                                            </label>
-                                        ))}
+                                    <div className="rounded-2xl border border-accent/15 bg-accent/5 px-4 py-3 text-sm text-base-content/70">
+                                        {t("agentSkillsHint")}
                                     </div>
                                 </div>
                             </div>

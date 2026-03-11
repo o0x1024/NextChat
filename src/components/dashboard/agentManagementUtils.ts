@@ -2,6 +2,8 @@ import type { AIProviderConfig, AgentProfile, CreateAgentInput, SystemSettings }
 import { runtimeSupportedRigProviderTypes } from "../../constants/providers";
 import { emptyMemoryPolicy, emptyPermissionPolicy } from "./agentPermissions";
 
+const DEFAULT_AGENT_TOOL_IDS = ["Skills"];
+
 export type ProviderReason = "disabled" | "missingApiKey" | "unsupported" | "noModels" | null;
 
 export type ProviderAvailability = {
@@ -34,8 +36,7 @@ export const emptyForm: CreateAgentInput = {
   provider: "openai",
   model: "gpt-4o",
   temperature: 0.7,
-  skillIds: [],
-  toolIds: [],
+  toolIds: [...DEFAULT_AGENT_TOOL_IDS],
   maxParallelRuns: 2,
   canSpawnSubtasks: true,
   memoryPolicy: emptyMemoryPolicy,
@@ -135,8 +136,13 @@ export function normalizeGeneratedAgentInput(
   settings: SystemSettings,
   generated: CreateAgentInput,
 ): CreateAgentInput {
+  const toolIds = generated.toolIds.includes("Skills")
+    ? generated.toolIds
+    : ["Skills", ...generated.toolIds];
+
   return {
     ...generated,
+    toolIds,
     ...normalizeModelForm(settings, {
       provider: generated.provider,
       model: generated.model,
@@ -160,7 +166,6 @@ export function serializeAgentConfig(agent: AgentProfile) {
     provider: agent.modelPolicy.provider,
     model: agent.modelPolicy.model,
     temperature: agent.modelPolicy.temperature,
-    skillIds: agent.skillIds,
     toolIds: agent.toolIds,
     maxParallelRuns: agent.maxParallelRuns,
     canSpawnSubtasks: agent.canSpawnSubtasks,

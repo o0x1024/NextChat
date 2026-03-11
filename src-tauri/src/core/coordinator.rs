@@ -124,31 +124,6 @@ impl Coordinator {
             }
         }
 
-        let mut matched_skills = Vec::new();
-        for skill in &agent.skill_ids {
-            if lowered.contains("research") && skill.contains("research") {
-                score += 8.0;
-                matched_skills.push(skill.clone());
-            }
-            if lowered.contains("build") && skill.contains("builder") {
-                score += 8.0;
-                matched_skills.push(skill.clone());
-            }
-            if lowered.contains("review") && skill.contains("reviewer") {
-                score += 8.0;
-                matched_skills.push(skill.clone());
-            }
-        }
-        matched_skills.sort();
-        matched_skills.dedup();
-        if !matched_skills.is_empty() {
-            factors.push(ClaimScoreFactor {
-                kind: ClaimScoreFactorKind::SkillMatch,
-                score: (matched_skills.len() as f64) * 8.0,
-                detail: format!("Matching skills: {}.", matched_skills.join(", ")),
-            });
-        }
-
         let load_penalty = (active_load as f64) * 12.0;
         score -= load_penalty;
         if load_penalty > 0.0 {

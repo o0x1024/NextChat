@@ -16,6 +16,7 @@ import type {
   Lease,
   MemoryItem,
   OwnerBlockerResolution,
+  PendingUserQuestion,
   SendHumanMessageInput,
   SkillDetail,
   UpdateSkillDetailInput,
@@ -87,6 +88,7 @@ export const dashboardEventNames = [
   "lease:granted",
   "lease:preempt-requested",
   "task:status-changed",
+  "pending-user-question:updated",
   "tool:run-started",
   "tool:run-completed",
   "approval:requested",
@@ -103,6 +105,7 @@ export interface DashboardEventPayloadMap {
   "lease:granted": Lease;
   "lease:preempt-requested": Lease;
   "task:status-changed": TaskCard;
+  "pending-user-question:updated": PendingUserQuestion;
   "tool:run-started": ToolRun;
   "tool:run-completed": ToolRun;
   "approval:requested": ToolRun;

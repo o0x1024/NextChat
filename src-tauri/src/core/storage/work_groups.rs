@@ -116,6 +116,12 @@ impl Storage {
                 params![work_group_id],
             )?;
             conn.execute(
+                "DELETE FROM workflow_checkpoints
+                 WHERE workflow_id IN (SELECT id FROM workflows WHERE work_group_id = ?1)
+                 OR task_id IN (SELECT id FROM task_cards WHERE work_group_id = ?1)",
+                params![work_group_id],
+            )?;
+            conn.execute(
                 "DELETE FROM claim_bids
                  WHERE task_card_id IN (SELECT id FROM task_cards WHERE work_group_id = ?1)",
                 params![work_group_id],
@@ -184,6 +190,12 @@ impl Storage {
             )?;
             conn.execute(
                 "DELETE FROM task_dispatches
+                 WHERE workflow_id IN (SELECT id FROM workflows WHERE work_group_id = ?1)
+                 OR task_id IN (SELECT id FROM task_cards WHERE work_group_id = ?1)",
+                params![work_group_id],
+            )?;
+            conn.execute(
+                "DELETE FROM workflow_checkpoints
                  WHERE workflow_id IN (SELECT id FROM workflows WHERE work_group_id = ?1)
                  OR task_id IN (SELECT id FROM task_cards WHERE work_group_id = ?1)",
                 params![work_group_id],

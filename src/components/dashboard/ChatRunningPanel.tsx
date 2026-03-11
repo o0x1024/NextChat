@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import type { Language } from "../../store/preferencesStore";
 import type {
   AgentProfile,
   ClaimBid,
@@ -9,8 +10,10 @@ import type {
   TaskBlockerRecord,
   ToolManifest,
   ToolRun,
+  WorkflowCheckpointRecord,
 } from "../../types";
 import { statusBadgeClass } from "./ui";
+import { WorkflowCheckpointPanel } from "./WorkflowCheckpointPanel";
 
 type BlockerAction =
   | "provide_context"
@@ -33,6 +36,7 @@ interface BlockerDraft {
 }
 
 interface ChatRunningPanelProps {
+  language: Language;
   activeTasks: TaskCard[];
   currentLeases: Lease[];
   currentApprovals: ToolRun[];
@@ -41,6 +45,7 @@ interface ChatRunningPanelProps {
   claimBids: ClaimBid[];
   agents: AgentProfile[];
   tools: ToolManifest[];
+  workflowCheckpoints: WorkflowCheckpointRecord[];
   highlightedTaskId: string | null;
   highlightedBlockerId: string | null;
   targetBlockerId: string | null;
@@ -124,6 +129,7 @@ function buildResolution(draft: BlockerDraft): OwnerBlockerResolution | null {
 }
 
 export function ChatRunningPanel({
+  language,
   activeTasks,
   currentLeases,
   currentApprovals,
@@ -132,6 +138,7 @@ export function ChatRunningPanel({
   claimBids,
   agents,
   tools,
+  workflowCheckpoints,
   highlightedTaskId,
   highlightedBlockerId,
   targetBlockerId,
@@ -295,6 +302,14 @@ export function ChatRunningPanel({
           </div>
         </div>
       </section>
+
+      <WorkflowCheckpointPanel
+        language={language}
+        tasks={currentGroupTasks}
+        agents={agents}
+        checkpoints={workflowCheckpoints}
+        onOpenTask={onJumpToTaskBoard}
+      />
 
       <section className="card card-border bg-base-100">
         <div className="card-body gap-3">

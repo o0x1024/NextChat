@@ -34,7 +34,7 @@ pub(super) struct TaskFailureReport {
 impl AppService {
     pub(super) fn handle_pending_user_question_request<R: Runtime>(
         &self,
-        _app: &AppHandle<R>,
+        app: &AppHandle<R>,
         task_card_id: &str,
         tool_run_id: Option<&str>,
         error: &anyhow::Error,
@@ -95,23 +95,24 @@ impl AppService {
         self.storage.insert_message(&question_message)?;
         self.storage.insert_task_blocker(&blocker)?;
 
-        self.storage
-            .insert_pending_user_question(&PendingUserQuestion {
-                id: new_id(),
-                work_group_id: task.work_group_id.clone(),
-                task_card_id: task.id.clone(),
-                agent_id: agent.id.clone(),
-                tool_run_id: tool_run_id.map(ToOwned::to_owned),
-                question: signal.question.clone(),
-                options: signal.options.clone(),
-                context: signal.context.clone(),
-                allow_free_form: signal.allow_free_form,
-                asked_message_id: question_message.id.clone(),
-                answer_message_id: None,
-                status: PendingUserQuestionStatus::Pending,
-                created_at: now(),
-                answered_at: None,
-            })?;
+        let pending_question = PendingUserQuestion {
+            id: new_id(),
+            work_group_id: task.work_group_id.clone(),
+            task_card_id: task.id.clone(),
+            agent_id: agent.id.clone(),
+            tool_run_id: tool_run_id.map(ToOwned::to_owned),
+            question: signal.question.clone(),
+            options: signal.options.clone(),
+            context: signal.context.clone(),
+            allow_free_form: signal.allow_free_form,
+            asked_message_id: question_message.id.clone(),
+            answer_message_id: None,
+            status: PendingUserQuestionStatus::Pending,
+            created_at: now(),
+            answered_at: None,
+        };
+        self.storage.insert_pending_user_question(&pending_question)?;
+        emit(app, "pending-user-question:updated", &pending_question)?;
 
         let audit_event = AuditEvent {
             id: new_id(),

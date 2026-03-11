@@ -158,6 +158,27 @@ impl Storage {
                   resolved_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS workflow_checkpoints (
+                  id TEXT PRIMARY KEY,
+                  workflow_id TEXT,
+                  stage_id TEXT,
+                  task_id TEXT,
+                  stage_title TEXT,
+                  task_title TEXT,
+                  assignee_agent_id TEXT,
+                  assignee_name TEXT,
+                  status TEXT NOT NULL,
+                  working_directory TEXT NOT NULL,
+                  repo_snapshot_json TEXT NOT NULL,
+                  artifact_summary_json TEXT NOT NULL,
+                  todo_snapshot_json TEXT NOT NULL,
+                  resume_hint TEXT,
+                  failure_count INTEGER NOT NULL DEFAULT 0,
+                  last_error TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS claim_bids (
                   id TEXT PRIMARY KEY,
                   task_card_id TEXT NOT NULL,
@@ -242,6 +263,9 @@ impl Storage {
                 CREATE INDEX IF NOT EXISTS idx_workflow_stages_workflow ON workflow_stages(workflow_id, order_index);
                 CREATE INDEX IF NOT EXISTS idx_task_dispatches_workflow ON task_dispatches(workflow_id, stage_id);
                 CREATE INDEX IF NOT EXISTS idx_task_blockers_task ON task_blockers(task_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_workflow_checkpoints_workflow ON workflow_checkpoints(workflow_id, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_workflow_checkpoints_stage ON workflow_checkpoints(stage_id, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_workflow_checkpoints_task ON workflow_checkpoints(task_id, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_bids_task ON claim_bids(task_card_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_leases_task ON leases(task_card_id);
                 CREATE INDEX IF NOT EXISTS idx_tool_runs_task ON tool_runs(task_card_id);
@@ -336,7 +360,6 @@ impl Storage {
                     "SC",
                     "Research Lead",
                     "Map the problem space, gather context, and keep the team aligned on evidence.",
-                    vec!["skill.research".to_string()],
                     vec![
                         "Skills".to_string(),
                         "Grep".to_string(),
@@ -352,7 +375,6 @@ impl Storage {
                     "BD",
                     "Systems Engineer",
                     "Turn task cards into executable changes, plans, and runnable artifacts.",
-                    vec!["skill.builder".to_string()],
                     vec![
                         "Skills".to_string(),
                         "Read".to_string(),
@@ -373,7 +395,6 @@ impl Storage {
                     "RV",
                     "Quality Reviewer",
                     "Stress test proposals, spot regressions, and keep the bar high.",
-                    vec!["skill.reviewer".to_string()],
                     vec![
                         "Skills".to_string(),
                         "Read".to_string(),
@@ -386,7 +407,7 @@ impl Storage {
             ];
 
             let mut agent_ids = Vec::new();
-            for (name, avatar, role, objective, skill_ids, tool_ids) in agent_specs {
+            for (name, avatar, role, objective, tool_ids) in agent_specs {
                 let id = new_id();
                 agent_ids.push(id.clone());
                 conn.execute(
@@ -403,7 +424,7 @@ impl Storage {
                         role,
                         objective,
                         json(&ModelPolicy::default())?,
-                        json(&skill_ids)?,
+                        json(&Vec::<String>::new())?,
                         json(&tool_ids)?,
                         2_i64,
                         1_i64,
@@ -491,7 +512,9 @@ impl Storage {
             work_groups: self.list_work_groups()?,
             messages: self.list_messages()?,
             task_cards: self.list_task_cards(None)?,
+            pending_user_questions: self.list_pending_user_questions()?,
             task_blockers: self.list_task_blockers()?,
+            workflow_checkpoints: self.list_all_workflow_checkpoints()?,
             claim_bids: self.list_claim_bids()?,
             leases: self.list_leases()?,
             tool_runs: self.list_tool_runs()?,
@@ -744,6 +767,24 @@ impl Storage {
             )
             .optional()
             .map_err(Into::into)
+        })
+    }
+
+    pub fn list_pending_user_questions(&self) -> Result<Vec<PendingUserQuestion>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT
+                  id, work_group_id, task_card_id, agent_id, tool_run_id, question, options,
+                  context, allow_free_form, asked_message_id, answer_message_id, status, created_at, answered_at
+                FROM pending_user_questions
+                WHERE status = ?1
+                ORDER BY created_at DESC
+                "#,
+            )?;
+            let rows =
+                stmt.query_map(params![json(&PendingUserQuestionStatus::Pending)?], map_pending_user_question)?;
+            collect_rows(rows)
         })
     }
 

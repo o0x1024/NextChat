@@ -7,12 +7,14 @@ import type {
   CreateWorkGroupInput,
   Lease,
   OwnerBlockerResolution,
+  PendingUserQuestion,
   SystemSettings,
   TaskCard,
   TaskBlockerRecord,
   ToolManifest,
   ToolRun,
   UpdateWorkGroupInput,
+  WorkflowCheckpointRecord,
   WorkGroup,
 } from "../../types";
 import type { Language } from "../../store/preferencesStore";
@@ -23,7 +25,9 @@ export interface ChatManagementProps {
   messages: ConversationMessage[];
   chatStreamTracks: ChatStreamTrack[];
   taskCards: TaskCard[];
+  pendingUserQuestions: PendingUserQuestion[];
   taskBlockers: TaskBlockerRecord[];
+  workflowCheckpoints: WorkflowCheckpointRecord[];
   leases: Lease[];
   claimBids: ClaimBid[];
   toolRuns: ToolRun[];

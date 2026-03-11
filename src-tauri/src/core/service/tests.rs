@@ -6,8 +6,9 @@ use crate::core::domain::{
 };
 use crate::core::workflow::{
     BlockerCategory, BlockerResolutionTarget, NarrativeEnvelope, RaiseTaskBlockerInput,
-    RequestRouteMode, StageStatus, TaskDispatchRecord, TaskDispatchSource, WorkflowExecutionMode,
-    WorkflowRecord, WorkflowStageRecord, WorkflowStatus,
+    RequestRouteMode, StageStatus, TaskDispatchRecord, TaskDispatchSource,
+    WorkflowCheckpointStatus, WorkflowExecutionMode, WorkflowRecord, WorkflowStageRecord,
+    WorkflowStatus,
 };
 use anyhow::anyhow;
 use std::{
@@ -81,7 +82,7 @@ fn minimal_group_flow_creates_task_lease_and_agent_summary() {
             provider: "mock".into(),
             model: "simulation".into(),
             temperature: 0.2,
-            skill_ids: vec!["skill.builder".into()],
+            skill_ids: vec![],
             tool_ids: vec!["plan.summarize".into()],
             max_parallel_runs: 2,
             can_spawn_subtasks: true,
@@ -98,7 +99,7 @@ fn minimal_group_flow_creates_task_lease_and_agent_summary() {
             provider: "mock".into(),
             model: "simulation".into(),
             temperature: 0.2,
-            skill_ids: vec!["skill.reviewer".into()],
+            skill_ids: vec![],
             tool_ids: vec!["plan.summarize".into()],
             max_parallel_runs: 2,
             can_spawn_subtasks: false,
@@ -216,7 +217,7 @@ fn permission_denial_moves_task_to_review_and_records_audit() {
             provider: "mock".into(),
             model: "simulation".into(),
             temperature: 0.2,
-            skill_ids: vec!["skill.builder".into()],
+            skill_ids: vec![],
             tool_ids: vec!["file.readwrite".into()],
             max_parallel_runs: 1,
             can_spawn_subtasks: false,
@@ -1175,7 +1176,7 @@ fn memory_policy_injects_snapshot_and_respects_write_scope() {
             provider: "mock".into(),
             model: "simulation".into(),
             temperature: 0.2,
-            skill_ids: vec!["skill.research".into()],
+            skill_ids: vec![],
             tool_ids: vec!["plan.summarize".into()],
             max_parallel_runs: 1,
             can_spawn_subtasks: false,
@@ -1478,7 +1479,7 @@ fn child_task_emits_collaboration_request_and_result_messages() {
             provider: "mock".into(),
             model: "simulation".into(),
             temperature: 0.2,
-            skill_ids: vec!["skill.builder".into()],
+            skill_ids: vec![],
             tool_ids: vec!["plan.summarize".into()],
             max_parallel_runs: 2,
             can_spawn_subtasks: true,
@@ -1495,7 +1496,7 @@ fn child_task_emits_collaboration_request_and_result_messages() {
             provider: "mock".into(),
             model: "simulation".into(),
             temperature: 0.2,
-            skill_ids: vec!["skill.reviewer".into()],
+            skill_ids: vec![],
             tool_ids: vec!["plan.summarize".into()],
             max_parallel_runs: 1,
             can_spawn_subtasks: false,
@@ -1878,4 +1879,304 @@ fn execution_failure_moves_task_to_review_and_releases_lease() {
         .expect("tool run");
     assert_eq!(tool_run.state, ToolRunState::Cancelled);
     assert!(tool_run.finished_at.is_some());
+}
+
+#[test]
+fn task_checkpoint_persists_repo_snapshot_and_resume_hint() {
+    let (service, workspace_root, _) = setup_service();
+    let worker_id = create_agent(&service, "执行成员", "Execution Engineer");
+    let work_group = service
+        .create_work_group(CreateWorkGroupInput {
+            name: "Checkpoint Group".into(),
+            goal: "Verify checkpoint persistence.".into(),
+            working_directory: workspace_root.to_string_lossy().into_owned(),
+            kind: WorkGroupKind::Persistent,
+            default_visibility: "summary".into(),
+            auto_archive: false,
+            member_agent_ids: None,
+        })
+        .expect("group");
+    service
+        .add_agent_to_work_group(&work_group.id, &worker_id)
+        .expect("add worker");
+
+    let task = TaskCard {
+        id: new_id(),
+        parent_id: None,
+        source_message_id: new_id(),
+        title: "Persist checkpoint".into(),
+        normalized_goal: "Persist checkpoint for retry.".into(),
+        input_payload: "Persist checkpoint for retry.".into(),
+        priority: 10,
+        status: TaskStatus::InProgress,
+        work_group_id: work_group.id.clone(),
+        created_by: "human".into(),
+        assigned_agent_id: Some(worker_id),
+        created_at: now(),
+    };
+    service.storage.insert_task_card(&task).expect("task");
+
+    service
+        .record_task_checkpoint(
+            &task,
+            WorkflowCheckpointStatus::TaskRunning,
+            1,
+            Some("resume from checkpoint".into()),
+            Some("boom".into()),
+        )
+        .expect("checkpoint");
+
+    let checkpoint = service
+        .storage
+        .latest_workflow_checkpoint_for_task(&task.id)
+        .expect("checkpoint query")
+        .expect("checkpoint exists");
+    assert_eq!(checkpoint.task_id.as_deref(), Some(task.id.as_str()));
+    assert_eq!(checkpoint.status, WorkflowCheckpointStatus::TaskRunning);
+    assert_eq!(checkpoint.failure_count, 1);
+    assert_eq!(
+        checkpoint.resume_hint.as_deref(),
+        Some("resume from checkpoint")
+    );
+    assert_eq!(checkpoint.last_error.as_deref(), Some("boom"));
+    assert!(checkpoint.repo_snapshot.is_empty);
+}
+
+#[test]
+fn retryable_failure_reassigns_greenfield_architecture_task_to_execution_agent() {
+    let (service, workspace_root, _) = setup_service();
+    let app = tauri::test::mock_app();
+    let app_handle = app.handle().clone();
+
+    let architect_id = create_agent(&service, "架构师1", "系统架构师");
+    let fullstack = service
+        .create_agent_profile(CreateAgentInput {
+            name: "全栈开发专家".into(),
+            avatar: "FS".into(),
+            role: "全栈工程师".into(),
+            objective: "直接实现前端项目并交付最小可运行版本。".into(),
+            provider: "mock".into(),
+            model: "simulation".into(),
+            temperature: 0.2,
+            skill_ids: vec![],
+            tool_ids: vec!["Write".into(), "Edit".into(), "Bash".into()],
+            max_parallel_runs: 2,
+            can_spawn_subtasks: false,
+            memory_policy: MemoryPolicy::default(),
+            permission_policy: AgentPermissionPolicy::default(),
+        })
+        .expect("fullstack");
+
+    let work_group = service
+        .create_work_group(CreateWorkGroupInput {
+            name: "Retry Group".into(),
+            goal: "Verify retryable failures can degrade into execution handoff.".into(),
+            working_directory: workspace_root.to_string_lossy().into_owned(),
+            kind: WorkGroupKind::Persistent,
+            default_visibility: "summary".into(),
+            auto_archive: false,
+            member_agent_ids: None,
+        })
+        .expect("group");
+    service
+        .add_agent_to_work_group(&work_group.id, &architect_id)
+        .expect("add architect");
+    service
+        .add_agent_to_work_group(&work_group.id, &fullstack.id)
+        .expect("add fullstack");
+
+    let owner_id = service
+        .storage
+        .get_work_group_owner_id(&work_group.id)
+        .expect("owner query")
+        .expect("owner");
+
+    let workflow = WorkflowRecord {
+        id: new_id(),
+        work_group_id: work_group.id.clone(),
+        source_message_id: new_id(),
+        route_mode: RequestRouteMode::OwnerOrchestrated,
+        title: "创新贪吃蛇".into(),
+        normalized_intent: "开发一个不一样的贪吃蛇游戏，仅前端即可，不需要后端".into(),
+        status: WorkflowStatus::Running,
+        owner_agent_id: owner_id,
+        current_stage_id: Some("stage-architecture".into()),
+        created_at: now(),
+    };
+    service
+        .storage
+        .insert_workflow(&workflow)
+        .expect("workflow");
+    service
+        .storage
+        .insert_workflow_stage(&WorkflowStageRecord {
+            id: "stage-architecture".into(),
+            workflow_id: workflow.id.clone(),
+            title: "技术方案与架构设计".into(),
+            goal: "确定技术栈和核心模块".into(),
+            order_index: 1,
+            execution_mode: WorkflowExecutionMode::Serial,
+            status: StageStatus::Running,
+            entry_message_id: None,
+            completion_message_id: None,
+            created_at: now(),
+        })
+        .expect("stage");
+
+    let task = TaskCard {
+        id: new_id(),
+        parent_id: None,
+        source_message_id: workflow.source_message_id.clone(),
+        title: "设计前端技术架构与模块划分".into(),
+        normalized_goal: "主导设计游戏的整体前端架构，包括技术选型和模块划分".into(),
+        input_payload: "主导设计游戏的整体前端架构，包括技术选型和模块划分".into(),
+        priority: 80,
+        status: TaskStatus::InProgress,
+        work_group_id: work_group.id.clone(),
+        created_by: "human".into(),
+        assigned_agent_id: Some(architect_id.clone()),
+        created_at: now(),
+    };
+    service.storage.insert_task_card(&task).expect("task");
+    service
+        .storage
+        .insert_task_dispatch(&TaskDispatchRecord {
+            task_id: task.id.clone(),
+            workflow_id: Some(workflow.id.clone()),
+            stage_id: Some("stage-architecture".into()),
+            dispatch_source: TaskDispatchSource::OwnerAssign,
+            depends_on_task_ids: vec![],
+            acknowledged_at: Some(now()),
+            result_message_id: None,
+            locked_by_user_mention: false,
+            target_agent_id: architect_id.clone(),
+            route_mode: RequestRouteMode::OwnerOrchestrated,
+            narrative_stage_label: Some("技术方案与架构设计".into()),
+            narrative_task_label: Some(task.title.clone()),
+        })
+        .expect("dispatch");
+    service
+        .storage
+        .insert_lease(&Lease {
+            id: new_id(),
+            task_card_id: task.id.clone(),
+            owner_agent_id: architect_id.clone(),
+            state: LeaseState::Active,
+            granted_at: now(),
+            expires_at: None,
+            preempt_requested_at: None,
+            released_at: None,
+        })
+        .expect("lease");
+    service
+        .record_task_checkpoint(
+            &task,
+            WorkflowCheckpointStatus::TaskRetryScheduled,
+            2,
+            Some("old checkpoint".into()),
+            Some("InternalServiceError".into()),
+        )
+        .expect("seed checkpoint");
+
+    let report = service
+        .handle_retryable_task_execution_failure(
+            &app_handle,
+            &task.id,
+            None,
+            &anyhow!(
+                "CompletionError: HttpError: Invalid status code 500 Internal Server Error with message: {{\"error\":{{\"code\":\"InternalServiceError\"}}}}"
+            ),
+        )
+        .expect("retryable handler")
+        .expect("report");
+
+    let updated_task = service
+        .storage
+        .get_task_card(&task.id)
+        .expect("updated task");
+    assert_eq!(
+        updated_task.assigned_agent_id.as_deref(),
+        Some(fullstack.id.as_str())
+    );
+    assert!(
+        updated_task.input_payload.contains("恢复执行要求"),
+        "expected greenfield resume hint to be appended"
+    );
+
+    let updated_dispatch = service
+        .storage
+        .get_task_dispatch(&task.id)
+        .expect("dispatch query")
+        .expect("dispatch");
+    assert_eq!(updated_dispatch.target_agent_id, fullstack.id);
+
+    let checkpoint = service
+        .storage
+        .latest_workflow_checkpoint_for_task(&task.id)
+        .expect("checkpoint query")
+        .expect("checkpoint");
+    assert_eq!(checkpoint.status, WorkflowCheckpointStatus::TaskReassigned);
+    assert!(checkpoint.repo_snapshot.is_empty);
+    assert!(report
+        .message
+        .expect("message")
+        .content
+        .contains("直接实现 MVP"));
+}
+
+#[test]
+fn dashboard_state_exposes_workflow_checkpoints() {
+    let (service, workspace_root, _) = setup_service();
+    let worker_id = create_agent(&service, "执行成员", "Execution Engineer");
+    let work_group = service
+        .create_work_group(CreateWorkGroupInput {
+            name: "Dashboard Checkpoint Group".into(),
+            goal: "Verify dashboard state includes workflow checkpoints.".into(),
+            working_directory: workspace_root.to_string_lossy().into_owned(),
+            kind: WorkGroupKind::Persistent,
+            default_visibility: "summary".into(),
+            auto_archive: false,
+            member_agent_ids: None,
+        })
+        .expect("group");
+    service
+        .add_agent_to_work_group(&work_group.id, &worker_id)
+        .expect("add worker");
+
+    let task = TaskCard {
+        id: new_id(),
+        parent_id: None,
+        source_message_id: new_id(),
+        title: "Checkpoint for dashboard".into(),
+        normalized_goal: "Expose checkpoint in dashboard state.".into(),
+        input_payload: "Expose checkpoint in dashboard state.".into(),
+        priority: 10,
+        status: TaskStatus::InProgress,
+        work_group_id: work_group.id,
+        created_by: "human".into(),
+        assigned_agent_id: Some(worker_id),
+        created_at: now(),
+    };
+    service.storage.insert_task_card(&task).expect("task");
+    service
+        .record_task_checkpoint(
+            &task,
+            WorkflowCheckpointStatus::TaskRunning,
+            0,
+            Some("dashboard resume hint".into()),
+            None,
+        )
+        .expect("checkpoint");
+
+    let state = service.dashboard_state().expect("dashboard state");
+    let checkpoint = state
+        .workflow_checkpoints
+        .into_iter()
+        .find(|item| item.task_id.as_deref() == Some(task.id.as_str()))
+        .expect("checkpoint in dashboard");
+    assert_eq!(checkpoint.status, WorkflowCheckpointStatus::TaskRunning);
+    assert_eq!(
+        checkpoint.resume_hint.as_deref(),
+        Some("dashboard resume hint")
+    );
 }

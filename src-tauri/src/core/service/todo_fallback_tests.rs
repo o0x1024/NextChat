@@ -41,7 +41,7 @@ fn plain_message_does_not_trigger_todowrite_permission_denial_when_unbound() {
             provider: "mock".into(),
             model: "simulation".into(),
             temperature: 0.2,
-            skill_ids: vec!["skill.reviewer".into(), "skill.research".into()],
+            skill_ids: vec![],
             tool_ids: vec![
                 "Read".into(),
                 "Grep".into(),
@@ -133,7 +133,7 @@ fn mentioned_agent_without_todowrite_is_not_failed_by_global_todowrite_fallback(
             provider: "mock".into(),
             model: "simulation".into(),
             temperature: 0.2,
-            skill_ids: vec!["skill.reviewer".into(), "skill.research".into()],
+            skill_ids: vec![],
             tool_ids: vec![
                 "Read".into(),
                 "Grep".into(),
@@ -155,7 +155,7 @@ fn mentioned_agent_without_todowrite_is_not_failed_by_global_todowrite_fallback(
             provider: "mock".into(),
             model: "simulation".into(),
             temperature: 0.2,
-            skill_ids: vec!["skill.builder".into()],
+            skill_ids: vec![],
             tool_ids: vec!["TodoWrite".into(), "Read".into()],
             max_parallel_runs: 1,
             can_spawn_subtasks: false,

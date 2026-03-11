@@ -13,7 +13,7 @@ use rig::{
     providers::{anthropic, gemini, openai},
     streaming::{StreamedAssistantContent, StreamingPrompt},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
@@ -24,8 +24,10 @@ use crate::core::{
         TaskExecutionContext, ToolCallProgressEvent, ToolCallProgressPhase, ToolHandler,
     },
     logging,
+    permissions::APPROVAL_REQUIRED_PREFIX,
     rig_tools::{build_rig_tools, sanitize_rig_tool_name, RigToolCallLog, RigToolEvent},
     stream_text::merge_stream_text,
+    tool_approval::{annotate_approval_request_error, PendingToolApprovalRequest},
 };
 
 #[derive(Debug, Clone)]
@@ -99,16 +101,7 @@ where
     M: CompletionModel,
 {
     async fn on_completion_call(&self, prompt: &Message, history: &[Message]) -> HookAction {
-        self.log(
-            "completion_call",
-            merge_json(
-                self.common_payload(),
-                json!({
-                    "historyCount": history.len(),
-                    "prompt": serialize_for_log(prompt, 16_000),
-                }),
-            ),
-        );
+        let _ = (prompt, history);
         HookAction::cont()
     }
 
@@ -117,17 +110,7 @@ where
         _prompt: &Message,
         response: &CompletionResponse<M::Response>,
     ) -> HookAction {
-        self.log(
-            "completion_response",
-            merge_json(
-                self.common_payload(),
-                json!({
-                    "messageId": response.message_id,
-                    "usage": response.usage,
-                    "choice": serialize_for_log(&response.choice, 16_000),
-                }),
-            ),
-        );
+        let _ = response;
         HookAction::cont()
     }
 
@@ -455,16 +438,6 @@ fn new_llm_log_context(
         agent_name: agent_name.map(ToOwned::to_owned),
         task_card_id: task_card_id.map(ToOwned::to_owned),
         work_group_id: work_group_id.map(ToOwned::to_owned),
-    }
-}
-
-fn serialize_for_log<T>(value: &T, max_chars: usize) -> String
-where
-    T: Serialize,
-{
-    match serde_json::to_string(value) {
-        Ok(serialized) => logging::truncate(&serialized, max_chars),
-        Err(error) => format!("<serialization_error: {error}>"),
     }
 }
 
@@ -1097,6 +1070,23 @@ where
     let (summary, tool_events) = match result {
         Ok(result) => result,
         Err(error) => {
+            let tool_events = call_log.snapshot();
+            let error = if error.to_string().contains(APPROVAL_REQUIRED_PREFIX) {
+                if let Some(event) = tool_events.last() {
+                    annotate_approval_request_error(
+                        error,
+                        &PendingToolApprovalRequest {
+                            tool_id: event.tool_id.clone(),
+                            tool_name: event.tool_name.clone(),
+                            input: event.input.clone(),
+                        },
+                    )
+                } else {
+                    error
+                }
+            } else {
+                error
+            };
             log_llm_error(&log_context, &error);
             return Err(error);
         }

@@ -43,8 +43,6 @@ function exposureBadgeClass(reason: ToolExposureReason) {
   switch (reason) {
     case "blocked_by_permission":
       return "badge-error";
-    case "blocked_by_skill":
-      return "badge-warning";
     case "not_bound":
       return "badge-ghost";
     default:
@@ -82,12 +80,10 @@ export function AgentWorkspace({
   const selectedSkills = currentAgent
     ? selectedSkillsForAgent(currentAgent, skills)
     : [];
-  const mappedSkills = currentAgent
-    ? currentAgent.skillIds.map((skillId) => skills.find((skill) => skill.id === skillId))
-    : [];
   const allowedSkillTags = Array.from(
     new Set(selectedSkills.flatMap((skill) => skill.allowedToolTags)),
   );
+  const skillsToolEnabled = currentAgent?.toolIds.includes("Skills") ?? false;
   const toolAvailability = currentAgent
     ? tools.map((tool) => ({
         tool,
@@ -234,7 +230,7 @@ export function AgentWorkspace({
                     </div>
                     <div className="rounded-box bg-base-200 px-3 py-2">
                       <span>{t("skills")}</span>
-                      <span className="font-medium">{currentAgent?.skillIds.length ?? 0}</span>
+                      <span className="font-medium">{selectedSkills.length}</span>
                     </div>
                     <div className="rounded-box bg-base-200 px-3 py-2">
                       <span>{t("tools")}</span>
@@ -293,11 +289,19 @@ export function AgentWorkspace({
                   <div className="flex items-center justify-between">
                     <h3 className="card-title text-base">{t("skills")}</h3>
                     <span className="badge badge-secondary">
-                      {currentAgent?.skillIds.length ?? 0}
+                      {selectedSkills.length}
                     </span>
                   </div>
 
                   <div className="space-y-2">
+                    <div className="rounded-box bg-base-200 px-3 py-2 text-sm text-base-content/60">
+                      <div className="font-medium text-base-content">
+                        {t("skillsToolExposure")}
+                      </div>
+                      <div className="mt-1">
+                        {skillsToolEnabled ? t("enabled") : t("disabled")}
+                      </div>
+                    </div>
                     <div className="rounded-box bg-base-200 px-3 py-2 text-sm text-base-content/60">
                       <div className="font-medium text-base-content">
                         {t("skillAllowedToolTags")}
@@ -306,27 +310,18 @@ export function AgentWorkspace({
                         {allowedSkillTags.join(", ") || t("notAvailable")}
                       </div>
                     </div>
-                    {mappedSkills.map((skill, index) =>
-                      skill ? (
-                        <div
-                          key={skill.id}
-                          className="rounded-box bg-base-200 p-3"
-                        >
-                          <div className="font-medium">{skill.name}</div>
-                          <div className="mt-1 text-sm text-base-content/60">
-                            {skill.allowedToolTags.join(", ") || t("notAvailable")}
-                          </div>
+                    {selectedSkills.map((skill) => (
+                      <div
+                        key={skill.id}
+                        className="rounded-box bg-base-200 p-3"
+                      >
+                        <div className="font-medium">{skill.name}</div>
+                        <div className="mt-1 text-sm text-base-content/60">
+                          {skill.allowedToolTags.join(", ") || t("notAvailable")}
                         </div>
-                      ) : (
-                        <div
-                          key={currentAgent?.skillIds[index] ?? index}
-                          className="badge badge-primary"
-                        >
-                          {currentAgent?.skillIds[index]}
-                        </div>
-                      ),
-                    )}
-                    {(currentAgent?.skillIds.length ?? 0) === 0 ? (
+                      </div>
+                    ))}
+                    {selectedSkills.length === 0 ? (
                       <span className="text-sm text-base-content/60">{t("notAvailable")}</span>
                     ) : null}
                   </div>
@@ -362,11 +357,7 @@ export function AgentWorkspace({
                               {tool.description}
                             </div>
                             <div className="mt-1 text-xs text-base-content/50">
-                              {reason === "blocked_by_skill"
-                                ? t("toolStatusBlockedBySkillHint", {
-                                    category: tool.category,
-                                  })
-                                : t(`toolStatusHint.${reason}`)}
+                              {t(`toolStatusHint.${reason}`)}
                             </div>
                           </div>
                           <div className="flex flex-col items-end gap-2">

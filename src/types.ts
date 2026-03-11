@@ -32,6 +32,7 @@ export type ToolRunState =
   | "running"
   | "completed"
   | "cancelled";
+export type PendingUserQuestionStatus = "pending" | "answered" | "cancelled";
 export type BlockerResolutionTarget = "owner" | "user";
 export type BlockerCategory =
   | "missing_dependency"
@@ -69,7 +70,6 @@ export interface AgentProfile {
   role: string;
   objective: string;
   modelPolicy: ModelPolicy;
-  skillIds: string[];
   toolIds: string[];
   maxParallelRuns: number;
   canSpawnSubtasks: boolean;
@@ -223,6 +223,23 @@ export interface ToolRun {
   resultRef?: string | null;
 }
 
+export interface PendingUserQuestion {
+  id: string;
+  workGroupId: string;
+  taskCardId: string;
+  agentId: string;
+  toolRunId?: string | null;
+  question: string;
+  options: string[];
+  context?: string | null;
+  allowFreeForm: boolean;
+  askedMessageId: string;
+  answerMessageId?: string | null;
+  status: PendingUserQuestionStatus;
+  createdAt: string;
+  answeredAt?: string | null;
+}
+
 export interface TaskBlockerRecord {
   id: string;
   taskId: string;
@@ -235,6 +252,47 @@ export interface TaskBlockerRecord {
   status: BlockerStatus;
   createdAt: string;
   resolvedAt?: string | null;
+}
+
+export type WorkflowCheckpointStatus =
+  | "workflowPlanned"
+  | "workflowRunning"
+  | "workflowCompleted"
+  | "stagePending"
+  | "stageRunning"
+  | "stageCompleted"
+  | "taskReady"
+  | "taskRunning"
+  | "taskRetryableFailure"
+  | "taskRetryScheduled"
+  | "taskReassigned"
+  | "taskCompleted";
+
+export interface WorkflowRepoSnapshot {
+  entryCount: number;
+  isEmpty: boolean;
+  topLevelEntries: string[];
+}
+
+export interface WorkflowCheckpointRecord {
+  id: string;
+  workflowId?: string | null;
+  stageId?: string | null;
+  taskId?: string | null;
+  stageTitle?: string | null;
+  taskTitle?: string | null;
+  assigneeAgentId?: string | null;
+  assigneeName?: string | null;
+  status: WorkflowCheckpointStatus;
+  workingDirectory: string;
+  repoSnapshot: WorkflowRepoSnapshot;
+  artifactSummary: string[];
+  todoSnapshot: string[];
+  resumeHint?: string | null;
+  failureCount: number;
+  lastError?: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export type OwnerBlockerResolution =
@@ -377,7 +435,9 @@ export interface DashboardState {
   workGroups: WorkGroup[];
   messages: ConversationMessage[];
   taskCards: TaskCard[];
+  pendingUserQuestions: PendingUserQuestion[];
   taskBlockers: TaskBlockerRecord[];
+  workflowCheckpoints: WorkflowCheckpointRecord[];
   claimBids: ClaimBid[];
   leases: Lease[];
   toolRuns: ToolRun[];
@@ -396,7 +456,6 @@ export interface CreateAgentInput {
   provider: string;
   model: string;
   temperature: number;
-  skillIds: string[];
   toolIds: string[];
   maxParallelRuns: number;
   canSpawnSubtasks: boolean;

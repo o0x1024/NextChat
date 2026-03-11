@@ -3,7 +3,8 @@ use rusqlite::{params, OptionalExtension};
 
 use super::{collect_rows, decode, json, Storage};
 use crate::core::workflow::{
-    BlockerStatus, TaskBlockerRecord, TaskDispatchRecord, WorkflowRecord, WorkflowStageRecord,
+    BlockerStatus, TaskBlockerRecord, TaskDispatchRecord, WorkflowCheckpointRecord, WorkflowRecord,
+    WorkflowStageRecord,
 };
 
 impl Storage {
@@ -185,6 +186,110 @@ impl Storage {
         })
     }
 
+    pub fn insert_workflow_checkpoint(&self, checkpoint: &WorkflowCheckpointRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"
+                INSERT OR REPLACE INTO workflow_checkpoints (
+                  id, workflow_id, stage_id, task_id, stage_title, task_title,
+                  assignee_agent_id, assignee_name, status, working_directory,
+                  repo_snapshot_json, artifact_summary_json, todo_snapshot_json,
+                  resume_hint, failure_count, last_error, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                "#,
+                params![
+                    checkpoint.id,
+                    checkpoint.workflow_id,
+                    checkpoint.stage_id,
+                    checkpoint.task_id,
+                    checkpoint.stage_title,
+                    checkpoint.task_title,
+                    checkpoint.assignee_agent_id,
+                    checkpoint.assignee_name,
+                    json(&checkpoint.status)?,
+                    checkpoint.working_directory,
+                    json(&checkpoint.repo_snapshot)?,
+                    json(&checkpoint.artifact_summary)?,
+                    json(&checkpoint.todo_snapshot)?,
+                    checkpoint.resume_hint,
+                    checkpoint.failure_count,
+                    checkpoint.last_error,
+                    checkpoint.created_at,
+                    checkpoint.updated_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn latest_workflow_checkpoint_for_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<WorkflowCheckpointRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT * FROM workflow_checkpoints WHERE task_id = ?1 ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+                params![task_id],
+                map_workflow_checkpoint,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn latest_workflow_checkpoint_for_stage(
+        &self,
+        stage_id: &str,
+    ) -> Result<Option<WorkflowCheckpointRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT * FROM workflow_checkpoints WHERE stage_id = ?1 ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+                params![stage_id],
+                map_workflow_checkpoint,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn latest_workflow_checkpoint(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Option<WorkflowCheckpointRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT * FROM workflow_checkpoints WHERE workflow_id = ?1 ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+                params![workflow_id],
+                map_workflow_checkpoint,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn list_workflow_checkpoints(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<WorkflowCheckpointRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT * FROM workflow_checkpoints WHERE workflow_id = ?1 ORDER BY updated_at ASC, rowid ASC",
+            )?;
+            let rows = stmt.query_map(params![workflow_id], map_workflow_checkpoint)?;
+            collect_rows(rows)
+        })
+    }
+
+    pub fn list_all_workflow_checkpoints(&self) -> Result<Vec<WorkflowCheckpointRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT * FROM workflow_checkpoints ORDER BY updated_at DESC, rowid DESC",
+            )?;
+            let rows = stmt.query_map([], map_workflow_checkpoint)?;
+            collect_rows(rows)
+        })
+    }
+
     pub fn latest_open_blocker_for_task(&self, task_id: &str) -> Result<Option<TaskBlockerRecord>> {
         self.with_conn(|conn| {
             conn.query_row(
@@ -277,5 +382,28 @@ fn map_task_blocker(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskBlockerReco
         status: decode(row.get("status")?)?,
         created_at: row.get("created_at")?,
         resolved_at: row.get("resolved_at")?,
+    })
+}
+
+fn map_workflow_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowCheckpointRecord> {
+    Ok(WorkflowCheckpointRecord {
+        id: row.get("id")?,
+        workflow_id: row.get("workflow_id")?,
+        stage_id: row.get("stage_id")?,
+        task_id: row.get("task_id")?,
+        stage_title: row.get("stage_title")?,
+        task_title: row.get("task_title")?,
+        assignee_agent_id: row.get("assignee_agent_id")?,
+        assignee_name: row.get("assignee_name")?,
+        status: decode(row.get("status")?)?,
+        working_directory: row.get("working_directory")?,
+        repo_snapshot: decode(row.get("repo_snapshot_json")?)?,
+        artifact_summary: decode(row.get("artifact_summary_json")?)?,
+        todo_snapshot: decode(row.get("todo_snapshot_json")?)?,
+        resume_hint: row.get("resume_hint")?,
+        failure_count: row.get("failure_count")?,
+        last_error: row.get("last_error")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
     })
 }

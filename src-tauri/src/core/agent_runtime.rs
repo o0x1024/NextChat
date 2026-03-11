@@ -26,16 +26,86 @@ impl<TModel, TTool> AgentRuntime<TModel, TTool> {
             tool_handler,
         }
     }
+
+    async fn execute_approved_tool(
+        &self,
+        context: &TaskExecutionContext,
+        skill_summary: &str,
+    ) -> Result<AgentExecution>
+    where
+        TTool: ToolHandler + 'static,
+    {
+        let tool = context
+            .approved_tool
+            .clone()
+            .expect("approved tool should exist");
+        let input = context
+            .approved_tool_input
+            .clone()
+            .unwrap_or_else(|| context.task_card.input_payload.clone());
+        let result = self
+            .tool_handler
+            .execute(ToolExecutionRequest {
+                tool: tool.clone(),
+                input,
+                task_card_id: context.task_card.id.clone(),
+                agent_id: context.agent.id.clone(),
+                agent: context.agent.clone(),
+                approval_granted: true,
+                working_directory: context.work_group.working_directory.clone(),
+                tool_stream: context.tool_stream.clone(),
+            })
+            .await?;
+        let suggested_subtasks = build_suggested_subtasks(context);
+        let memory_summary = if context.memory_context.is_empty() {
+            "None".to_string()
+        } else {
+            context
+                .memory_context
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let collaborator_summary = if suggested_subtasks.is_empty() {
+            "None".to_string()
+        } else {
+            suggested_subtasks.join(" | ")
+        };
+
+        Ok(AgentExecution {
+            summary: format!(
+                "{} used {} to work on '{}'.",
+                context.agent.name, tool.name, context.task_card.title
+            ),
+            backstage_notes: format!(
+                "Skills exposed: {}. Tools exposed: {}. Memory injected: {}. Tools called: {}. Suggested collaborators: {}.",
+                skill_summary,
+                context
+                    .available_tools
+                    .iter()
+                    .map(|available_tool| available_tool.id.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                memory_summary,
+                tool.id,
+                collaborator_summary
+            ),
+            suggested_subtasks,
+            tool_output: Some(result.output),
+            execution_mode: ExecutionMode::Fallback,
+        })
+    }
 }
 
 fn build_execution_preamble(context: &TaskExecutionContext) -> String {
     let skill_summary = if context.available_skills.is_empty() {
-        "No extra skills enabled.".to_string()
+        "No enabled skills exposed.".to_string()
     } else {
         context
             .available_skills
             .iter()
-            .map(|skill| skill.name.clone())
+            .map(|skill| format!("{} ({})", skill.name, skill.id))
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -52,7 +122,7 @@ fn build_execution_preamble(context: &TaskExecutionContext) -> String {
     };
 
     format!(
-        "You are {}. Role: {}. Objective: {}. Skills: {}. Available tools: {}.\nRuntime environment:\n{}\nUse tools when they materially improve accuracy. If a high-risk tool is not exposed, do not imply that it was used.",
+        "You are {}. Role: {}. Objective: {}. Enabled skills: {}. Available tools: {}.\nRuntime environment:\n{}\nUse tools when they materially improve accuracy. High-risk tools require approval before execution. If the Skills tool is available, inspect a skill with it before relying on the skill's detailed instructions.",
         context.agent.name,
         context.agent.role,
         context.agent.objective,
@@ -63,15 +133,10 @@ fn build_execution_preamble(context: &TaskExecutionContext) -> String {
 }
 
 fn build_execution_prompt(context: &TaskExecutionContext) -> String {
-    let planning_rules = context
+    let skill_catalog = context
         .available_skills
         .iter()
-        .flat_map(|skill| skill.planning_rules.iter().cloned())
-        .collect::<Vec<_>>();
-    let done_criteria = context
-        .available_skills
-        .iter()
-        .flat_map(|skill| skill.done_criteria.iter().cloned())
+        .map(|skill| format!("- {} [{}]", skill.name, skill.id))
         .collect::<Vec<_>>();
     let memory_summary = if context.memory_context.is_empty() {
         "- None".to_string()
@@ -99,29 +164,16 @@ fn build_execution_prompt(context: &TaskExecutionContext) -> String {
         .join("\n");
 
     format!(
-        "Work group goal: {}\nWorking directory: {}\nTask: {}\nConversation items:\n{}\nMemory context:\n{}\nPlanning rules:\n{}\nDone criteria:\n{}\nReturn a concise progress summary. If you need to delegate follow-up work, append one line per child task in the exact format `Delegate @AgentName: task details`. If you used tools, cite the concrete outcome instead of generic statements.",
+        "Work group goal: {}\nWorking directory: {}\nTask: {}\nConversation items:\n{}\nMemory context:\n{}\nEnabled skills catalog:\n{}\nReturn a concise progress summary. If a skill seems relevant, inspect it with the Skills tool before using it. If you need to delegate follow-up work, append one line per child task in the exact format `Delegate @AgentName: task details`. If you used tools, cite the concrete outcome instead of generic statements.",
         context.work_group.goal,
         context.work_group.working_directory,
         context.task_card.normalized_goal,
         conversation_items,
         memory_summary,
-        if planning_rules.is_empty() {
+        if skill_catalog.is_empty() {
             "- None".to_string()
         } else {
-            planning_rules
-                .iter()
-                .map(|rule| format!("- {rule}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        },
-        if done_criteria.is_empty() {
-            "- Provide the best available answer".to_string()
-        } else {
-            done_criteria
-                .iter()
-                .map(|item| format!("- {item}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+            skill_catalog.join("\n")
         }
     )
 }
@@ -134,15 +186,20 @@ where
 {
     async fn execute_task(&self, context: TaskExecutionContext) -> Result<AgentExecution> {
         let skill_summary = if context.available_skills.is_empty() {
-            "No extra skills enabled.".to_string()
+            "No enabled skills exposed.".to_string()
         } else {
             context
                 .available_skills
                 .iter()
-                .map(|skill| skill.name.clone())
+                .map(|skill| format!("{} ({})", skill.name, skill.id))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+
+        if context.approved_tool.is_some() {
+            return self.execute_approved_tool(&context, &skill_summary).await;
+        }
+
         let preamble = build_execution_preamble(&context);
         let prompt = build_execution_prompt(&context);
 
@@ -253,7 +310,7 @@ where
         );
 
         let backstage_notes = format!(
-            "Skills used: {}. Tools exposed: {}. Memory injected: {}. Tools called: {}. Suggested collaborators: {}.",
+            "Skills exposed: {}. Tools exposed: {}. Memory injected: {}. Tools called: {}. Suggested collaborators: {}.",
             skill_summary,
             context
                 .available_tools
@@ -418,13 +475,20 @@ fn merge_subtasks(explicit: Vec<String>, heuristic: Vec<String>, limit: usize) -
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+
     use super::{
         build_execution_preamble, build_execution_prompt, build_suggested_subtasks,
-        cleaned_summary, extract_delegation_directives,
+        cleaned_summary, extract_delegation_directives, AgentRuntime,
     };
     use crate::core::domain::{
-        AgentPermissionPolicy, AgentProfile, MemoryPolicy, ModelPolicy, TaskCard,
-        TaskExecutionContext, TaskStatus, ToolManifest, WorkGroup, WorkGroupKind,
+        AgentExecution, AgentExecutor, AgentPermissionPolicy, AgentProfile, ExecutionMode,
+        MemoryPolicy, ModelPolicy, ModelProviderAdapter, SystemSettings, TaskCard,
+        TaskExecutionContext, TaskStatus, ToolExecutionRequest, ToolExecutionResult, ToolHandler,
+        ToolManifest, WorkGroup, WorkGroupKind,
     };
 
     fn agent(id: &str, name: &str) -> AgentProfile {
@@ -492,6 +556,7 @@ mod tests {
             }],
             available_skills: vec![],
             approved_tool: None,
+            approved_tool_input: None,
             settings: crate::core::domain::SystemSettings::default(),
             summary_stream: None,
             tool_stream: None,
@@ -557,5 +622,70 @@ mod tests {
         assert!(preamble.contains("Working directory: /Users/a1024/code/NextChat"));
         assert!(preamble.contains("Shell execution:"));
         assert!(preamble.contains("Platform:"));
+    }
+
+    struct NeverModel;
+
+    #[async_trait]
+    impl ModelProviderAdapter for NeverModel {
+        async fn complete(
+            &self,
+            _policy: &ModelPolicy,
+            _settings: &SystemSettings,
+            _preamble: &str,
+            _prompt: &str,
+        ) -> Result<Option<String>> {
+            panic!("model should not be used for approved tool execution")
+        }
+    }
+
+    struct RecordingToolHandler {
+        inputs: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ToolHandler for RecordingToolHandler {
+        async fn execute(&self, request: ToolExecutionRequest) -> Result<ToolExecutionResult> {
+            self.inputs
+                .lock()
+                .expect("inputs")
+                .push(request.input.clone());
+            Ok(ToolExecutionResult {
+                output: format!("executed {}", request.tool.id),
+                result_ref: Some(request.input),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_tool_uses_saved_input() {
+        let handler = std::sync::Arc::new(RecordingToolHandler {
+            inputs: Mutex::new(Vec::new()),
+        });
+        let runtime = AgentRuntime::new(std::sync::Arc::new(NeverModel), handler.clone());
+        let mut ctx = context("fallback task payload");
+        ctx.approved_tool = Some(ToolManifest {
+            id: "Bash".into(),
+            name: "Bash".into(),
+            category: "system".into(),
+            risk_level: crate::core::domain::ToolRiskLevel::High,
+            input_schema: "{}".into(),
+            output_schema: "{}".into(),
+            timeout_ms: 1_000,
+            concurrency_limit: 1,
+            permissions: vec![],
+            description: "Run shell commands".into(),
+        });
+        ctx.approved_tool_input = Some(r#"{"command":"pwd"}"#.into());
+
+        let execution: AgentExecution = runtime.execute_task(ctx).await.expect("execution");
+
+        assert_eq!(execution.execution_mode, ExecutionMode::Fallback);
+        assert_eq!(execution.tool_output.as_deref(), Some("executed Bash"));
+        assert!(execution.summary.contains("Bash"));
+        assert_eq!(
+            handler.inputs.lock().expect("inputs").as_slice(),
+            &[r#"{"command":"pwd"}"#.to_string()]
+        );
     }
 }
