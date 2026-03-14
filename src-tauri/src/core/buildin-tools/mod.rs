@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod coordination;
 pub mod filesystem;
 pub mod network;
+pub mod request_peer_input;
 pub mod skills;
 pub mod system;
 pub mod workspace;

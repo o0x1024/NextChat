@@ -41,8 +41,6 @@ function riskBadgeClass(riskLevel: ToolManifest["riskLevel"]) {
 
 function exposureBadgeClass(reason: ToolExposureReason) {
   switch (reason) {
-    case "blocked_by_permission":
-      return "badge-error";
     case "not_bound":
       return "badge-ghost";
     default:
@@ -94,10 +92,7 @@ export function AgentWorkspace({
     ({ reason }) => reason === "available",
   ).length;
   const permissionRuleCount = currentAgent
-    ? currentAgent.permissionPolicy.allowToolIds.length +
-      currentAgent.permissionPolicy.denyToolIds.length +
-      currentAgent.permissionPolicy.requireApprovalToolIds.length +
-      currentAgent.permissionPolicy.allowFsRoots.length +
+    ? currentAgent.permissionPolicy.allowFsRoots.length +
       currentAgent.permissionPolicy.allowNetworkDomains.length
     : 0;
 
@@ -387,27 +382,6 @@ export function AgentWorkspace({
                   </div>
 
                   <div className="grid gap-4 md:grid-cols-2">
-                    <div>
-                      <div className="mb-2 text-sm font-medium">{t("permissionAllowTools")}</div>
-                      <div className="text-sm text-base-content/60">
-                        {joinPolicyList(currentAgent?.permissionPolicy.allowToolIds ?? []) ||
-                          t("permissionInheritTools")}
-                      </div>
-                    </div>
-                    <div>
-                      <div className="mb-2 text-sm font-medium">{t("permissionDenyTools")}</div>
-                      <div className="text-sm text-base-content/60">
-                        {joinPolicyList(currentAgent?.permissionPolicy.denyToolIds ?? []) ||
-                          t("notAvailable")}
-                      </div>
-                    </div>
-                    <div>
-                      <div className="mb-2 text-sm font-medium">{t("permissionRequireApprovalTools")}</div>
-                      <div className="text-sm text-base-content/60">
-                        {joinPolicyList(currentAgent?.permissionPolicy.requireApprovalToolIds ?? []) ||
-                          t("notAvailable")}
-                      </div>
-                    </div>
                     <div>
                       <div className="mb-2 text-sm font-medium">{t("permissionAllowFsRoots")}</div>
                       <div className="text-sm text-base-content/60">

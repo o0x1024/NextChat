@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { Language } from "../../store/preferencesStore";
 import type {
+  AddWorkflowStageInput,
   AgentProfile,
   ClaimBid,
   Lease,
@@ -10,10 +11,14 @@ import type {
   TaskBlockerRecord,
   ToolManifest,
   ToolRun,
+  UpdateWorkflowStageInput,
   WorkflowCheckpointRecord,
+  WorkflowRecord,
+  WorkflowStageRecord,
 } from "../../types";
 import { statusBadgeClass } from "./ui";
 import { WorkflowCheckpointPanel } from "./WorkflowCheckpointPanel";
+import { WorkflowControlPanel } from "./WorkflowControlPanel";
 
 type BlockerAction =
   | "provide_context"
@@ -46,6 +51,8 @@ interface ChatRunningPanelProps {
   agents: AgentProfile[];
   tools: ToolManifest[];
   workflowCheckpoints: WorkflowCheckpointRecord[];
+  workflows: WorkflowRecord[];
+  workflowStages: WorkflowStageRecord[];
   highlightedTaskId: string | null;
   highlightedBlockerId: string | null;
   targetBlockerId: string | null;
@@ -56,6 +63,13 @@ interface ChatRunningPanelProps {
   onJumpToTaskBoard: (taskId?: string) => void;
   onApproveRun: (toolRunId: string, approved: boolean) => Promise<void>;
   onResolveBlocker: (blockerId: string, resolution: OwnerBlockerResolution) => Promise<void>;
+  onCancelWorkflow: (workflowId: string) => Promise<void>;
+  onPauseWorkflow: (workflowId: string) => Promise<void>;
+  onResumeWorkflow: (workflowId: string) => Promise<void>;
+  onSkipStage: (workflowId: string, stageId: string) => Promise<void>;
+  onAddStage: (input: AddWorkflowStageInput) => Promise<void>;
+  onUpdateStage: (input: UpdateWorkflowStageInput) => Promise<void>;
+  onRemoveStage: (stageId: string) => Promise<void>;
 }
 
 function initialDraft(taskBlocker: TaskBlockerRecord, agents: AgentProfile[]): BlockerDraft {
@@ -139,6 +153,8 @@ export function ChatRunningPanel({
   agents,
   tools,
   workflowCheckpoints,
+  workflows,
+  workflowStages,
   highlightedTaskId,
   highlightedBlockerId,
   targetBlockerId,
@@ -149,6 +165,13 @@ export function ChatRunningPanel({
   onJumpToTaskBoard,
   onApproveRun,
   onResolveBlocker,
+  onCancelWorkflow,
+  onPauseWorkflow,
+  onResumeWorkflow,
+  onSkipStage,
+  onAddStage,
+  onUpdateStage,
+  onRemoveStage,
 }: ChatRunningPanelProps) {
   const { t } = useTranslation();
   const [expandedBlockerId, setExpandedBlockerId] = useState<string | null>(null);
@@ -302,6 +325,21 @@ export function ChatRunningPanel({
           </div>
         </div>
       </section>
+
+      <WorkflowControlPanel
+        language={language}
+        workflows={workflows}
+        workflowStages={workflowStages}
+        tasks={currentGroupTasks}
+        agents={agents}
+        onCancelWorkflow={onCancelWorkflow}
+        onPauseWorkflow={onPauseWorkflow}
+        onResumeWorkflow={onResumeWorkflow}
+        onSkipStage={onSkipStage}
+        onAddStage={onAddStage}
+        onUpdateStage={onUpdateStage}
+        onRemoveStage={onRemoveStage}
+      />
 
       <WorkflowCheckpointPanel
         language={language}

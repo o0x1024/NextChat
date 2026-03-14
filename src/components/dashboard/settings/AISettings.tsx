@@ -85,6 +85,7 @@ export function AISettings() {
     setSelectedSettingsProviderId: setSelectedProviderId,
     refresh,
     updateSettings,
+    showToast,
   } = useAppStore();
 
   const { providers } = settings;
@@ -126,12 +127,16 @@ export function AISettings() {
         ...globalConfig,
         ...updates,
       },
+    }).then(() => {
+      showToast(t("settingsSaved"), 'success');
     });
   };
 
   const updateProvider = (id: string, updates: Partial<AIProviderConfig>) => {
     const nextProviders = providers.map((p) => (p.id === id ? { ...p, ...updates } : p));
-    void updateSettings({ ...settings, providers: nextProviders });
+    void updateSettings({ ...settings, providers: nextProviders }).then(() => {
+      showToast(t("settingsSaved"), 'success');
+    });
   };
 
   const updateProviderDefaultModel = (provider: AIProviderConfig, inputValue: string) => {
@@ -257,6 +262,7 @@ export function AISettings() {
 
     setFormMessage("");
     await updateSettings({ ...settings, providers: [...providers, provider] });
+    showToast(t("settingsSaved"), 'success');
     setSelectedProviderId(provider.id);
     setNewProviderForm({
       ...emptyNewProviderForm,

@@ -45,6 +45,8 @@ export function ChatManagement({
   pendingUserQuestions,
   taskBlockers,
   workflowCheckpoints,
+  workflows,
+  workflowStages,
   leases,
   claimBids,
   toolRuns,
@@ -64,6 +66,13 @@ export function ChatManagement({
   onApproveRun,
   onCancelTask,
   onResolveBlocker,
+  onCancelWorkflow,
+  onPauseWorkflow,
+  onResumeWorkflow,
+  onSkipStage,
+  onAddStage,
+  onUpdateStage,
+  onRemoveStage,
 }: ChatManagementProps) {
   const { t } = useTranslation();
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -944,6 +953,8 @@ export function ChatManagement({
                 currentTaskBlockers={currentTaskBlockers}
                 claimBids={claimBids}
                 workflowCheckpoints={workflowCheckpoints}
+                workflows={workflows}
+                workflowStages={workflowStages}
                 highlightedTaskId={highlightedTaskId}
                 highlightedBlockerId={highlightedBlockerId}
                 panelTarget={panelTarget}
@@ -962,6 +973,13 @@ export function ChatManagement({
                 onSetBlockerCardRef={(blockerId, node) => { blockerCardRefs.current[blockerId] = node; }}
                 onApproveRun={onApproveRun}
                 onResolveBlocker={onResolveBlocker}
+                onCancelWorkflow={onCancelWorkflow}
+                onPauseWorkflow={onPauseWorkflow}
+                onResumeWorkflow={onResumeWorkflow}
+                onSkipStage={onSkipStage}
+                onAddStage={onAddStage}
+                onUpdateStage={onUpdateStage}
+                onRemoveStage={onRemoveStage}
                 onCancelTask={onCancelTask}
                 onAddAgent={handleAddMember}
                 onRemoveAgent={handleRemoveMember}

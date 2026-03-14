@@ -3,6 +3,7 @@ import {
   addAgentToWorkGroup,
   approveToolRun,
   cancelTaskCard,
+  cancelWorkflow,
   clearWorkGroupHistory,
   createAgentProfile,
   createWorkGroup,
@@ -13,11 +14,17 @@ import {
   getInstalledSkillDetail,
   getDashboardState,
   pauseLease,
+  pauseWorkflow,
   readInstalledSkillFile,
   removeAgentFromWorkGroup,
   resolveOwnerBlocker,
   resumeTaskCard,
+  resumeWorkflow,
   sendHumanMessage,
+  skipWorkflowStage,
+  addWorkflowStage,
+  updateWorkflowStage,
+  removeWorkflowStage,
   installSkillFromGithub,
   installSkillFromLocal,
   setInstalledSkillEnabled,
@@ -52,9 +59,16 @@ import type {
   UpdateAgentInput,
   UpdateSkillDetailInput,
   UpdateWorkGroupInput,
+  AddWorkflowStageInput,
+  UpdateWorkflowStageInput,
 } from "../types";
 
 type Unlisten = () => void | Promise<void>;
+
+export interface ToastState {
+  message: string;
+  type: 'success' | 'error' | 'info' | 'warning';
+}
 
 interface AppStore extends DashboardState {
   chatStreamTracks: ChatStreamTrack[];
@@ -65,6 +79,7 @@ interface AppStore extends DashboardState {
   backstageOpen: boolean;
   loading: boolean;
   error?: string;
+  toast?: ToastState;
   init: () => Promise<void>;
   refresh: (withLoading?: boolean) => Promise<void>;
   deleteAgent: (id: string) => Promise<void>;
@@ -73,6 +88,8 @@ interface AppStore extends DashboardState {
   setSelectedTaskId: (id?: string) => void;
   setSelectedSettingsProviderId: (id: string) => void;
   toggleBackstage: () => void;
+  showToast: (message: string, type?: 'success' | 'error' | 'info' | 'warning') => void;
+  clearToast: () => void;
   createAgent: (input: CreateAgentInput) => Promise<void>;
   updateAgent: (input: UpdateAgentInput) => Promise<void>;
   createGroup: (input: CreateWorkGroupInput) => Promise<void>;
@@ -87,6 +104,13 @@ interface AppStore extends DashboardState {
   resolveBlocker: (blockerId: string, resolution: OwnerBlockerResolution) => Promise<void>;
   pauseLeaseById: (leaseId: string) => Promise<void>;
   resumeTask: (taskCardId: string) => Promise<void>;
+  cancelWorkflow: (workflowId: string) => Promise<void>;
+  pauseWorkflow: (workflowId: string) => Promise<void>;
+  resumeWorkflow: (workflowId: string) => Promise<void>;
+  skipWorkflowStage: (workflowId: string, stageId: string) => Promise<void>;
+  addWorkflowStage: (input: AddWorkflowStageInput) => Promise<void>;
+  updateWorkflowStage: (input: UpdateWorkflowStageInput) => Promise<void>;
+  removeWorkflowStage: (stageId: string) => Promise<void>;
   updateSettings: (settings: SystemSettings) => Promise<void>;
   installSkillFromGithub: (source: string, skillPath?: string) => Promise<number>;
   installSkillFromLocal: (sourcePath: string) => Promise<number>;
@@ -120,6 +144,8 @@ const emptyState: DashboardState = {
   skills: [],
   tools: [],
   memoryItems: [],
+  workflows: [],
+  workflowStages: [],
   settings: {
     providers: [],
     globalConfig: {
@@ -409,6 +435,15 @@ export const useAppStore = create<AppStore>((set, get) => ({
   toggleBackstage() {
     set((state) => ({ backstageOpen: !state.backstageOpen }));
   },
+  showToast(message, type = 'success') {
+    set({ toast: { message, type } });
+    setTimeout(() => {
+      set((state) => (state.toast?.message === message ? { toast: undefined } : state));
+    }, 3000);
+  },
+  clearToast() {
+    set({ toast: undefined });
+  },
   async createAgent(input) {
     const agent = await createAgentProfile(input);
     await get().refresh();
@@ -468,6 +503,27 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
   async resumeTask(taskCardId) {
     await withRefresh(() => resumeTaskCard(taskCardId), get().refresh);
+  },
+  async cancelWorkflow(workflowId) {
+    await withRefresh(() => cancelWorkflow(workflowId), get().refresh);
+  },
+  async pauseWorkflow(workflowId) {
+    await withRefresh(() => pauseWorkflow(workflowId), get().refresh);
+  },
+  async resumeWorkflow(workflowId) {
+    await withRefresh(() => resumeWorkflow(workflowId), get().refresh);
+  },
+  async skipWorkflowStage(workflowId, stageId) {
+    await withRefresh(() => skipWorkflowStage(workflowId, stageId), get().refresh);
+  },
+  async addWorkflowStage(input) {
+    await withRefresh(() => addWorkflowStage(input), get().refresh);
+  },
+  async updateWorkflowStage(input) {
+    await withRefresh(() => updateWorkflowStage(input), get().refresh);
+  },
+  async removeWorkflowStage(stageId) {
+    await withRefresh(() => removeWorkflowStage(stageId), get().refresh);
   },
   async updateSettings(settings) {
     // Optimistically reflect settings changes in UI to avoid stale reads between rapid edits.

@@ -4,7 +4,7 @@ use tauri::{AppHandle, Runtime};
 
 use super::{
     collect_allowed_tools, emit, narrative_messages::render_question_text, scored_candidates,
-    should_skip_implicit_todowrite_fallback, AppService,
+    should_skip_implicit_task_fallback, AppService,
 };
 use crate::core::domain::{
     new_id, now, AgentProfile, ClaimScorer, ConversationMessage, MessageKind,
@@ -65,6 +65,7 @@ impl AppService {
             kind: MessageKind::Text,
             visibility: Visibility::Main,
             content: input.content.clone(),
+            narrative_meta: None,
             mentions,
             task_card_id: None,
             execution_mode: None,
@@ -115,6 +116,7 @@ impl AppService {
         source_message: &ConversationMessage,
         members: &[AgentProfile],
     ) -> Result<RequestRouteMode> {
+        // Fast path: explicit @-mentions override any classification
         let owner = self.group_owner_for_work_group(&work_group.id)?;
         let has_owner_mention = owner
             .as_ref()
@@ -125,23 +127,115 @@ impl AppService {
             .iter()
             .filter(|agent_id| owner.as_ref().map(|item| &item.id) != Some(*agent_id))
             .count();
-        let lowered = source_message.content.to_lowercase();
-        let asks_owner = OWNER_ROUTING_KEYWORDS
+
+        if non_owner_mentions > 0 {
+            let asks_owner = OWNER_ROUTING_KEYWORDS
+                .iter()
+                .any(|keyword| source_message.content.contains(keyword));
+            if has_owner_mention || asks_owner {
+                return Ok(RequestRouteMode::OwnerOrchestrated);
+            }
+            return Ok(RequestRouteMode::DirectAgentAssign);
+        }
+
+        // Try LLM-based semantic classification
+        if let Some(result) = self.try_llm_classify_route(work_group, source_message, members) {
+            return Ok(result);
+        }
+
+        // Fallback: keyword-based heuristic
+        self.keyword_classify_route(source_message, members)
+    }
+
+    /// Attempt LLM-based semantic route classification.
+    /// Returns None if LLM is not configured or the call fails.
+    fn try_llm_classify_route(
+        &self,
+        work_group: &WorkGroup,
+        source_message: &ConversationMessage,
+        members: &[AgentProfile],
+    ) -> Option<RequestRouteMode> {
+        let settings = self.storage.get_settings().ok()?;
+        if settings.global_config.default_llm_provider.is_empty()
+            || settings.global_config.default_llm_model.is_empty()
+        {
+            return None;
+        }
+
+        let member_names: Vec<String> = members
             .iter()
-            .any(|keyword| source_message.content.contains(keyword));
+            .filter(|a| !self.is_builtin_group_owner_profile(a))
+            .map(|a| a.name.clone())
+            .collect();
+
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return None, // No async runtime available (e.g. in tests)
+        };
+
+        let result = tokio::task::block_in_place(|| {
+            handle.block_on(
+                super::semantic_routing::classify_route_with_llm(
+                    &settings,
+                    &source_message.content,
+                    &work_group.name,
+                    &work_group.goal,
+                    &member_names,
+                ),
+            )
+        });
+
+        match result {
+            Ok(classification) if classification.confidence >= 0.6 => {
+                crate::core::logging::llm_event(
+                    "routing.llm_classify",
+                    "classified",
+                    serde_json::json!({
+                        "route": format!("{:?}", classification.route_mode),
+                        "confidence": classification.confidence,
+                        "reasoning": classification.reasoning,
+                    }),
+                );
+                Some(classification.route_mode)
+            }
+            Ok(classification) => {
+                crate::core::logging::llm_event(
+                    "routing.llm_classify",
+                    "low_confidence_fallback",
+                    serde_json::json!({
+                        "route": format!("{:?}", classification.route_mode),
+                        "confidence": classification.confidence,
+                        "reasoning": classification.reasoning,
+                    }),
+                );
+                None // Low confidence → fall back to keyword
+            }
+            Err(error) => {
+                crate::core::logging::llm_event(
+                    "routing.llm_classify",
+                    "error_fallback",
+                    serde_json::json!({
+                        "error": format!("{error:#}"),
+                    }),
+                );
+                None // Error → fall back to keyword
+            }
+        }
+    }
+
+    /// Original keyword-based heuristic classification.
+    fn keyword_classify_route(
+        &self,
+        source_message: &ConversationMessage,
+        members: &[AgentProfile],
+    ) -> Result<RequestRouteMode> {
+        let lowered = source_message.content.to_lowercase();
         let looks_like_question = DIRECT_QUESTION_KEYWORDS
             .iter()
             .any(|keyword| source_message.content.contains(keyword) || lowered.contains(keyword));
         let looks_like_project = PROJECT_KEYWORDS
             .iter()
             .any(|keyword| source_message.content.contains(keyword) || lowered.contains(keyword));
-
-        if non_owner_mentions > 0 {
-            if has_owner_mention || asks_owner {
-                return Ok(RequestRouteMode::OwnerOrchestrated);
-            }
-            return Ok(RequestRouteMode::DirectAgentAssign);
-        }
 
         let active_members = members
             .iter()
@@ -232,6 +326,7 @@ impl AppService {
             kind: MessageKind::Status,
             visibility: Visibility::Main,
             content,
+            narrative_meta: None,
             mentions: vec![],
             task_card_id: Some(task.id.clone()),
             execution_mode: None,
@@ -279,6 +374,7 @@ impl AppService {
             kind: MessageKind::Status,
             visibility: Visibility::Main,
             content,
+            narrative_meta: None,
             mentions: vec![],
             task_card_id: Some(task.id.clone()),
             execution_mode: None,
@@ -383,9 +479,15 @@ impl AppService {
             .map(|item| self.storage.get_task_card(&item.task_id))
             .collect::<Result<Vec<_>>>()?;
 
-        let next_ready = stage_dispatches
+        // Determine execution mode for this stage: Parallel dispatches all
+        // ready tasks simultaneously; Serial dispatches one at a time.
+        let stage = self.storage.get_workflow_stage(&stage_id)?;
+        let is_parallel =
+            stage.execution_mode == crate::core::workflow::WorkflowExecutionMode::Parallel;
+
+        let ready_task_ids: Vec<String> = stage_dispatches
             .iter()
-            .find(|item| {
+            .filter(|item| {
                 stage_tasks
                     .iter()
                     .find(|task_item| task_item.id == item.task_id)
@@ -399,10 +501,18 @@ impl AppService {
                             })
                     })
             })
-            .map(|item| item.task_id.clone());
+            .map(|item| item.task_id.clone())
+            .collect();
 
-        if let Some(task_id) = next_ready {
-            self.activate_stage_tasks(app, &workflow_id, &stage_id, &[task_id], false)?;
+        // In parallel mode activate all ready tasks; serial activates at most one.
+        let to_activate: Vec<String> = if is_parallel {
+            ready_task_ids
+        } else {
+            ready_task_ids.into_iter().take(1).collect()
+        };
+
+        if !to_activate.is_empty() {
+            self.activate_stage_tasks(app, &workflow_id, &stage_id, &to_activate, false)?;
             return Ok(());
         }
 
@@ -414,12 +524,85 @@ impl AppService {
         }
 
         let mut stage = self.storage.get_workflow_stage(&stage_id)?;
+        // Collect structured deliverables from completed tasks
+        let deliverables: Vec<serde_json::Value> = stage_tasks
+            .iter()
+            .filter_map(|task_item| {
+                task_item.output_summary.as_ref().map(|summary| {
+                    serde_json::json!({
+                        "taskTitle": task_item.title,
+                        "agentId": task_item.assigned_agent_id,
+                        "summary": summary,
+                    })
+                })
+            })
+            .collect();
+        stage.deliverables_json = if deliverables.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&deliverables).unwrap_or_default())
+        };
         stage.status = StageStatus::Completed;
         self.storage.insert_workflow_stage(&stage)?;
         self.record_stage_checkpoint(
             &stage.id,
             crate::core::workflow::WorkflowCheckpointStatus::StageCompleted,
         )?;
+
+        // ── Quality Gate ──────────────────────────────────────────────────────
+        // Evaluate stage deliverables against the goal. On failure the gate will
+        // set both stage + workflow status to `NeedsReview` and we abort the
+        // transition to the next stage.
+        let gate_failed = if let Ok(settings) = self.storage.get_settings() {
+            let gate_result = self.run_quality_gate(
+                &workflow_id,
+                &stage.id,
+                &stage.title,
+                &stage.goal,
+                stage.deliverables_json.as_deref(),
+                &settings,
+            );
+            match gate_result {
+                Ok(Some(result)) => {
+                    if result.outcome == crate::core::service::quality_gate::QualityGateOutcome::Fail {
+                        eprintln!(
+                            "Quality gate FAILED for stage {}: {}",
+                            stage.id, result.reasoning
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+
+        if gate_failed {
+            // Gate updated stage + workflow status — emit a status message and return
+            let workflow = self.storage.get_workflow(&workflow_id)?;
+            let review_msg = format!(
+                "⚠️ Stage '{}' did not pass the quality gate. The workflow has been paused for review.",
+                stage.title
+            );
+            let mut envelope = NarrativeEnvelope::new(
+                NarrativeMessageType::OwnerStageTransition,
+                review_msg,
+            );
+            envelope.workflow_id = Some(workflow.id.clone());
+            envelope.stage_id = Some(stage.id.clone());
+            envelope.stage_title = Some(stage.title.clone());
+            let message = self.owner_message_from_envelope(
+                &workflow.work_group_id,
+                envelope,
+                MessageKind::Status,
+            )?;
+            self.storage.insert_message(&message)?;
+            emit(app, "chat:message-created", &message)?;
+            return Ok(());
+        }
 
         let stages = self.storage.list_workflow_stages(&workflow_id)?;
         let next_stage = stages
@@ -522,6 +705,7 @@ impl AppService {
             work_group_id: work_group.id.clone(),
             created_by: "human".into(),
             assigned_agent_id: None,
+            output_summary: None,
             created_at: now(),
         };
 
@@ -601,7 +785,7 @@ impl AppService {
                 .cloned()
             {
                 if let Some(tool) = requested_tool.clone() {
-                    if should_skip_implicit_todowrite_fallback(&human_message.content, &tool) {
+                    if should_skip_implicit_task_fallback(&human_message.content, &tool) {
                         requested_tool = None;
                     }
                 }
@@ -731,31 +915,10 @@ impl AppService {
                 &lease.id,
                 json!({ "taskCardId": lease.task_card_id, "agentId": lease.owner_agent_id }),
             )?;
-            if let Some(agent) = routing_members
+            if routing_members
                 .iter()
-                .find(|candidate| candidate.id == lease.owner_agent_id)
+                .any(|candidate| candidate.id == lease.owner_agent_id)
             {
-                let ack = ConversationMessage {
-                    id: new_id(),
-                    conversation_id: work_group.id.clone(),
-                    work_group_id: work_group.id.clone(),
-                    sender_kind: SenderKind::Agent,
-                    sender_id: agent.id.clone(),
-                    sender_name: agent.name.clone(),
-                    kind: MessageKind::Status,
-                    visibility: Visibility::Main,
-                    content: self.build_task_narrative_content(
-                        &claim_plan.task_card,
-                        NarrativeMessageType::AgentAck,
-                        self.build_agent_ack_text(&claim_plan.task_card, agent)?,
-                    )?,
-                    mentions: vec![],
-                    task_card_id: Some(claim_plan.task_card.id.clone()),
-                    execution_mode: None,
-                    created_at: now(),
-                };
-                self.storage.insert_message(&ack)?;
-                emit(&app, "chat:message-created", &ack)?;
                 if let Some(mut dispatch) =
                     self.storage.get_task_dispatch(&claim_plan.task_card.id)?
                 {
@@ -855,6 +1018,7 @@ impl AppService {
                     work_group_id: plan.workflow.work_group_id.clone(),
                     created_by: plan.workflow.owner_agent_id.clone(),
                     assigned_agent_id: Some(task.assignee_agent_id.clone()),
+                    output_summary: None,
                     created_at: now(),
                 };
                 self.storage.insert_task_card(&task_card)?;
@@ -925,7 +1089,7 @@ impl AppService {
         self.activate_stage_tasks(app, workflow_id, &stage.id, &pending_task_ids, true)
     }
 
-    fn activate_stage_tasks<R: Runtime>(
+    pub(super) fn activate_stage_tasks<R: Runtime>(
         &self,
         app: &AppHandle<R>,
         workflow_id: &str,
@@ -1006,33 +1170,11 @@ impl AppService {
             if let Some(lease) = self.storage.get_lease_by_task(&active_task.id)? {
                 emit(app, "lease:granted", &lease)?;
             }
-            self.spawn_task_execution(app.clone(), active_task.id.clone(), None);
-            let ack_content = self.build_task_narrative_content(
-                &active_task,
-                NarrativeMessageType::AgentAck,
-                self.build_agent_ack_text(&active_task, &agent)?,
-            )?;
-            let ack = ConversationMessage {
-                id: new_id(),
-                conversation_id: active_task.work_group_id.clone(),
-                work_group_id: active_task.work_group_id.clone(),
-                sender_kind: SenderKind::Agent,
-                sender_id: agent.id.clone(),
-                sender_name: agent.name.clone(),
-                kind: MessageKind::Status,
-                visibility: Visibility::Main,
-                content: ack_content,
-                mentions: vec![],
-                task_card_id: Some(active_task.id.clone()),
-                execution_mode: None,
-                created_at: now(),
-            };
-            self.storage.insert_message(&ack)?;
-            emit(app, "chat:message-created", &ack)?;
             if let Some(mut dispatch) = self.storage.get_task_dispatch(&active_task.id)? {
                 dispatch.acknowledged_at = Some(now());
                 self.storage.insert_task_dispatch(&dispatch)?;
             }
+            self.spawn_task_execution(app.clone(), active_task.id.clone(), None);
         }
 
         Ok(())

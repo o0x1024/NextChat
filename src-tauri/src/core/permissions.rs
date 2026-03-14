@@ -1,4 +1,4 @@
-use crate::core::domain::{AgentProfile, ToolManifest, ToolRiskLevel};
+use crate::core::domain::{AgentProfile, ToolManifest};
 
 pub const PERMISSION_DENIED_PREFIX: &str = "permission denied:";
 pub const APPROVAL_REQUIRED_PREFIX: &str = "approval required:";
@@ -33,17 +33,6 @@ pub fn is_tool_enabled_for_agent(agent: &AgentProfile, tool_id: &str) -> bool {
         .tool_ids
         .iter()
         .any(|id| tool_binding_matches(id, tool_id))
-        && (agent.permission_policy.allow_tool_ids.is_empty()
-            || agent
-                .permission_policy
-                .allow_tool_ids
-                .iter()
-                .any(|id| tool_binding_matches(id, tool_id)))
-        && !agent
-            .permission_policy
-            .deny_tool_ids
-            .iter()
-            .any(|id| tool_binding_matches(id, tool_id))
 }
 
 pub fn base_tool_authorization(
@@ -61,17 +50,7 @@ pub fn base_tool_authorization(
         ));
     }
 
-    if !is_tool_enabled_for_agent(agent, &tool.id) {
-        return ToolAuthorizationDecision::denied(format!(
-            "agent policy blocks tool '{}'",
-            tool.name
-        ));
-    }
-
-    ToolAuthorizationDecision::allowed(
-        tool.risk_level == ToolRiskLevel::High
-            || agent.permission_policy.requires_approval(&tool.id),
-    )
+    ToolAuthorizationDecision::allowed(false)
 }
 
 pub fn is_permission_guard_error(error: &str) -> bool {
@@ -91,15 +70,15 @@ fn tool_binding_matches(bound_tool_id: &str, requested_tool_id: &str) -> bool {
 fn compat_requested_ids(tool_id: &str) -> &'static [&'static str] {
     match tool_id {
         "shell.exec" => &["Bash"],
-        "file.readwrite" => &["Read", "Write", "Edit", "MultiEdit"],
+        "file.readwrite" => &["Read", "Write", "Edit"],
         "project.search" => &["Grep", "Glob", "LS"],
         "http.request" => &["WebFetch", "WebSearch"],
-        "plan.summarize" => &["TodoWrite"],
+        "plan.summarize" => &["TaskCreate", "TaskGet", "TaskUpdate", "TaskList"],
         "Bash" => &["shell.exec"],
-        "Read" | "Write" | "Edit" | "MultiEdit" => &["file.readwrite"],
+        "Read" | "Write" | "Edit" => &["file.readwrite"],
         "Grep" | "Glob" | "LS" => &["project.search"],
         "WebFetch" | "WebSearch" => &["http.request"],
-        "TodoWrite" => &["plan.summarize"],
+        "TaskCreate" | "TaskGet" | "TaskUpdate" | "TaskList" => &["plan.summarize"],
         _ => &[],
     }
 }

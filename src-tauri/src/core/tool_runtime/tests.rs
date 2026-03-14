@@ -26,7 +26,7 @@ fn agent() -> AgentProfile {
         model_policy: ModelPolicy::default(),
         skill_ids: vec![],
         tool_ids: vec![
-            "Skills".into(),
+            "Skill".into(),
             "Read".into(),
             "Write".into(),
             "Grep".into(),
@@ -56,7 +56,7 @@ async fn read_and_write_tools_work() {
             task_card_id: "task-1".into(),
             agent_id: "agent-1".into(),
             agent: agent(),
-            approval_granted: true,
+            approval_granted: false,
             working_directory: ".".into(),
             tool_stream: None,
         })
@@ -71,7 +71,7 @@ async fn read_and_write_tools_work() {
             task_card_id: "task-1".into(),
             agent_id: "agent-1".into(),
             agent: agent(),
-            approval_granted: true,
+            approval_granted: false,
             working_directory: ".".into(),
             tool_stream: None,
         })
@@ -136,7 +136,7 @@ fn enabled_tools_are_not_filtered_by_skills() {
 }
 
 #[test]
-fn tool_selection_does_not_fallback_to_todowrite_when_not_allowed() {
+fn tool_selection_does_not_fallback_to_task_create_when_not_allowed() {
     let workspace_root = unique_root("selection-workspace");
     let data_root = unique_root("selection-data");
     fs::create_dir_all(&workspace_root).expect("workspace");
@@ -148,7 +148,7 @@ fn tool_selection_does_not_fallback_to_todowrite_when_not_allowed() {
 }
 
 #[test]
-fn tool_selection_falls_back_to_todowrite_when_allowed() {
+fn tool_selection_falls_back_to_task_create_when_allowed() {
     let workspace_root = unique_root("selection-workspace-allowed");
     let data_root = unique_root("selection-data-allowed");
     fs::create_dir_all(&workspace_root).expect("workspace");
@@ -156,9 +156,9 @@ fn tool_selection_falls_back_to_todowrite_when_allowed() {
     let runtime = ToolRuntime::new(workspace_root, data_root).expect("runtime");
 
     let selected = runtime
-        .select_tool_for_text("please handle this request", &["TodoWrite".into()])
+        .select_tool_for_text("please handle this request", &["TaskCreate".into()])
         .expect("fallback tool");
-    assert_eq!(selected.id, "TodoWrite");
+    assert_eq!(selected.id, "TaskCreate");
 }
 
 #[tokio::test]

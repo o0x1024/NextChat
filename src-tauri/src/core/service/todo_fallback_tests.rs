@@ -100,8 +100,11 @@ fn plain_message_does_not_trigger_todowrite_permission_denial_when_unbound() {
             .expect("tool runs")
             .into_iter()
             .filter(|run| run.task_card_id == task.id)
-            .all(|run| run.tool_id != "TodoWrite"),
-        "task should not enqueue TodoWrite when TodoWrite is not bound"
+            .all(|run| !matches!(
+                run.tool_id.as_str(),
+                "TaskCreate" | "TaskGet" | "TaskUpdate" | "TaskList"
+            )),
+        "task should not enqueue task management tools when they are not bound"
     );
     assert!(
         service
@@ -113,8 +116,8 @@ fn plain_message_does_not_trigger_todowrite_permission_denial_when_unbound() {
                 message.task_card_id.as_deref() == Some(task.id.as_str())
                     && matches!(message.sender_kind, SenderKind::System)
             })
-            .all(|message| !message.content.contains("cannot use TodoWrite")),
-        "task should not produce TodoWrite permission denial message"
+            .all(|message| !message.content.contains("cannot use Task")),
+        "task should not produce task tool permission denial message"
     );
 }
 
@@ -156,7 +159,12 @@ fn mentioned_agent_without_todowrite_is_not_failed_by_global_todowrite_fallback(
             model: "simulation".into(),
             temperature: 0.2,
             skill_ids: vec![],
-            tool_ids: vec!["TodoWrite".into(), "Read".into()],
+            tool_ids: vec![
+                "TaskCreate".into(),
+                "TaskUpdate".into(),
+                "TaskList".into(),
+                "Read".into(),
+            ],
             max_parallel_runs: 1,
             can_spawn_subtasks: false,
             memory_policy: MemoryPolicy::default(),
@@ -203,7 +211,7 @@ fn mentioned_agent_without_todowrite_is_not_failed_by_global_todowrite_fallback(
     assert_ne!(
         task.status,
         TaskStatus::NeedsReview,
-        "task should not fail because another member exposes TodoWrite"
+        "task should not fail because another member exposes task management tools"
     );
     assert!(
         service
@@ -215,7 +223,7 @@ fn mentioned_agent_without_todowrite_is_not_failed_by_global_todowrite_fallback(
                 message.task_card_id.as_deref() == Some(task.id.as_str())
                     && matches!(message.sender_kind, SenderKind::System)
             })
-            .all(|message| !message.content.contains("cannot use TodoWrite")),
-        "task should not produce TodoWrite permission denial for the mentioned agent"
+            .all(|message| !message.content.contains("cannot use Task")),
+        "task should not produce task tool permission denial for the mentioned agent"
     );
 }

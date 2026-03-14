@@ -51,8 +51,8 @@ impl Storage {
                 r#"
                 INSERT OR REPLACE INTO workflow_stages (
                   id, workflow_id, title, goal, order_index, execution_mode, status,
-                  entry_message_id, completion_message_id, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                  entry_message_id, completion_message_id, deliverables_json, quality_gate_json, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                 "#,
                 params![
                     stage.id,
@@ -64,6 +64,8 @@ impl Storage {
                     json(&stage.status)?,
                     stage.entry_message_id,
                     stage.completion_message_id,
+                    stage.deliverables_json,
+                    stage.quality_gate_json,
                     stage.created_at,
                 ],
             )?;
@@ -320,6 +322,28 @@ impl Storage {
             collect_rows(rows)
         })
     }
+
+    pub fn list_workflows(&self) -> Result<Vec<WorkflowRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT * FROM workflows ORDER BY created_at DESC")?;
+            let rows = stmt.query_map([], map_workflow)?;
+            collect_rows(rows)
+        })
+    }
+
+    pub fn list_workflows_by_work_group(
+        &self,
+        work_group_id: &str,
+    ) -> Result<Vec<WorkflowRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT * FROM workflows WHERE work_group_id = ?1 ORDER BY created_at DESC",
+            )?;
+            let rows = stmt.query_map(params![work_group_id], map_workflow)?;
+            collect_rows(rows)
+        })
+    }
 }
 
 fn map_workflow(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRecord> {
@@ -348,6 +372,8 @@ fn map_workflow_stage(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowStage
         status: decode(row.get("status")?)?,
         entry_message_id: row.get("entry_message_id")?,
         completion_message_id: row.get("completion_message_id")?,
+        deliverables_json: row.get::<_, Option<String>>("deliverables_json").unwrap_or(None),
+        quality_gate_json: row.get::<_, Option<String>>("quality_gate_json").unwrap_or(None),
         created_at: row.get("created_at")?,
     })
 }

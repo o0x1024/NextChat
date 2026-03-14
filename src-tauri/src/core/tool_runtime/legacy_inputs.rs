@@ -14,16 +14,79 @@ impl ToolRuntime {
             return input.to_string();
         }
 
+        // LLMs sometimes emit literal newline/tab bytes inside JSON string values instead of
+        // the required escape sequences (\\n, \\t).  Try to repair that before falling back to
+        // pattern-based normalisation.
+        if let Some(repaired) = sanitize_json_string_literals(trimmed) {
+            return repaired;
+        }
+
         match tool.id.as_str() {
             "Write" => normalize_write_input(trimmed),
             "Read" => normalize_read_input(trimmed),
             "LS" => normalize_ls_input(trimmed),
             "Bash" => normalize_bash_input(trimmed),
-            "ExitPlanMode" => Some(json!({ "plan": trimmed }).to_string()),
-            "TodoWrite" => normalize_todo_write_input(trimmed),
             _ => None,
         }
         .unwrap_or_else(|| input.to_string())
+    }
+}
+
+/// Repairs JSON that contains literal control characters (newline, carriage-return, tab)
+/// inside string values.  Returns `Some(repaired)` only when the result is valid JSON.
+fn sanitize_json_string_literals(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    // Only attempt repair for JSON objects / arrays.
+    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        return None;
+    }
+
+    let mut result = String::with_capacity(trimmed.len() + 64);
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut modified = false;
+
+    for ch in trimmed.chars() {
+        if escaped {
+            result.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            result.push(ch);
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            result.push(ch);
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\n' => {
+                    result.push_str("\\n");
+                    modified = true;
+                }
+                '\r' => {
+                    result.push_str("\\r");
+                    modified = true;
+                }
+                '\t' => {
+                    result.push_str("\\t");
+                    modified = true;
+                }
+                _ => result.push(ch),
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    if modified && serde_json::from_str::<Value>(&result).is_ok() {
+        Some(result)
+    } else {
+        None
     }
 }
 
@@ -90,69 +153,66 @@ fn normalize_bash_input(input: &str) -> Option<String> {
     Some(json!({ "command": command }).to_string())
 }
 
-fn normalize_todo_write_input(input: &str) -> Option<String> {
-    if !is_explicit_todo_request(input) {
-        return None;
+#[cfg(test)]
+mod tests {
+    use super::sanitize_json_string_literals;
+    use serde_json::Value;
+
+    /// Helper: round-trips the repaired JSON through serde to confirm it is valid.
+    fn parse_repaired(input: &str) -> Value {
+        let repaired = sanitize_json_string_literals(input)
+            .expect("sanitize_json_string_literals should return Some");
+        serde_json::from_str(&repaired).expect("repaired JSON must be valid")
     }
 
-    let body = strip_todo_prefix(input).unwrap_or(input).trim();
-    let mut todos = body
-        .lines()
-        .map(str::trim)
-        .map(strip_bullet_prefix)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-
-    if todos.is_empty() && !body.is_empty() {
-        todos.push(body.to_string());
-    }
-    if todos.is_empty() {
-        return None;
+    #[test]
+    fn repairs_literal_newline_in_content_field() {
+        // Simulates the LLM emitting a real newline byte inside the JSON string value.
+        let raw = "{\"file_path\":\"/tmp/a.js\",\"content\":\"line1\nline2\"}";
+        let value = parse_repaired(raw);
+        assert_eq!(
+            value["content"].as_str().unwrap(),
+            "line1\nline2",
+            "content should decode back to two lines"
+        );
     }
 
-    Some(
-        json!({
-            "todos": todos
-                .into_iter()
-                .enumerate()
-                .map(|(index, content)| json!({
-                    "id": format!("todo-{}", index + 1),
-                    "content": content,
-                    "status": "pending",
-                }))
-                .collect::<Vec<_>>(),
-        })
-        .to_string(),
-    )
-}
+    #[test]
+    fn repairs_literal_cr_and_tab() {
+        let raw = "{\"key\":\"col1\tcol2\r\ncol3\"}";
+        let value = parse_repaired(raw);
+        let content = value["key"].as_str().unwrap();
+        assert!(content.contains('\t'));
+        assert!(content.contains('\n'));
+    }
 
-fn is_explicit_todo_request(input: &str) -> bool {
-    let lowered = input.to_lowercase();
-    ["todo", "task list", "待办"]
-        .iter()
-        .any(|keyword| lowered.contains(keyword))
-}
+    #[test]
+    fn returns_none_for_already_valid_json() {
+        let valid = r#"{"file_path":"/tmp/a.js","content":"line1\\nline2"}"#;
+        // Already valid → sanitize should return None (no modification needed).
+        assert!(
+            sanitize_json_string_literals(valid).is_none(),
+            "no repair needed for already-valid JSON"
+        );
+    }
 
-fn strip_todo_prefix(input: &str) -> Option<&str> {
-    let lowered = input.to_lowercase();
-    ["todo", "task list"]
-        .iter()
-        .find_map(|keyword| {
-            lowered
-                .find(keyword)
-                .map(|index| &input[index + keyword.len()..])
-        })
-        .or_else(|| {
-            input
-                .find("待办")
-                .map(|index| &input[index + "待办".len()..])
-        })
-        .map(|value| value.trim_start_matches([':', '：', '-', ' ']))
-}
+    #[test]
+    fn returns_none_for_non_json_input() {
+        assert!(sanitize_json_string_literals("write foo content: bar").is_none());
+    }
 
-fn strip_bullet_prefix(line: &str) -> &str {
-    line.trim_start_matches(|ch: char| {
-        ch.is_ascii_digit() || matches!(ch, '.' | ')' | '-' | '*' | '[' | ']' | ' ')
-    })
+    #[test]
+    fn does_not_corrupt_escaped_sequences_already_in_string() {
+        // Input has a proper \\n escape plus a literal newline — both should survive.
+        let raw = "{\"a\":\"already\\\\n escaped\nand literal\"}";
+        let value = parse_repaired(raw);
+        let s = value["a"].as_str().unwrap();
+        // The already-escaped \\n should remain as a literal backslash-n pair.
+        assert!(s.contains("\\n"), "escaped \\n must not be double-escaped");
+        // The literal newline should now be a real newline in the decoded value.
+        assert!(
+            s.contains('\n'),
+            "literal newline must be present after decode"
+        );
+    }
 }

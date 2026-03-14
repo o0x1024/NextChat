@@ -168,10 +168,10 @@ export function ChatMessageList({
             <time className="ml-2">{formatTime(track.updatedAt, language)}</time>
           </div>
           <div className="chat-bubble chat-bubble-secondary min-w-0 max-w-full text-sm">
-            <div className="whitespace-pre-wrap break-words">
-              {track.content}
+            <div className="min-w-0 max-w-full">
+              <MarkdownMessage content={track.content} />
               {track.status === "streaming" ? (
-                <span className="ml-1 inline-block h-4 w-1 animate-pulse bg-current align-middle" />
+                <span className="mt-1 inline-block h-4 w-1 animate-pulse bg-current align-middle" />
               ) : null}
             </div>
           </div>

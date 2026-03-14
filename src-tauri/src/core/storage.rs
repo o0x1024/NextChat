@@ -282,6 +282,10 @@ impl Storage {
                 "TEXT NOT NULL DEFAULT '.'",
             )?;
             ensure_column(conn, "work_groups", "owner_agent_id", "TEXT")?;
+            ensure_column(conn, "messages", "narrative_meta", "TEXT")?;
+            ensure_column(conn, "task_cards", "output_summary", "TEXT")?;
+            ensure_column(conn, "workflow_stages", "deliverables_json", "TEXT")?;
+            ensure_column(conn, "workflow_stages", "quality_gate_json", "TEXT")?;
             conn.execute(
                 "UPDATE agents SET permission_policy = ?1 WHERE permission_policy IS NULL",
                 params![json(&AgentPermissionPolicy::default())?],
@@ -361,7 +365,7 @@ impl Storage {
                     "Research Lead",
                     "Map the problem space, gather context, and keep the team aligned on evidence.",
                     vec![
-                        "Skills".to_string(),
+                        "Skill".to_string(),
                         "Grep".to_string(),
                         "WebSearch".to_string(),
                         "WebFetch".to_string(),
@@ -376,18 +380,18 @@ impl Storage {
                     "Systems Engineer",
                     "Turn task cards into executable changes, plans, and runnable artifacts.",
                     vec![
-                        "Skills".to_string(),
+                        "Skill".to_string(),
                         "Read".to_string(),
                         "Edit".to_string(),
                         "Write".to_string(),
-                        "MultiEdit".to_string(),
                         "Grep".to_string(),
                         "Glob".to_string(),
                         "Bash".to_string(),
                         "shell.exec".to_string(),
                         "AskUserQuestion".to_string(),
-                        "TodoWrite".to_string(),
-                        "ExitPlanMode".to_string(),
+                        "TaskCreate".to_string(),
+                        "TaskUpdate".to_string(),
+                        "TaskList".to_string(),
                     ],
                 ),
                 (
@@ -396,12 +400,14 @@ impl Storage {
                     "Quality Reviewer",
                     "Stress test proposals, spot regressions, and keep the bar high.",
                     vec![
-                        "Skills".to_string(),
+                        "Skill".to_string(),
                         "Read".to_string(),
                         "Grep".to_string(),
                         "LS".to_string(),
                         "AskUserQuestion".to_string(),
-                        "TodoWrite".to_string(),
+                        "TaskCreate".to_string(),
+                        "TaskUpdate".to_string(),
+                        "TaskList".to_string(),
                     ],
                 ),
             ];
@@ -507,6 +513,11 @@ impl Storage {
     }
 
     pub fn dashboard_state(&self) -> Result<DashboardState> {
+        let workflows = self.list_workflows()?;
+        let workflow_stages: Vec<_> = workflows
+            .iter()
+            .flat_map(|w| self.list_workflow_stages(&w.id).unwrap_or_default())
+            .collect();
         Ok(DashboardState {
             agents: self.list_agents()?,
             work_groups: self.list_work_groups()?,
@@ -515,6 +526,8 @@ impl Storage {
             pending_user_questions: self.list_pending_user_questions()?,
             task_blockers: self.list_task_blockers()?,
             workflow_checkpoints: self.list_all_workflow_checkpoints()?,
+            workflows,
+            workflow_stages,
             claim_bids: self.list_claim_bids()?,
             leases: self.list_leases()?,
             tool_runs: self.list_tool_runs()?,

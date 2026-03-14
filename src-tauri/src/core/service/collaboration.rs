@@ -36,6 +36,7 @@ impl AppService {
                     .unwrap_or("Pending assignment"),
                 child_task.normalized_goal
             ),
+            narrative_meta: None,
             mentions: collaborator
                 .map(|agent| vec![agent.id.clone()])
                 .unwrap_or_default(),
@@ -93,6 +94,7 @@ impl AppService {
                 collaboration_status_label(&status),
                 summary.trim()
             ),
+            narrative_meta: None,
             mentions: vec![requester.id.clone()],
             task_card_id: Some(child_task.id.clone()),
             execution_mode,

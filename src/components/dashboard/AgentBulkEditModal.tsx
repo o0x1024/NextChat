@@ -9,9 +9,6 @@ export interface AgentBulkEditDraft {
   model: string;
   temperature: number;
   applyPermissionPolicy: boolean;
-  allowToolIds: string;
-  denyToolIds: string;
-  requireApprovalToolIds: string;
   allowFsRoots: string;
   allowNetworkDomains: string;
 }
@@ -138,21 +135,6 @@ export function AgentBulkEditModal({
 
           {draft.applyPermissionPolicy && (
             <div className="mt-4 grid gap-4 md:grid-cols-2">
-              <BulkTextarea
-                label={t("permissionAllowTools")}
-                value={draft.allowToolIds}
-                onChange={(value) => onChange({ ...draft, allowToolIds: value })}
-              />
-              <BulkTextarea
-                label={t("permissionDenyTools")}
-                value={draft.denyToolIds}
-                onChange={(value) => onChange({ ...draft, denyToolIds: value })}
-              />
-              <BulkTextarea
-                label={t("permissionRequireApprovalTools")}
-                value={draft.requireApprovalToolIds}
-                onChange={(value) => onChange({ ...draft, requireApprovalToolIds: value })}
-              />
               <BulkTextarea
                 label={t("permissionAllowFsRoots")}
                 value={draft.allowFsRoots}

@@ -79,6 +79,7 @@ pub enum BlockerCategory {
     ToolFailure,
     DesignConflict,
     NeedUserDecision,
+    PeerInputRequired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -163,6 +164,8 @@ pub struct WorkflowStageRecord {
     pub status: StageStatus,
     pub entry_message_id: Option<String>,
     pub completion_message_id: Option<String>,
+    pub deliverables_json: Option<String>,
+    pub quality_gate_json: Option<String>,
     pub created_at: String,
 }
 

@@ -1,4 +1,5 @@
 import type {
+  AddWorkflowStageInput,
   AgentProfile,
   AuditEvent,
   ChatStreamTrack,
@@ -13,8 +14,11 @@ import type {
   TaskBlockerRecord,
   ToolManifest,
   ToolRun,
+  UpdateWorkflowStageInput,
   UpdateWorkGroupInput,
   WorkflowCheckpointRecord,
+  WorkflowRecord,
+  WorkflowStageRecord,
   WorkGroup,
 } from "../../types";
 import type { Language } from "../../store/preferencesStore";
@@ -45,8 +49,17 @@ export interface ChatManagementProps {
   onAddAgent: (workGroupId: string, agentId: string) => Promise<void>;
   onRemoveAgent: (workGroupId: string, agentId: string) => Promise<void>;
   onApproveRun: (toolRunId: string, approved: boolean) => Promise<void>;
+  workflows: WorkflowRecord[];
+  workflowStages: WorkflowStageRecord[];
   onCancelTask: (taskCardId: string) => Promise<void>;
   onResolveBlocker: (blockerId: string, resolution: OwnerBlockerResolution) => Promise<void>;
+  onCancelWorkflow: (workflowId: string) => Promise<void>;
+  onPauseWorkflow: (workflowId: string) => Promise<void>;
+  onResumeWorkflow: (workflowId: string) => Promise<void>;
+  onSkipStage: (workflowId: string, stageId: string) => Promise<void>;
+  onAddStage: (input: AddWorkflowStageInput) => Promise<void>;
+  onUpdateStage: (input: UpdateWorkflowStageInput) => Promise<void>;
+  onRemoveStage: (stageId: string) => Promise<void>;
 }
 
 export type PanelTarget =

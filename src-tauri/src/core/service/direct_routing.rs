@@ -65,6 +65,7 @@ impl AppService {
             work_group_id: work_group.id.clone(),
             created_by: "human".into(),
             assigned_agent_id: Some(agent.id.clone()),
+            output_summary: None,
             created_at: now(),
         };
         let execution = self
@@ -80,6 +81,7 @@ impl AppService {
                 available_skills: selected_skills_for_agent(agent, &self.tool_runtime.all_skills()),
                 approved_tool: None,
                 approved_tool_input: None,
+                upstream_context: None,
                 settings: self.storage.get_settings()?,
                 summary_stream: None,
                 tool_stream: None,
@@ -166,7 +168,8 @@ impl AppService {
                     sender_name: "System".into(),
                     kind: MessageKind::Status,
                     visibility: crate::core::domain::Visibility::Backstage,
-                    content: serde_json::to_string(&envelope)?,
+                    content: envelope.text.clone(),
+                    narrative_meta: Some(serde_json::to_string(&envelope)?),
                     mentions: vec![agent.id.clone()],
                     task_card_id: Some(task.id.clone()),
                     execution_mode: None,
@@ -175,7 +178,7 @@ impl AppService {
                 self.storage.insert_message(&message)?;
                 emit(&app, "chat:message-created", &message)?;
             }
-            self.activate_assigned_task(&app, &task, members, NarrativeMessageType::AgentAck)?;
+            self.activate_assigned_task(&app, &task, members)?;
         }
         Ok(self
             .storage
@@ -190,7 +193,6 @@ impl AppService {
         app: &AppHandle<R>,
         task: &TaskCard,
         members: &[AgentProfile],
-        narrative_type: NarrativeMessageType,
     ) -> Result<()> {
         let agent_id = task
             .assigned_agent_id
@@ -218,27 +220,6 @@ impl AppService {
         if let Some(lease) = self.storage.get_lease_by_task(&active_task.id)? {
             emit(app, "lease:granted", &lease)?;
         }
-        let ack = ConversationMessage {
-            id: new_id(),
-            conversation_id: active_task.work_group_id.clone(),
-            work_group_id: active_task.work_group_id.clone(),
-            sender_kind: SenderKind::Agent,
-            sender_id: agent.id.clone(),
-            sender_name: agent.name.clone(),
-            kind: MessageKind::Status,
-            visibility: crate::core::domain::Visibility::Main,
-            content: self.build_task_narrative_content(
-                &active_task,
-                narrative_type,
-                self.build_agent_ack_text(&active_task, &agent)?,
-            )?,
-            mentions: vec![],
-            task_card_id: Some(active_task.id.clone()),
-            execution_mode: None,
-            created_at: now(),
-        };
-        self.storage.insert_message(&ack)?;
-        emit(app, "chat:message-created", &ack)?;
         self.spawn_task_execution(app.clone(), active_task.id.clone(), None);
         Ok(())
     }
@@ -262,6 +243,7 @@ impl AppService {
             work_group_id: source_message.work_group_id.clone(),
             created_by: "human".into(),
             assigned_agent_id: Some(assignee_agent_id.to_string()),
+            output_summary: None,
             created_at: now(),
         })
     }

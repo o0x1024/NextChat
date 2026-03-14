@@ -10,8 +10,11 @@ use crate::core::{
     },
     llm_rig::test_connection,
     logging,
-    service::AppService,
-    workflow::{OwnerBlockerResolution, RaiseTaskBlockerInput, TaskBlockerRecord},
+    service::{AppService, AddWorkflowStageInput, UpdateWorkflowStageInput},
+    workflow::{
+        OwnerBlockerResolution, RaiseTaskBlockerInput, TaskBlockerRecord, WorkflowRecord,
+        WorkflowStageRecord,
+    },
 };
 
 struct SharedState {
@@ -254,6 +257,81 @@ async fn resume_task_card(
 }
 
 #[tauri::command]
+async fn cancel_workflow(
+    app: tauri::AppHandle,
+    state: State<'_, SharedState>,
+    workflow_id: String,
+) -> Result<WorkflowRecord, String> {
+    command_result(
+        "tauri.cancel_workflow",
+        state.service.cancel_workflow(app, &workflow_id),
+    )
+}
+
+#[tauri::command]
+async fn pause_workflow(
+    app: tauri::AppHandle,
+    state: State<'_, SharedState>,
+    workflow_id: String,
+) -> Result<WorkflowRecord, String> {
+    command_result(
+        "tauri.pause_workflow",
+        state.service.pause_workflow(app, &workflow_id),
+    )
+}
+
+#[tauri::command]
+async fn resume_workflow(
+    app: tauri::AppHandle,
+    state: State<'_, SharedState>,
+    workflow_id: String,
+) -> Result<WorkflowRecord, String> {
+    command_result(
+        "tauri.resume_workflow",
+        state.service.resume_workflow(app, &workflow_id),
+    )
+}
+
+#[tauri::command]
+async fn skip_workflow_stage(
+    app: tauri::AppHandle,
+    state: State<'_, SharedState>,
+    workflow_id: String,
+    stage_id: String,
+) -> Result<WorkflowStageRecord, String> {
+    command_result(
+        "tauri.skip_workflow_stage",
+        state
+            .service
+            .skip_workflow_stage(app, &workflow_id, &stage_id),
+    )
+}
+
+#[tauri::command]
+async fn add_workflow_stage(
+    state: State<'_, SharedState>,
+    input: AddWorkflowStageInput,
+) -> Result<WorkflowStageRecord, String> {
+    command_result("tauri.add_workflow_stage", state.service.add_workflow_stage(input))
+}
+
+#[tauri::command]
+async fn update_workflow_stage(
+    state: State<'_, SharedState>,
+    input: UpdateWorkflowStageInput,
+) -> Result<WorkflowStageRecord, String> {
+    command_result("tauri.update_workflow_stage", state.service.update_workflow_stage(input))
+}
+
+#[tauri::command]
+async fn remove_workflow_stage(
+    state: State<'_, SharedState>,
+    stage_id: String,
+) -> Result<(), String> {
+    command_result("tauri.remove_workflow_stage", state.service.remove_workflow_stage(&stage_id))
+}
+
+#[tauri::command]
 async fn get_audit_events(
     state: State<'_, SharedState>,
     limit: Option<usize>,
@@ -281,10 +359,15 @@ async fn update_settings(
 }
 
 #[tauri::command]
-async fn test_provider_connection(config: AIProviderConfig) -> Result<(), String> {
+async fn test_provider_connection(
+    state: State<'_, SharedState>,
+    config: AIProviderConfig,
+) -> Result<(), String> {
+    let settings = state.service.get_settings().map_err(|e| e.to_string())?;
+    let proxy_url = &settings.global_config.proxy_url;
     command_result(
         "tauri.test_provider_connection",
-        test_connection(&config).await,
+        test_connection(&config, proxy_url).await,
     )
 }
 
@@ -489,6 +572,13 @@ pub fn run() {
             resolve_owner_blocker,
             pause_lease,
             resume_task_card,
+            cancel_workflow,
+            pause_workflow,
+            resume_workflow,
+            skip_workflow_stage,
+            add_workflow_stage,
+            update_workflow_stage,
+            remove_workflow_stage,
             get_audit_events,
             get_settings,
             update_settings,

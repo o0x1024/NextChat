@@ -1,9 +1,10 @@
 use super::AppService;
 use crate::core::domain::{
-    new_id, now, ClaimBid, ClaimScoreBreakdown, ConversationMessage, CreateWorkGroupInput, Lease,
-    LeaseState, MemoryItem, MemoryScope, MessageKind, SenderKind, TaskCard, TaskStatus, ToolRun,
-    ToolRunState, Visibility, WorkGroupKind,
+    new_id, now, AuditEvent, ClaimBid, ClaimScoreBreakdown, ConversationMessage,
+    CreateWorkGroupInput, Lease, LeaseState, MemoryItem, MemoryScope, MessageKind, SenderKind,
+    TaskCard, TaskStatus, ToolRun, ToolRunState, Visibility, WorkGroupKind,
 };
+use serde_json::json;
 use std::{
     fs,
     path::PathBuf,
@@ -42,6 +43,17 @@ fn clear_work_group_history_removes_messages_tasks_and_tool_artifacts() {
             member_agent_ids: None,
         })
         .expect("work group");
+    let other_work_group = service
+        .create_work_group(CreateWorkGroupInput {
+            name: "Other Group".into(),
+            goal: "Keep unrelated audit history.".into(),
+            working_directory: ".".into(),
+            kind: WorkGroupKind::Persistent,
+            default_visibility: "summary".into(),
+            auto_archive: false,
+            member_agent_ids: None,
+        })
+        .expect("other work group");
 
     let message = ConversationMessage {
         id: new_id(),
@@ -53,6 +65,7 @@ fn clear_work_group_history_removes_messages_tasks_and_tool_artifacts() {
         kind: MessageKind::Text,
         visibility: Visibility::Main,
         content: "hello".into(),
+        narrative_meta: None,
         mentions: vec![],
         task_card_id: None,
         execution_mode: None,
@@ -75,6 +88,7 @@ fn clear_work_group_history_removes_messages_tasks_and_tool_artifacts() {
         work_group_id: work_group.id.clone(),
         created_by: "human".into(),
         assigned_agent_id: Some("agent-test".into()),
+        output_summary: None,
         created_at: now(),
     };
     service
@@ -158,6 +172,56 @@ fn clear_work_group_history_removes_messages_tasks_and_tool_artifacts() {
         .insert_memory_item(&group_memory)
         .expect("insert group memory");
 
+    let cleared_decision_audit = AuditEvent {
+        id: new_id(),
+        event_type: "owner.decision.generated".into(),
+        entity_type: "owner_decision".into(),
+        entity_id: "owner.assignment".into(),
+        payload_json: json!({
+            "context": {
+                "workGroupId": work_group.id,
+                "taskId": task.id,
+            }
+        })
+        .to_string(),
+        created_at: now(),
+    };
+    service
+        .storage
+        .insert_audit_event(&cleared_decision_audit)
+        .expect("insert cleared decision audit");
+
+    let cleared_group_audit = AuditEvent {
+        id: new_id(),
+        event_type: "work_group.updated".into(),
+        entity_type: "work_group".into(),
+        entity_id: work_group.id.clone(),
+        payload_json: json!({ "goal": "Validate clear history behavior." }).to_string(),
+        created_at: now(),
+    };
+    service
+        .storage
+        .insert_audit_event(&cleared_group_audit)
+        .expect("insert cleared work group audit");
+
+    let retained_other_group_audit = AuditEvent {
+        id: new_id(),
+        event_type: "owner.decision.generated".into(),
+        entity_type: "owner_decision".into(),
+        entity_id: "owner.assignment".into(),
+        payload_json: json!({
+            "context": {
+                "workGroupId": other_work_group.id,
+            }
+        })
+        .to_string(),
+        created_at: now(),
+    };
+    service
+        .storage
+        .insert_audit_event(&retained_other_group_audit)
+        .expect("insert retained audit");
+
     service
         .clear_work_group_history(&work_group.id)
         .expect("clear history");
@@ -224,6 +288,31 @@ fn clear_work_group_history_removes_messages_tasks_and_tool_artifacts() {
                 && item.scope_id == work_group.id),
         "work-group memory should be retained"
     );
+
+    let audit_events = service
+        .storage
+        .list_audit_events(None)
+        .expect("audit events");
+    assert!(
+        audit_events.iter().all(
+            |event| event.id != cleared_decision_audit.id && event.id != cleared_group_audit.id
+        ),
+        "audit events for the cleared work group should be removed"
+    );
+    assert!(
+        audit_events
+            .iter()
+            .any(|event| event.id == retained_other_group_audit.id),
+        "audit events for other work groups should remain"
+    );
+    assert!(
+        audit_events.iter().any(|event| {
+            event.event_type == "work_group.history_cleared"
+                && event.entity_type == "work_group"
+                && event.entity_id == work_group.id
+        }),
+        "clear history should emit a fresh audit event for the work group"
+    );
 }
 
 #[test]
@@ -252,6 +341,7 @@ fn clear_work_group_history_rejects_when_active_leases_exist() {
         kind: MessageKind::Text,
         visibility: Visibility::Main,
         content: "active task".into(),
+        narrative_meta: None,
         mentions: vec![],
         task_card_id: None,
         execution_mode: None,
@@ -274,6 +364,7 @@ fn clear_work_group_history_rejects_when_active_leases_exist() {
         work_group_id: work_group.id.clone(),
         created_by: "human".into(),
         assigned_agent_id: Some("agent-test".into()),
+        output_summary: None,
         created_at: now(),
     };
     service

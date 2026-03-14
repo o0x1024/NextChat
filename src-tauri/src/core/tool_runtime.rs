@@ -40,14 +40,20 @@ pub struct ToolRuntime {
     pub(crate) http_client: Client,
     pub(crate) bash_runs: Arc<AsyncMutex<HashMap<String, BackgroundBashRun>>>,
     pub(crate) bash_tasks: Arc<AsyncMutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
-    pub(crate) todo_state: Arc<AsyncMutex<Vec<TodoItem>>>,
+    pub(crate) task_state: Arc<AsyncMutex<HashMap<String, TaskItem>>>,
+    pub(crate) task_counter: Arc<AsyncMutex<u64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct TodoItem {
-    pub(crate) content: String,
-    pub(crate) status: String,
+pub(crate) struct TaskItem {
     pub(crate) id: String,
+    pub(crate) subject: String,
+    pub(crate) description: String,
+    pub(crate) active_form: Option<String>,
+    pub(crate) status: String,
+    pub(crate) owner: Option<String>,
+    pub(crate) blocks: Vec<String>,
+    pub(crate) blocked_by: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,7 +92,8 @@ impl ToolRuntime {
             http_client,
             bash_runs: Arc::new(AsyncMutex::new(HashMap::new())),
             bash_tasks: Arc::new(AsyncMutex::new(HashMap::new())),
-            todo_state: Arc::new(AsyncMutex::new(Vec::new())),
+            task_state: Arc::new(AsyncMutex::new(HashMap::new())),
+            task_counter: Arc::new(AsyncMutex::new(0)),
         })
     }
 
@@ -131,29 +138,29 @@ impl ToolRuntime {
             ("Glob", &["glob", "pattern", "文件名", "匹配"][..]),
             ("Grep", &["grep", "regex", "search", "查找", "搜索"][..]),
             (
-                "Skills",
+                "Skill",
                 &["skill", "skills", "skill.md", "技能", "提示词包"][..],
             ),
             ("LS", &["ls", "list", "directory", "目录"][..]),
-            (
-                "ExitPlanMode",
-                &["exit plan", "ready to code", "退出规划"][..],
-            ),
             ("Read", &["read", "查看", "读取", "file"][..]),
             ("Edit", &["edit", "replace", "修改", "替换"][..]),
-            ("MultiEdit", &["multi edit", "batch edit", "批量修改"][..]),
             ("Write", &["write", "save", "写入", "保存"][..]),
-            ("NotebookEdit", &["notebook", "ipynb", "jupyter"][..]),
             ("WebFetch", &["fetch", "url", "网页抓取"][..]),
-            ("TodoWrite", &["todo", "task list", "待办"][..]),
+            ("TaskCreate", &["task create", "new task", "创建任务"][..]),
+            ("TaskList", &["task list", "todo", "待办", "list tasks"][..]),
+            ("TaskGet", &["task get", "get task"][..]),
+            (
+                "TaskUpdate",
+                &["task update", "update task", "mark task"][..],
+            ),
             ("WebSearch", &["web search", "search web", "联网搜索"][..]),
             (
-                "BashOutput",
-                &["bash output", "shell output", "后台输出"][..],
+                "TaskOutput",
+                &["task output", "bash output", "shell output", "后台输出"][..],
             ),
             (
-                "KillBash",
-                &["kill bash", "terminate shell", "停止命令"][..],
+                "TaskStop",
+                &["task stop", "kill bash", "terminate shell", "停止命令"][..],
             ),
         ]);
 
@@ -175,7 +182,7 @@ impl ToolRuntime {
             BUILTIN_TOOLS
                 .iter()
                 .find(|tool| {
-                    tool.id == "TodoWrite"
+                    tool.id == "TaskCreate"
                         && (allowed_tool_ids.is_empty() || allowed_tool_ids.contains(&tool.id))
                 })
                 .cloned()
@@ -507,25 +514,23 @@ impl ToolHandler for ToolRuntime {
         match normalized_request.tool.id.as_str() {
             "Task" => self.run_task_compat_tool(&normalized_request).await,
             "AskUserQuestion" => self.run_ask_user_question_tool(&normalized_request).await,
+            "RequestPeerInput" => self.run_request_peer_input_tool(&normalized_request).await,
             "Bash" => self.run_bash_compat_tool(&normalized_request).await,
             "Glob" => self.run_glob_compat_tool(&normalized_request).await,
             "Grep" => self.run_grep_compat_tool(&normalized_request).await,
-            "Skills" => self.run_skills_tool(&normalized_request).await,
+            "Skill" => self.run_skill_tool(&normalized_request).await,
             "LS" => self.run_ls_compat_tool(&normalized_request).await,
-            "ExitPlanMode" => self.run_exit_plan_mode_tool(&normalized_request).await,
             "Read" => self.run_read_compat_tool(&normalized_request).await,
             "Edit" => self.run_edit_compat_tool(&normalized_request).await,
-            "MultiEdit" => self.run_multiedit_compat_tool(&normalized_request).await,
             "Write" => self.run_write_compat_tool(&normalized_request).await,
-            "NotebookEdit" => {
-                self.run_notebook_edit_compat_tool(&normalized_request)
-                    .await
-            }
             "WebFetch" => self.run_web_fetch_compat_tool(&normalized_request).await,
-            "TodoWrite" => self.run_todo_write_compat_tool(&normalized_request).await,
+            "TaskCreate" => self.run_task_create_tool(&normalized_request).await,
+            "TaskGet" => self.run_task_get_tool(&normalized_request).await,
+            "TaskUpdate" => self.run_task_update_tool(&normalized_request).await,
+            "TaskList" => self.run_task_list_tool(&normalized_request).await,
             "WebSearch" => self.run_web_search_compat_tool(&normalized_request).await,
-            "BashOutput" => self.run_bash_output_compat_tool(&normalized_request).await,
-            "KillBash" => self.run_kill_bash_compat_tool(&normalized_request).await,
+            "TaskOutput" => self.run_task_output_compat_tool(&normalized_request).await,
+            "TaskStop" => self.run_task_stop_compat_tool(&normalized_request).await,
             _ => Err(anyhow!("unsupported tool '{}'", request.tool.id)),
         }
     }

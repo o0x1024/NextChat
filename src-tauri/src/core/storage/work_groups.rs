@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::params;
+use rusqlite::{params, Connection};
 
 use super::{bool_to_i64, json, map_work_group, Storage};
 use crate::core::domain::{MemoryScope, WorkGroup};
@@ -148,6 +148,7 @@ impl Storage {
                 "DELETE FROM messages WHERE work_group_id = ?1",
                 params![work_group_id],
             )?;
+            delete_work_group_audit_events(conn, work_group_id)?;
             let deleted = conn.execute(
                 "DELETE FROM work_groups WHERE id = ?1",
                 params![work_group_id],
@@ -227,6 +228,7 @@ impl Storage {
                 "DELETE FROM messages WHERE work_group_id = ?1",
                 params![work_group_id],
             )?;
+            delete_work_group_audit_events(conn, work_group_id)?;
             Ok(())
         })
     }
@@ -261,4 +263,53 @@ impl Storage {
         self.insert_work_group(&group)?;
         Ok(group)
     }
+}
+
+fn delete_work_group_audit_events(conn: &Connection, work_group_id: &str) -> Result<()> {
+    let work_group_pattern = format!("%\"workGroupId\":\"{}\"%", work_group_id);
+    let work_group_snake_pattern = format!("%\"work_group_id\":\"{}\"%", work_group_id);
+
+    conn.execute(
+        r#"
+        DELETE FROM audit_events
+        WHERE (entity_type = 'work_group' AND entity_id = ?1)
+           OR (entity_type = 'task_card' AND entity_id IN (
+                SELECT id FROM task_cards WHERE work_group_id = ?1
+           ))
+           OR (entity_type = 'workflow' AND entity_id IN (
+                SELECT id FROM workflows WHERE work_group_id = ?1
+           ))
+           OR (entity_type = 'workflow_stage' AND entity_id IN (
+                SELECT id FROM workflow_stages
+                WHERE workflow_id IN (SELECT id FROM workflows WHERE work_group_id = ?1)
+           ))
+           OR (entity_type = 'task_dispatch' AND entity_id IN (
+                SELECT id FROM task_dispatches
+                WHERE workflow_id IN (SELECT id FROM workflows WHERE work_group_id = ?1)
+                   OR task_id IN (SELECT id FROM task_cards WHERE work_group_id = ?1)
+           ))
+           OR (entity_type = 'task_blocker' AND entity_id IN (
+                SELECT id FROM task_blockers
+                WHERE workflow_id IN (SELECT id FROM workflows WHERE work_group_id = ?1)
+                   OR task_id IN (SELECT id FROM task_cards WHERE work_group_id = ?1)
+           ))
+           OR (entity_type = 'claim_bid' AND entity_id IN (
+                SELECT id FROM claim_bids
+                WHERE task_card_id IN (SELECT id FROM task_cards WHERE work_group_id = ?1)
+           ))
+           OR (entity_type = 'lease' AND entity_id IN (
+                SELECT id FROM leases
+                WHERE task_card_id IN (SELECT id FROM task_cards WHERE work_group_id = ?1)
+           ))
+           OR (entity_type = 'tool_run' AND entity_id IN (
+                SELECT id FROM tool_runs
+                WHERE task_card_id IN (SELECT id FROM task_cards WHERE work_group_id = ?1)
+           ))
+           OR payload_json LIKE ?2
+           OR payload_json LIKE ?3
+        "#,
+        params![work_group_id, work_group_pattern, work_group_snake_pattern],
+    )?;
+
+    Ok(())
 }

@@ -4,20 +4,25 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use futures::StreamExt;
 use reqwest::Client;
 use rig::{
     agent::{HookAction, PromptHook, ToolCallHookAction},
     client::CompletionClient,
     completion::{CompletionModel, CompletionResponse, Message, Prompt},
     providers::{anthropic, gemini, openai},
-    streaming::{StreamedAssistantContent, StreamingPrompt},
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
+mod tool_execution;
+
+use self::tool_execution::{
+    complete_task_with_tools_attempt, is_empty_json_response_error, log_llm_recovery,
+    pending_user_question_error_from_tool_events, reset_summary_stream, ToolRequestFailure,
+    ToolRequestMode,
+};
 use crate::core::{
     domain::{
         AIProviderConfig, ModelPolicy, ModelProviderAdapter, SummaryStreamSignal, SystemSettings,
@@ -258,7 +263,32 @@ fn parse_custom_headers(config: &AIProviderConfig) -> Result<Vec<(String, String
     Ok(headers)
 }
 
-fn openai_compatible_client(config: &AIProviderConfig) -> Result<openai::CompletionsClient> {
+/// Sets up proxy environment variables for reqwest if proxy_url is configured.
+fn configure_proxy_env(proxy_url: &str) {
+    let trimmed = proxy_url.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    // Set both HTTP and HTTPS proxy environment variables
+    // reqwest will automatically use these for all requests
+    if trimmed.starts_with("http://") {
+        std::env::set_var("HTTP_PROXY", trimmed);
+    } else if trimmed.starts_with("https://") {
+        std::env::set_var("HTTPS_PROXY", trimmed);
+    } else {
+        // Assume HTTPS by default
+        std::env::set_var("HTTPS_PROXY", trimmed);
+    }
+    // Also set the ALL_PROXY for generic proxy support
+    std::env::set_var("ALL_PROXY", trimmed);
+}
+
+fn openai_compatible_client(
+    config: &AIProviderConfig,
+    proxy_url: &str,
+) -> Result<openai::CompletionsClient> {
+    configure_proxy_env(proxy_url);
     let mut builder = openai::Client::builder().api_key(config.api_key.trim());
     if let Some(base_url) = normalized_openai_compatible_base_url(&config.base_url) {
         builder = builder.base_url(&base_url);
@@ -280,7 +310,8 @@ fn normalized_anthropic_base_url(base_url: &str) -> String {
     }
 }
 
-fn anthropic_client(config: &AIProviderConfig) -> Result<anthropic::Client> {
+fn anthropic_client(config: &AIProviderConfig, proxy_url: &str) -> Result<anthropic::Client> {
+    configure_proxy_env(proxy_url);
     anthropic::Client::builder()
         .api_key(config.api_key.trim())
         .base_url(normalized_anthropic_base_url(&config.base_url))
@@ -303,7 +334,8 @@ fn gemini_api_base_url(base_url: &str) -> String {
     format!("{}/v1beta", normalized_gemini_base_url(base_url))
 }
 
-fn gemini_client(config: &AIProviderConfig) -> Result<gemini::Client> {
+fn gemini_client(config: &AIProviderConfig, proxy_url: &str) -> Result<gemini::Client> {
+    configure_proxy_env(proxy_url);
     gemini::Client::builder()
         .api_key(config.api_key.trim())
         .base_url(normalized_gemini_base_url(&config.base_url))
@@ -594,7 +626,11 @@ fn apply_custom_headers_to_request(
     Ok(request)
 }
 
-async fn fetch_openai_compatible_models(config: &AIProviderConfig) -> Result<Vec<String>> {
+async fn fetch_openai_compatible_models(
+    config: &AIProviderConfig,
+    proxy_url: &str,
+) -> Result<Vec<String>> {
+    configure_proxy_env(proxy_url);
     let client = Client::new();
     let mut last_error: Option<anyhow::Error> = None;
 
@@ -665,11 +701,12 @@ async fn fetch_openai_compatible_models(config: &AIProviderConfig) -> Result<Vec
     Err(anyhow!("No models were returned by the provider"))
 }
 
-async fn fetch_anthropic_models(config: &AIProviderConfig) -> Result<Vec<String>> {
+async fn fetch_anthropic_models(config: &AIProviderConfig, proxy_url: &str) -> Result<Vec<String>> {
     if config.api_key.trim().is_empty() {
         return Err(anyhow!("API key is required for Anthropic model refresh"));
     }
 
+    configure_proxy_env(proxy_url);
     let client = Client::new();
     let base_url = normalized_api_base_url(&config.base_url, "https://api.anthropic.com");
     let api_base_url = if base_url.ends_with("/v1") {
@@ -697,11 +734,12 @@ async fn fetch_anthropic_models(config: &AIProviderConfig) -> Result<Vec<String>
     ))
 }
 
-async fn fetch_gemini_models(config: &AIProviderConfig) -> Result<Vec<String>> {
+async fn fetch_gemini_models(config: &AIProviderConfig, proxy_url: &str) -> Result<Vec<String>> {
     if config.api_key.trim().is_empty() {
         return Err(anyhow!("API key is required for Gemini model refresh"));
     }
 
+    configure_proxy_env(proxy_url);
     let client = Client::new();
     let base_url = gemini_api_base_url(&config.base_url);
     let payload: GeminiModelListResponse = parse_json_response(
@@ -735,7 +773,8 @@ async fn fetch_gemini_models(config: &AIProviderConfig) -> Result<Vec<String>> {
     Ok(dedupe_models(models))
 }
 
-async fn fetch_ollama_models(config: &AIProviderConfig) -> Result<Vec<String>> {
+async fn fetch_ollama_models(config: &AIProviderConfig, proxy_url: &str) -> Result<Vec<String>> {
+    configure_proxy_env(proxy_url);
     let client = Client::new();
     let base_url = normalized_api_base_url(&config.base_url, "http://localhost:11434");
     let payload: Value = parse_json_response(
@@ -748,7 +787,7 @@ async fn fetch_ollama_models(config: &AIProviderConfig) -> Result<Vec<String>> {
     Ok(parse_model_ids(&payload))
 }
 
-pub async fn refresh_models(config: &AIProviderConfig) -> Result<Vec<String>> {
+pub async fn refresh_models(config: &AIProviderConfig, proxy_url: &str) -> Result<Vec<String>> {
     logging::llm_event(
         "llm.refresh_models",
         "request_start",
@@ -763,12 +802,12 @@ pub async fn refresh_models(config: &AIProviderConfig) -> Result<Vec<String>> {
         match config.rig_provider_type.as_str() {
             provider_type if is_openai_compatible_provider_type(provider_type) => {
                 if provider_type == "Ollama" {
-                    fetch_ollama_models(config).await
+                    fetch_ollama_models(config, proxy_url).await
                 } else {
-                    fetch_openai_compatible_models(config).await
+                    fetch_openai_compatible_models(config, proxy_url).await
                 }
             }
-            "Anthropic" => match fetch_anthropic_models(config).await {
+            "Anthropic" => match fetch_anthropic_models(config, proxy_url).await {
                 Ok(models) => Ok(models),
                 Err(error) => {
                     let message = error.to_string();
@@ -787,7 +826,7 @@ pub async fn refresh_models(config: &AIProviderConfig) -> Result<Vec<String>> {
                     }
                 }
             },
-            "Gemini" => fetch_gemini_models(config).await,
+            "Gemini" => fetch_gemini_models(config, proxy_url).await,
             _ => Err(anyhow!(
                 "Unsupported provider type for model refresh: {}",
                 config.rig_provider_type
@@ -897,8 +936,6 @@ where
         }),
     );
 
-    let call_log = RigToolCallLog::new();
-    let tools = build_rig_tools(context, tool_handler);
     let summary_reset_epoch = Arc::new(AtomicUsize::new(0));
     let tool_identity_by_hook_name = context
         .available_tools
@@ -910,167 +947,93 @@ where
                 (tool.id.clone(), tool.name.clone()),
             )
         })
-        .collect();
-    let hook = LlmRequestHook {
-        context: log_context.clone(),
-        call_log: call_log.clone(),
-        tool_call_stream: context.tool_call_stream.clone(),
-        summary_stream: summary_stream.clone(),
-        summary_reset_epoch: summary_reset_epoch.clone(),
-        tool_identity_by_hook_name,
-    };
+        .collect::<HashMap<_, _>>();
 
-    let result = async {
-        match config.rig_provider_type.as_str() {
-            provider_type if is_openai_compatible_provider_type(provider_type) => {
-                let client = openai_compatible_client(config)?;
-
-                let agent = client
-                    .agent(&context.agent.model_policy.model)
-                    .preamble(preamble)
-                    .default_max_turns(max_turns_for_config(config))
-                    .temperature(context.agent.model_policy.temperature)
-                    .max_tokens(config.max_tokens as u64)
-                    .tools(tools)
-                    .build();
-
-                let mut stream = agent.stream_prompt(prompt).with_hook(hook.clone()).await;
-                let mut streamed_summary = String::new();
-                let mut final_summary: Option<String> = None;
-                let mut seen_reset_epoch = 0usize;
-
-                while let Some(chunk) = stream.next().await {
-                    let reset_epoch = summary_reset_epoch.load(Ordering::SeqCst);
-                    if reset_epoch != seen_reset_epoch {
-                        streamed_summary.clear();
-                        seen_reset_epoch = reset_epoch;
-                    }
-                    match chunk? {
-                        rig::agent::MultiTurnStreamItem::StreamAssistantItem(
-                            StreamedAssistantContent::Text(text),
-                        ) => {
-                            if let Some(delta) =
-                                merge_stream_text(&mut streamed_summary, &text.text)
-                            {
-                                if let Some(stream) = summary_stream.as_ref() {
-                                    let _ = stream.send(SummaryStreamSignal::Delta(delta));
-                                }
-                            }
+    let result: std::result::Result<
+        (String, Vec<RigToolEvent>),
+        (anyhow::Error, Vec<RigToolEvent>),
+    > = match complete_task_with_tools_attempt(
+        context,
+        tool_handler.clone(),
+        config,
+        &log_context,
+        preamble,
+        prompt,
+        summary_stream.clone(),
+        summary_reset_epoch.clone(),
+        &tool_identity_by_hook_name,
+        ToolRequestMode::Streaming,
+    )
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(ToolRequestFailure::RetryableEmptyJson {
+            error: first_error, ..
+        }) => {
+            reset_summary_stream(summary_stream.as_ref());
+            match complete_task_with_tools_attempt(
+                context,
+                tool_handler.clone(),
+                config,
+                &log_context,
+                preamble,
+                prompt,
+                summary_stream.clone(),
+                summary_reset_epoch.clone(),
+                &tool_identity_by_hook_name,
+                ToolRequestMode::Streaming,
+            )
+            .await
+            {
+                Ok(result) => Ok(result),
+                Err(ToolRequestFailure::RetryableEmptyJson {
+                    error: second_error,
+                    ..
+                }) => {
+                    log_llm_recovery(
+                        &log_context,
+                        "request_recovery",
+                        "fallback_to_non_streaming",
+                        ToolRequestMode::Streaming,
+                        &second_error,
+                        0,
+                        None,
+                    );
+                    reset_summary_stream(summary_stream.as_ref());
+                    complete_task_with_tools_attempt(
+                        context,
+                        tool_handler,
+                        config,
+                        &log_context,
+                        preamble,
+                        prompt,
+                        summary_stream,
+                        summary_reset_epoch,
+                        &tool_identity_by_hook_name,
+                        ToolRequestMode::NonStreaming,
+                    )
+                    .await
+                    .map_err(|failure| match failure {
+                        ToolRequestFailure::RetryableEmptyJson { error, tool_events }
+                        | ToolRequestFailure::Fatal { error, tool_events } => {
+                            let final_error = if is_empty_json_response_error(&error.to_string()) {
+                                anyhow!("{first_error}; fallback failed: {error}")
+                            } else {
+                                error
+                            };
+                            (final_error, tool_events)
                         }
-                        rig::agent::MultiTurnStreamItem::FinalResponse(response) => {
-                            final_summary = Some(response.response().to_string());
-                        }
-                        _ => {}
-                    }
+                    })
                 }
-
-                Ok::<_, anyhow::Error>((
-                    final_summary.unwrap_or(streamed_summary),
-                    call_log.snapshot(),
-                ))
+                Err(ToolRequestFailure::Fatal { error, tool_events }) => Err((error, tool_events)),
             }
-            "Anthropic" => {
-                let client = anthropic_client(config)?;
-                let agent = client
-                    .agent(&context.agent.model_policy.model)
-                    .preamble(preamble)
-                    .default_max_turns(max_turns_for_config(config))
-                    .temperature(context.agent.model_policy.temperature)
-                    .max_tokens(config.max_tokens as u64)
-                    .tools(tools)
-                    .build();
-                let mut stream = agent.stream_prompt(prompt).with_hook(hook.clone()).await;
-                let mut streamed_summary = String::new();
-                let mut final_summary: Option<String> = None;
-                let mut seen_reset_epoch = 0usize;
-
-                while let Some(chunk) = stream.next().await {
-                    let reset_epoch = summary_reset_epoch.load(Ordering::SeqCst);
-                    if reset_epoch != seen_reset_epoch {
-                        streamed_summary.clear();
-                        seen_reset_epoch = reset_epoch;
-                    }
-                    match chunk? {
-                        rig::agent::MultiTurnStreamItem::StreamAssistantItem(
-                            StreamedAssistantContent::Text(text),
-                        ) => {
-                            if let Some(delta) =
-                                merge_stream_text(&mut streamed_summary, &text.text)
-                            {
-                                if let Some(stream) = summary_stream.as_ref() {
-                                    let _ = stream.send(SummaryStreamSignal::Delta(delta));
-                                }
-                            }
-                        }
-                        rig::agent::MultiTurnStreamItem::FinalResponse(response) => {
-                            final_summary = Some(response.response().to_string());
-                        }
-                        _ => {}
-                    }
-                }
-
-                Ok::<_, anyhow::Error>((
-                    final_summary.unwrap_or(streamed_summary),
-                    call_log.snapshot(),
-                ))
-            }
-            "Gemini" => {
-                let client = gemini_client(config)?;
-                let agent = client
-                    .agent(&context.agent.model_policy.model)
-                    .preamble(preamble)
-                    .default_max_turns(max_turns_for_config(config))
-                    .temperature(context.agent.model_policy.temperature)
-                    .max_tokens(config.max_tokens as u64)
-                    .tools(tools)
-                    .build();
-                let mut stream = agent.stream_prompt(prompt).with_hook(hook).await;
-                let mut streamed_summary = String::new();
-                let mut final_summary: Option<String> = None;
-                let mut seen_reset_epoch = 0usize;
-
-                while let Some(chunk) = stream.next().await {
-                    let reset_epoch = summary_reset_epoch.load(Ordering::SeqCst);
-                    if reset_epoch != seen_reset_epoch {
-                        streamed_summary.clear();
-                        seen_reset_epoch = reset_epoch;
-                    }
-                    match chunk? {
-                        rig::agent::MultiTurnStreamItem::StreamAssistantItem(
-                            StreamedAssistantContent::Text(text),
-                        ) => {
-                            if let Some(delta) =
-                                merge_stream_text(&mut streamed_summary, &text.text)
-                            {
-                                if let Some(stream) = summary_stream.as_ref() {
-                                    let _ = stream.send(SummaryStreamSignal::Delta(delta));
-                                }
-                            }
-                        }
-                        rig::agent::MultiTurnStreamItem::FinalResponse(response) => {
-                            final_summary = Some(response.response().to_string());
-                        }
-                        _ => {}
-                    }
-                }
-
-                Ok::<_, anyhow::Error>((
-                    final_summary.unwrap_or(streamed_summary),
-                    call_log.snapshot(),
-                ))
-            }
-            _ => Err(anyhow!(
-                "Unsupported provider type '{}' for tool-capable LLM request",
-                config.rig_provider_type
-            )),
         }
-    }
-    .await;
+        Err(ToolRequestFailure::Fatal { error, tool_events }) => Err((error, tool_events)),
+    };
 
     let (summary, tool_events) = match result {
         Ok(result) => result,
-        Err(error) => {
-            let tool_events = call_log.snapshot();
+        Err((error, tool_events)) => {
             let error = if error.to_string().contains(APPROVAL_REQUIRED_PREFIX) {
                 if let Some(event) = tool_events.last() {
                     annotate_approval_request_error(
@@ -1091,6 +1054,11 @@ where
             return Err(error);
         }
     };
+
+    if let Some(error) = pending_user_question_error_from_tool_events(&tool_events)? {
+        log_llm_error(&log_context, &error);
+        return Err(error);
+    }
 
     logging::llm_event(
         "llm.complete_task_with_tools",
@@ -1163,10 +1131,12 @@ impl ModelProviderAdapter for RigModelAdapter {
             tool_identity_by_hook_name: HashMap::new(),
         };
 
+        let proxy_url = &settings.global_config.proxy_url;
+
         let result = async {
             match config.rig_provider_type.as_str() {
                 provider_type if is_openai_compatible_provider_type(provider_type) => {
-                    let client = openai_compatible_client(config)?;
+                    let client = openai_compatible_client(config, proxy_url)?;
 
                     let agent = client
                         .agent(&policy.model)
@@ -1179,7 +1149,7 @@ impl ModelProviderAdapter for RigModelAdapter {
                     Ok::<_, anyhow::Error>(agent.prompt(prompt).with_hook(hook.clone()).await?)
                 }
                 "Anthropic" => {
-                    let client = anthropic_client(config)?;
+                    let client = anthropic_client(config, proxy_url)?;
                     let agent = client
                         .agent(&policy.model)
                         .preamble(preamble)
@@ -1190,7 +1160,7 @@ impl ModelProviderAdapter for RigModelAdapter {
                     Ok::<_, anyhow::Error>(agent.prompt(prompt).with_hook(hook.clone()).await?)
                 }
                 "Gemini" => {
-                    let client = gemini_client(config)?;
+                    let client = gemini_client(config, proxy_url)?;
                     let agent = client
                         .agent(&policy.model)
                         .preamble(preamble)
@@ -1232,7 +1202,99 @@ impl ModelProviderAdapter for RigModelAdapter {
     }
 }
 
-pub async fn test_connection(config: &AIProviderConfig) -> Result<()> {
+/// Lightweight LLM completion without tools — for classification, summarization, etc.
+pub async fn simple_complete(
+    config: &AIProviderConfig,
+    proxy_url: &str,
+    model: &str,
+    preamble: &str,
+    prompt: &str,
+    max_tokens: u64,
+) -> Result<String> {
+    let log_context = new_llm_log_context(
+        "llm.simple_complete",
+        config,
+        model,
+        config.temperature,
+        None,
+        None,
+        None,
+        None,
+    );
+    log_llm_start(&log_context, preamble, prompt, json!({}));
+
+    let hook = LlmRequestHook {
+        context: log_context.clone(),
+        call_log: RigToolCallLog::new(),
+        tool_call_stream: None,
+        summary_stream: None,
+        summary_reset_epoch: Arc::new(AtomicUsize::new(0)),
+        tool_identity_by_hook_name: HashMap::new(),
+    };
+
+    let result = async {
+        match config.rig_provider_type.as_str() {
+            provider_type if is_openai_compatible_provider_type(provider_type) => {
+                let client = openai_compatible_client(config, proxy_url)?;
+                let agent = client
+                    .agent(model)
+                    .preamble(preamble)
+                    .temperature(config.temperature)
+                    .max_tokens(max_tokens)
+                    .build();
+                Ok::<_, anyhow::Error>(agent.prompt(prompt).with_hook(hook.clone()).await?)
+            }
+            "Anthropic" => {
+                let client = anthropic_client(config, proxy_url)?;
+                let agent = client
+                    .agent(model)
+                    .preamble(preamble)
+                    .temperature(config.temperature)
+                    .max_tokens(max_tokens)
+                    .build();
+                Ok::<_, anyhow::Error>(agent.prompt(prompt).with_hook(hook.clone()).await?)
+            }
+            "Gemini" => {
+                let client = gemini_client(config, proxy_url)?;
+                let agent = client
+                    .agent(model)
+                    .preamble(preamble)
+                    .temperature(config.temperature)
+                    .max_tokens(max_tokens)
+                    .build();
+                Ok::<_, anyhow::Error>(agent.prompt(prompt).with_hook(hook).await?)
+            }
+            _ => Err(anyhow!(
+                "Unsupported provider type '{}' for simple completion",
+                config.rig_provider_type
+            )),
+        }
+    }
+    .await;
+
+    match result {
+        Ok(text) => {
+            logging::llm_event(
+                "llm.simple_complete",
+                "request_success",
+                json!({
+                    "sessionId": log_context.session_id,
+                    "providerId": log_context.provider_id,
+                    "providerType": log_context.provider_type,
+                    "model": log_context.model,
+                    "response": logging::truncate(&text, 2_000),
+                }),
+            );
+            Ok(text)
+        }
+        Err(error) => {
+            log_llm_error(&log_context, &error);
+            Err(error)
+        }
+    }
+}
+
+pub async fn test_connection(config: &AIProviderConfig, proxy_url: &str) -> Result<()> {
     let log_context = new_llm_log_context(
         "llm.test_connection",
         config,
@@ -1257,7 +1319,7 @@ pub async fn test_connection(config: &AIProviderConfig) -> Result<()> {
     let result = async {
         match config.rig_provider_type.as_str() {
             provider_type if is_openai_compatible_provider_type(provider_type) => {
-                let client = openai_compatible_client(config)?;
+                let client = openai_compatible_client(config, proxy_url)?;
                 let agent = client.agent(&config.default_model).max_tokens(1).build();
                 Ok::<_, anyhow::Error>(
                     agent
@@ -1268,7 +1330,7 @@ pub async fn test_connection(config: &AIProviderConfig) -> Result<()> {
                 )
             }
             "Anthropic" => {
-                let client = anthropic_client(config)?;
+                let client = anthropic_client(config, proxy_url)?;
                 let agent = client.agent(&config.default_model).max_tokens(1).build();
                 Ok::<_, anyhow::Error>(
                     agent
@@ -1279,7 +1341,7 @@ pub async fn test_connection(config: &AIProviderConfig) -> Result<()> {
                 )
             }
             "Gemini" => {
-                let client = gemini_client(config)?;
+                let client = gemini_client(config, proxy_url)?;
                 let agent = client.agent(&config.default_model).max_tokens(1).build();
                 Ok::<_, anyhow::Error>(agent.prompt("ping").with_hook(hook).await.map(|_| ())?)
             }
@@ -1311,12 +1373,17 @@ pub async fn test_connection(config: &AIProviderConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::tool_execution::{
+        classify_empty_json_recovery_action, is_empty_json_response_error,
+        pending_user_question_error_from_tool_events, EmptyJsonRecoveryAction, ToolRequestMode,
+    };
     use super::{
         gemini_api_base_url, is_http_unauthorized_or_forbidden, max_turns_for_config,
         normalized_anthropic_base_url, normalized_gemini_base_url,
         normalized_openai_compatible_base_url, openai_compatible_api_base_urls,
     };
     use crate::core::domain::AIProviderConfig;
+    use crate::core::rig_tools::RigToolEvent;
 
     #[test]
     fn strips_trailing_v1_for_openai_compatible_providers() {
@@ -1416,5 +1483,72 @@ mod tests {
 
         config.max_dialog_rounds = 0;
         assert_eq!(max_turns_for_config(&config), 1);
+    }
+
+    #[test]
+    fn detects_empty_json_response_errors() {
+        assert!(is_empty_json_response_error(
+            "CompletionError: JsonError: EOF while parsing an object at line 1 column 1"
+        ));
+        assert!(is_empty_json_response_error(
+            "error decoding response body: EOF while parsing a value at line 1 column 0"
+        ));
+        assert!(!is_empty_json_response_error(
+            "JsonError: trailing characters at line 1 column 2"
+        ));
+    }
+
+    #[test]
+    fn classifies_partial_stream_summary_as_recoverable() {
+        assert_eq!(
+            classify_empty_json_recovery_action(
+                ToolRequestMode::Streaming,
+                "CompletionError: JsonError: EOF while parsing an object at line 1 column 1",
+                0,
+                "partial summary",
+            ),
+            EmptyJsonRecoveryAction::AcceptPartialSummary
+        );
+    }
+
+    #[test]
+    fn classifies_empty_streaming_json_as_retryable() {
+        assert_eq!(
+            classify_empty_json_recovery_action(
+                ToolRequestMode::Streaming,
+                "CompletionError: JsonError: EOF while parsing an object at line 1 column 1",
+                0,
+                "",
+            ),
+            EmptyJsonRecoveryAction::RetryStreaming
+        );
+        assert_eq!(
+            classify_empty_json_recovery_action(
+                ToolRequestMode::NonStreaming,
+                "CompletionError: JsonError: EOF while parsing an object at line 1 column 1",
+                0,
+                "",
+            ),
+            EmptyJsonRecoveryAction::Propagate
+        );
+    }
+
+    #[test]
+    fn detects_pending_user_question_wrapped_inside_tool_result() {
+        let tool_events = vec![RigToolEvent {
+            tool_id: "AskUserQuestion".into(),
+            tool_name: "AskUserQuestion".into(),
+            call_id: "call-1".into(),
+            input: "{}".into(),
+            output: "Toolset error: ToolCallError: ToolCallError: __nextchat_ask_user_question__:{\"question\":\"继续吗？\",\"options\":[\"是\"],\"context\":null,\"allowFreeForm\":true}".into(),
+        }];
+
+        let error = pending_user_question_error_from_tool_events(&tool_events)
+            .expect("scan tool events")
+            .expect("pending user question should be detected");
+
+        assert!(error
+            .to_string()
+            .contains("__nextchat_ask_user_question__:"));
     }
 }

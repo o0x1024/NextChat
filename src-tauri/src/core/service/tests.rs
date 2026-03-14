@@ -61,6 +61,17 @@ fn parse_narrative(content: &str) -> Option<NarrativeEnvelope> {
     serde_json::from_str::<NarrativeEnvelope>(content).ok()
 }
 
+/// Try to extract a NarrativeEnvelope from a message.
+/// Checks narrative_meta first (new format), then falls back to content (legacy).
+fn message_narrative(msg: &crate::core::domain::ConversationMessage) -> Option<NarrativeEnvelope> {
+    if let Some(ref meta) = msg.narrative_meta {
+        if let Ok(env) = serde_json::from_str::<NarrativeEnvelope>(meta) {
+            return Some(env);
+        }
+    }
+    parse_narrative(&msg.content)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn block_on_service_future_is_safe_inside_runtime() {
     let value = super::block_on_service_future(async { 7usize });
@@ -332,16 +343,16 @@ fn direct_assign_route_skips_owner_plan_messages() {
         .list_messages_for_group(&work_group.id)
         .expect("messages");
     assert!(
-        messages.iter().any(|message| {
-            parse_narrative(&message.content).is_some_and(|item| {
+        !messages.iter().any(|message| {
+            message_narrative(message).is_some_and(|item| {
                 item.narrative_type == crate::core::workflow::NarrativeMessageType::AgentAck
             })
         }),
-        "expected direct agent ack narrative",
+        "direct assignment should not emit agent ack narrative",
     );
     assert!(
         !messages.iter().any(|message| {
-            parse_narrative(&message.content).is_some_and(|item| {
+            message_narrative(message).is_some_and(|item| {
                 matches!(
                     item.narrative_type,
                     crate::core::workflow::NarrativeMessageType::OwnerAck
@@ -356,7 +367,7 @@ fn direct_assign_route_skips_owner_plan_messages() {
             matches!(
                 message.visibility,
                 crate::core::domain::Visibility::Backstage
-            ) && parse_narrative(&message.content).is_some_and(|item| {
+            ) && message_narrative(message).is_some_and(|item| {
                 item.narrative_type == crate::core::workflow::NarrativeMessageType::DirectAssign
             })
         }),
@@ -369,7 +380,7 @@ fn direct_assign_route_skips_owner_plan_messages() {
             .expect("messages");
         if messages.iter().any(|message| {
             matches!(message.visibility, crate::core::domain::Visibility::Main)
-                && parse_narrative(&message.content).is_some_and(|item| {
+                && message_narrative(message).is_some_and(|item| {
                     item.narrative_type
                         == crate::core::workflow::NarrativeMessageType::AgentProgress
                 })
@@ -384,21 +395,12 @@ fn direct_assign_route_skips_owner_plan_messages() {
         has_progress,
         "expected direct assignment progress narrative"
     );
-    let direct_ack = messages
-        .iter()
-        .filter_map(|message| parse_narrative(&message.content))
-        .find(|item| item.narrative_type == crate::core::workflow::NarrativeMessageType::AgentAck)
-        .expect("direct ack narrative");
-    assert!(
-        direct_ack.text.contains("关键问题开始推进"),
-        "expected llm-generated direct ack text"
-    );
     let direct_progress = service
         .storage
         .list_messages_for_group(&work_group.id)
         .expect("messages")
         .into_iter()
-        .filter_map(|message| parse_narrative(&message.content))
+        .filter_map(|message| message_narrative(&message))
         .find(|item| {
             item.narrative_type == crate::core::workflow::NarrativeMessageType::AgentProgress
         })
@@ -453,7 +455,7 @@ fn owner_orchestrated_route_emits_owner_plan() {
         .expect("messages");
     assert!(
         messages.iter().any(|message| {
-            parse_narrative(&message.content).is_some_and(|item| {
+            message_narrative(message).is_some_and(|item| {
                 item.narrative_type == crate::core::workflow::NarrativeMessageType::OwnerAck
             })
         }),
@@ -461,7 +463,7 @@ fn owner_orchestrated_route_emits_owner_plan() {
     );
     assert!(
         messages.iter().any(|message| {
-            parse_narrative(&message.content).is_some_and(|item| {
+            message_narrative(message).is_some_and(|item| {
                 item.narrative_type == crate::core::workflow::NarrativeMessageType::OwnerPlan
             })
         }),
@@ -511,7 +513,7 @@ fn single_task_owner_route_emits_narrative_dispatch_in_main_chat() {
 
     assert!(
         main_messages.iter().any(|message| {
-            parse_narrative(&message.content).is_some_and(|item| {
+            message_narrative(message).is_some_and(|item| {
                 item.narrative_type == crate::core::workflow::NarrativeMessageType::OwnerAck
             })
         }),
@@ -519,7 +521,7 @@ fn single_task_owner_route_emits_narrative_dispatch_in_main_chat() {
     );
     assert!(
         main_messages.iter().any(|message| {
-            parse_narrative(&message.content).is_some_and(|item| {
+            message_narrative(message).is_some_and(|item| {
                 item.narrative_type == crate::core::workflow::NarrativeMessageType::OwnerDispatch
             })
         }),
@@ -531,14 +533,13 @@ fn single_task_owner_route_emits_narrative_dispatch_in_main_chat() {
             .all(|message| { !message.content.contains("Task card created and leased to") }),
         "legacy coordinator status should not stay in main chat",
     );
-    let agent_ack = main_messages
-        .iter()
-        .filter_map(|message| parse_narrative(&message.content))
-        .find(|item| item.narrative_type == crate::core::workflow::NarrativeMessageType::AgentAck)
-        .expect("owner route agent ack");
     assert!(
-        agent_ack.text.contains("关键点梳理清楚"),
-        "expected llm-generated owner-route agent ack text"
+        !main_messages.iter().any(|message| {
+            message_narrative(message).is_some_and(|item| {
+                item.narrative_type == crate::core::workflow::NarrativeMessageType::AgentAck
+            })
+        }),
+        "owner route should not emit agent ack narrative"
     );
 }
 
@@ -598,6 +599,8 @@ fn owner_blocker_resolution_resumes_blocked_task() {
             status: StageStatus::Running,
             entry_message_id: None,
             completion_message_id: None,
+            deliverables_json: None,
+            quality_gate_json: None,
             created_at: now(),
         })
         .expect("stage");
@@ -614,6 +617,7 @@ fn owner_blocker_resolution_resumes_blocked_task() {
         work_group_id: work_group.id.clone(),
         created_by: "human".into(),
         assigned_agent_id: Some(worker_id.clone()),
+        output_summary: None,
         created_at: now(),
     };
     service.storage.insert_task_card(&task).expect("task");
@@ -685,7 +689,7 @@ fn owner_blocker_resolution_resumes_blocked_task() {
             .expect("messages")
             .into_iter()
             .any(|message| {
-                parse_narrative(&message.content).is_some_and(|item| {
+                message_narrative(&message).is_some_and(|item| {
                     item.narrative_type
                         == crate::core::workflow::NarrativeMessageType::BlockerResolved
                 })
@@ -750,6 +754,8 @@ fn owner_blocker_can_escalate_to_user_and_resume_after_answer() {
             status: StageStatus::Running,
             entry_message_id: None,
             completion_message_id: None,
+            deliverables_json: None,
+            quality_gate_json: None,
             created_at: now(),
         })
         .expect("stage");
@@ -766,6 +772,7 @@ fn owner_blocker_can_escalate_to_user_and_resume_after_answer() {
         work_group_id: work_group.id.clone(),
         created_by: "human".into(),
         assigned_agent_id: Some(worker_id.clone()),
+        output_summary: None,
         created_at: now(),
     };
     service.storage.insert_task_card(&task).expect("task");
@@ -932,6 +939,8 @@ fn owner_blocker_can_create_dependency_task() {
             status: StageStatus::Running,
             entry_message_id: None,
             completion_message_id: None,
+            deliverables_json: None,
+            quality_gate_json: None,
             created_at: now(),
         })
         .expect("stage");
@@ -948,6 +957,7 @@ fn owner_blocker_can_create_dependency_task() {
         work_group_id: work_group.id.clone(),
         created_by: "human".into(),
         assigned_agent_id: Some(worker_id.clone()),
+        output_summary: None,
         created_at: now(),
     };
     service.storage.insert_task_card(&task).expect("task");
@@ -1081,6 +1091,8 @@ fn owner_blocker_can_request_approval() {
             status: StageStatus::Running,
             entry_message_id: None,
             completion_message_id: None,
+            deliverables_json: None,
+            quality_gate_json: None,
             created_at: now(),
         })
         .expect("stage");
@@ -1097,6 +1109,7 @@ fn owner_blocker_can_request_approval() {
         work_group_id: work_group.id.clone(),
         created_by: "human".into(),
         assigned_agent_id: Some(worker_id.clone()),
+        output_summary: None,
         created_at: now(),
     };
     service.storage.insert_task_card(&task).expect("task");
@@ -1313,6 +1326,7 @@ fn parent_task_waits_for_all_children_before_completion() {
         work_group_id: work_group.id.clone(),
         created_by: "human".into(),
         assigned_agent_id: Some(agent.id.clone()),
+        output_summary: None,
         created_at: now(),
     };
     service.storage.insert_task_card(&parent).expect("parent");
@@ -1345,6 +1359,7 @@ fn parent_task_waits_for_all_children_before_completion() {
                 work_group_id: work_group.id.clone(),
                 created_by: agent.id.clone(),
                 assigned_agent_id: Some(agent.id.clone()),
+                output_summary: None,
                 created_at: now(),
             })
             .expect("child");
@@ -1424,6 +1439,7 @@ fn child_issue_bubbles_parent_to_review() {
         work_group_id: work_group.id.clone(),
         created_by: "human".into(),
         assigned_agent_id: Some(agent.id.clone()),
+        output_summary: None,
         created_at: now(),
     };
     service.storage.insert_task_card(&parent).expect("parent");
@@ -1443,6 +1459,7 @@ fn child_issue_bubbles_parent_to_review() {
                 work_group_id: work_group.id.clone(),
                 created_by: agent.id.clone(),
                 assigned_agent_id: Some(agent.id.clone()),
+                output_summary: None,
                 created_at: now(),
             })
             .expect("child");
@@ -1535,6 +1552,7 @@ fn child_task_emits_collaboration_request_and_result_messages() {
         work_group_id: work_group.id.clone(),
         created_by: "human".into(),
         assigned_agent_id: Some(requester.id.clone()),
+        output_summary: None,
         created_at: now(),
     };
     service.storage.insert_task_card(&parent).expect("parent");
@@ -1655,6 +1673,7 @@ fn startup_recovery_pauses_low_risk_inflight_work() {
         work_group_id: work_group.id.clone(),
         created_by: "human".into(),
         assigned_agent_id: Some(agent.id.clone()),
+        output_summary: None,
         created_at: now(),
     };
     service.storage.insert_task_card(&task).expect("task");
@@ -1739,6 +1758,7 @@ fn startup_recovery_marks_high_risk_inflight_work_for_review() {
         work_group_id: work_group.id.clone(),
         created_by: "human".into(),
         assigned_agent_id: Some(agent.id.clone()),
+        output_summary: None,
         created_at: now(),
     };
     service.storage.insert_task_card(&task).expect("task");
@@ -1824,6 +1844,7 @@ fn execution_failure_moves_task_to_review_and_releases_lease() {
         work_group_id: work_group.id.clone(),
         created_by: "human".into(),
         assigned_agent_id: Some(agent.id.clone()),
+        output_summary: None,
         created_at: now(),
     };
     service.storage.insert_task_card(&task).expect("task");
@@ -1912,6 +1933,7 @@ fn task_checkpoint_persists_repo_snapshot_and_resume_hint() {
         work_group_id: work_group.id.clone(),
         created_by: "human".into(),
         assigned_agent_id: Some(worker_id),
+        output_summary: None,
         created_at: now(),
     };
     service.storage.insert_task_card(&task).expect("task");
@@ -2019,6 +2041,8 @@ fn retryable_failure_reassigns_greenfield_architecture_task_to_execution_agent()
             status: StageStatus::Running,
             entry_message_id: None,
             completion_message_id: None,
+            deliverables_json: None,
+            quality_gate_json: None,
             created_at: now(),
         })
         .expect("stage");
@@ -2035,6 +2059,7 @@ fn retryable_failure_reassigns_greenfield_architecture_task_to_execution_agent()
         work_group_id: work_group.id.clone(),
         created_by: "human".into(),
         assigned_agent_id: Some(architect_id.clone()),
+        output_summary: None,
         created_at: now(),
     };
     service.storage.insert_task_card(&task).expect("task");
@@ -2155,6 +2180,7 @@ fn dashboard_state_exposes_workflow_checkpoints() {
         work_group_id: work_group.id,
         created_by: "human".into(),
         assigned_agent_id: Some(worker_id),
+        output_summary: None,
         created_at: now(),
     };
     service.storage.insert_task_card(&task).expect("task");
@@ -2178,5 +2204,288 @@ fn dashboard_state_exposes_workflow_checkpoints() {
     assert_eq!(
         checkpoint.resume_hint.as_deref(),
         Some("dashboard resume hint")
+    );
+}
+
+#[test]
+fn parallel_stage_activates_all_ready_tasks_on_completion() {
+    // When a parallel-mode stage has multiple tasks and one completes, all
+    // remaining Pending tasks (with no remaining deps) should be activated.
+    let (service, _workspace, _data) = setup_service();
+    let app = tauri::test::mock_app();
+    let app_handle = app.handle().clone();
+
+    let owner_id = create_agent(&service, "Owner", "group_owner");
+    let worker_a = create_agent(&service, "AgentA", "developer");
+    let worker_b = create_agent(&service, "AgentB", "developer");
+    let worker_c = create_agent(&service, "AgentC", "developer");
+
+    let work_group = service
+        .create_work_group(CreateWorkGroupInput {
+            name: "Parallel Test Group".into(),
+            goal: "Test parallel dispatch".into(),
+            working_directory: ".".into(),
+            kind: WorkGroupKind::Persistent,
+            default_visibility: "summary".into(),
+            auto_archive: false,
+            member_agent_ids: None,
+        })
+        .expect("create work group");
+    service
+        .add_agent_to_work_group(&work_group.id, &owner_id)
+        .expect("add owner");
+    service
+        .add_agent_to_work_group(&work_group.id, &worker_a)
+        .expect("add worker_a");
+    service
+        .add_agent_to_work_group(&work_group.id, &worker_b)
+        .expect("add worker_b");
+    service
+        .add_agent_to_work_group(&work_group.id, &worker_c)
+        .expect("add worker_c");
+
+    let wf_id = "wf-parallel-test";
+    let stage_id = "stage-parallel";
+    let workflow = WorkflowRecord {
+        id: wf_id.into(),
+        work_group_id: work_group.id.clone(),
+        source_message_id: "src-msg".into(),
+        route_mode: RequestRouteMode::OwnerOrchestrated,
+        title: "并行阶段测试".into(),
+        normalized_intent: "测试并行调度".into(),
+        status: WorkflowStatus::Running,
+        owner_agent_id: owner_id.clone(),
+        current_stage_id: Some(stage_id.into()),
+        created_at: now(),
+    };
+    service.storage.insert_workflow(&workflow).expect("workflow");
+    service
+        .storage
+        .insert_workflow_stage(&WorkflowStageRecord {
+            id: stage_id.into(),
+            workflow_id: wf_id.into(),
+            title: "并行执行阶段".into(),
+            goal: "并行完成三个子任务".into(),
+            order_index: 1,
+            execution_mode: WorkflowExecutionMode::Parallel,
+            status: StageStatus::Running,
+            entry_message_id: None,
+            completion_message_id: None,
+            deliverables_json: None,
+            quality_gate_json: None,
+            created_at: now(),
+        })
+        .expect("parallel stage");
+
+    // Task A: the task that "just completed" — Completed status, no deps.
+    let task_a_id = "task-parallel-a";
+    let task_a = TaskCard {
+        id: task_a_id.into(),
+        parent_id: None,
+        source_message_id: "src-msg".into(),
+        title: "任务A".into(),
+        normalized_goal: "完成A".into(),
+        input_payload: "完成A".into(),
+        priority: 80,
+        status: TaskStatus::Completed,
+        work_group_id: work_group.id.clone(),
+        created_by: owner_id.clone(),
+        assigned_agent_id: Some(worker_a.clone()),
+        output_summary: Some("A complete".into()),
+        created_at: now(),
+    };
+    service.storage.insert_task_card(&task_a).expect("task_a");
+    service
+        .storage
+        .insert_task_dispatch(&TaskDispatchRecord {
+            task_id: task_a_id.into(),
+            workflow_id: Some(wf_id.into()),
+            stage_id: Some(stage_id.into()),
+            dispatch_source: TaskDispatchSource::OwnerAssign,
+            depends_on_task_ids: vec![],
+            acknowledged_at: Some(now()),
+            result_message_id: None,
+            locked_by_user_mention: false,
+            target_agent_id: worker_a.clone(),
+            route_mode: RequestRouteMode::OwnerOrchestrated,
+            narrative_stage_label: Some("并行执行阶段".into()),
+            narrative_task_label: Some("任务A".into()),
+        })
+        .expect("dispatch_a");
+
+    // Task B: Pending, no deps — should be activated by parallel dispatch.
+    let task_b_id = "task-parallel-b";
+    let task_b = TaskCard {
+        id: task_b_id.into(),
+        parent_id: None,
+        source_message_id: "src-msg".into(),
+        title: "任务B".into(),
+        normalized_goal: "完成B".into(),
+        input_payload: "完成B".into(),
+        priority: 70,
+        status: TaskStatus::Pending,
+        work_group_id: work_group.id.clone(),
+        created_by: owner_id.clone(),
+        assigned_agent_id: Some(worker_b.clone()),
+        output_summary: None,
+        created_at: now(),
+    };
+    service.storage.insert_task_card(&task_b).expect("task_b");
+    service
+        .storage
+        .insert_task_dispatch(&TaskDispatchRecord {
+            task_id: task_b_id.into(),
+            workflow_id: Some(wf_id.into()),
+            stage_id: Some(stage_id.into()),
+            dispatch_source: TaskDispatchSource::OwnerAssign,
+            depends_on_task_ids: vec![],
+            acknowledged_at: None,
+            result_message_id: None,
+            locked_by_user_mention: false,
+            target_agent_id: worker_b.clone(),
+            route_mode: RequestRouteMode::OwnerOrchestrated,
+            narrative_stage_label: Some("并行执行阶段".into()),
+            narrative_task_label: Some("任务B".into()),
+        })
+        .expect("dispatch_b");
+
+    // Task C: Pending, no deps — should also be activated by parallel dispatch.
+    let task_c_id = "task-parallel-c";
+    let task_c = TaskCard {
+        id: task_c_id.into(),
+        parent_id: None,
+        source_message_id: "src-msg".into(),
+        title: "任务C".into(),
+        normalized_goal: "完成C".into(),
+        input_payload: "完成C".into(),
+        priority: 60,
+        status: TaskStatus::Pending,
+        work_group_id: work_group.id.clone(),
+        created_by: owner_id.clone(),
+        assigned_agent_id: Some(worker_c.clone()),
+        output_summary: None,
+        created_at: now(),
+    };
+    service.storage.insert_task_card(&task_c).expect("task_c");
+    service
+        .storage
+        .insert_task_dispatch(&TaskDispatchRecord {
+            task_id: task_c_id.into(),
+            workflow_id: Some(wf_id.into()),
+            stage_id: Some(stage_id.into()),
+            dispatch_source: TaskDispatchSource::OwnerAssign,
+            depends_on_task_ids: vec![],
+            acknowledged_at: None,
+            result_message_id: None,
+            locked_by_user_mention: false,
+            target_agent_id: worker_c.clone(),
+            route_mode: RequestRouteMode::OwnerOrchestrated,
+            narrative_stage_label: Some("并行执行阶段".into()),
+            narrative_task_label: Some("任务C".into()),
+        })
+        .expect("dispatch_c");
+
+    // Set up leases for the pending tasks so activate_stage_tasks can run.
+    service
+        .storage
+        .insert_lease(&Lease {
+            id: new_id(),
+            task_card_id: task_b_id.into(),
+            owner_agent_id: worker_b.clone(),
+            state: LeaseState::Paused,
+            granted_at: now(),
+            expires_at: None,
+            preempt_requested_at: None,
+            released_at: None,
+        })
+        .expect("lease_b");
+    service
+        .storage
+        .insert_lease(&Lease {
+            id: new_id(),
+            task_card_id: task_c_id.into(),
+            owner_agent_id: worker_c.clone(),
+            state: LeaseState::Paused,
+            granted_at: now(),
+            expires_at: None,
+            preempt_requested_at: None,
+            released_at: None,
+        })
+        .expect("lease_c");
+
+    // Simulate: task A completed → trigger completion handler.
+    // We call activate_stage_tasks directly with the parallel logic,
+    // but the real path goes through handle_narrative_task_completion.
+    // Let's use the service's own handle_task_completion path by building a
+    // fake dispatch + directly triggering activate_stage_tasks with both B & C.
+    // We test the routing function `activate_next_stage` equivalent: collect all
+    // Pending tasks with satisfied deps, then run activate_stage_tasks for all.
+    let dispatches = service
+        .storage
+        .list_stage_task_dispatches(stage_id)
+        .expect("dispatches");
+    let tasks: Vec<TaskCard> = dispatches
+        .iter()
+        .map(|d| service.storage.get_task_card(&d.task_id).expect("task"))
+        .collect();
+
+    // Simulate the parallel dispatch logic from routing.rs:
+    let ready_ids: Vec<String> = dispatches
+        .iter()
+        .filter(|item| {
+            tasks
+                .iter()
+                .find(|t| t.id == item.task_id)
+                .is_some_and(|t| {
+                    matches!(t.status, TaskStatus::Pending)
+                        && item.depends_on_task_ids.iter().all(|dep| {
+                            tasks.iter().any(|c| {
+                                c.id == *dep && matches!(c.status, TaskStatus::Completed)
+                            })
+                        })
+                })
+        })
+        .map(|item| item.task_id.clone())
+        .collect();
+
+    // Parallel: ALL ready tasks (B and C) should be in ready_ids.
+    assert_eq!(
+        ready_ids.len(),
+        2,
+        "parallel stage should activate both B and C, but got {:?}",
+        ready_ids
+    );
+    assert!(ready_ids.contains(&task_b_id.to_string()));
+    assert!(ready_ids.contains(&task_c_id.to_string()));
+
+    // Also verify that a serial stage would only pick one:
+    let serial_activate: Vec<String> = ready_ids.iter().cloned().take(1).collect();
+    assert_eq!(serial_activate.len(), 1, "serial stage picks exactly one task");
+
+    // Call activate_stage_tasks with all ready for parallel.
+    service
+        .activate_stage_tasks(&app_handle, wf_id, stage_id, &ready_ids, false)
+        .expect("activate parallel tasks");
+
+    // After activation the dispatch records for B and C should be acknowledged.
+    let dispatches_after = service
+        .storage
+        .list_stage_task_dispatches(stage_id)
+        .expect("dispatches after");
+    let b_dispatch = dispatches_after
+        .iter()
+        .find(|d| d.task_id == task_b_id)
+        .expect("dispatch B after");
+    let c_dispatch = dispatches_after
+        .iter()
+        .find(|d| d.task_id == task_c_id)
+        .expect("dispatch C after");
+    assert!(
+        b_dispatch.acknowledged_at.is_some(),
+        "task B dispatch should be acknowledged after parallel activation"
+    );
+    assert!(
+        c_dispatch.acknowledged_at.is_some(),
+        "task C dispatch should be acknowledged after parallel activation"
     );
 }

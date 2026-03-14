@@ -8,16 +8,23 @@ use crate::core::tool_runtime::ToolRuntime;
 use super::{
     is_local_skill_id, normalize_skill_path, parse_skill_document, parse_skill_frontmatter_summary,
     render_builtin_skill_content, required_skill_id, skill_path_within_depth,
-    SkillFrontmatterSummary, SkillSummaryOutput, SkillsAction, SkillsToolInput, SkillsToolOutput,
-    MAX_SKILL_FILE_BYTES, MAX_SKILL_FILE_DEPTH,
+    SkillFrontmatterSummary, SkillSummaryOutput, SkillToolInput, SkillsAction, SkillsToolInput,
+    SkillsToolOutput, MAX_SKILL_FILE_BYTES, MAX_SKILL_FILE_DEPTH,
 };
 
 impl ToolRuntime {
-    pub(crate) async fn run_skills_tool(
+    /// Handler for the new `Skill` tool (Claude Code compatible schema).
+    /// Accepts `{skill, args}` and translates to the legacy action-based routing.
+    pub(crate) async fn run_skill_tool(
         &self,
         request: &ToolExecutionRequest,
     ) -> Result<ToolExecutionResult> {
-        let input = self.parse_json_input::<SkillsToolInput>(&request.input, "Skills")?;
+        // Try new schema first; fall back to legacy schema for backward compatibility.
+        let input: SkillsToolInput =
+            match self.parse_json_input::<SkillToolInput>(&request.input, "Skill") {
+                Ok(new_input) => new_input.into_legacy(),
+                Err(_) => self.parse_json_input::<SkillsToolInput>(&request.input, "Skill")?,
+            };
         let output = match input.action {
             SkillsAction::List => self.list_skills_tool_output()?,
             SkillsAction::Load => self.load_skill_tool_output(input.skill_id.as_deref())?,

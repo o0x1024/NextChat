@@ -11,8 +11,8 @@ impl Storage {
                 r#"
                 INSERT OR REPLACE INTO task_cards (
                   id, parent_id, source_message_id, title, normalized_goal, input_payload, priority,
-                  status, work_group_id, created_by, assigned_agent_id, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                  status, work_group_id, created_by, assigned_agent_id, output_summary, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 "#,
                 params![
                     task_card.id,
@@ -26,6 +26,7 @@ impl Storage {
                     task_card.work_group_id,
                     task_card.created_by,
                     task_card.assigned_agent_id,
+                    task_card.output_summary,
                     task_card.created_at,
                 ],
             )?;
@@ -88,6 +89,7 @@ fn map_task_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskCard> {
         work_group_id: row.get("work_group_id")?,
         created_by: row.get("created_by")?,
         assigned_agent_id: row.get("assigned_agent_id")?,
+        output_summary: row.get::<_, Option<String>>("output_summary").unwrap_or(None),
         created_at: row.get("created_at")?,
     })
 }

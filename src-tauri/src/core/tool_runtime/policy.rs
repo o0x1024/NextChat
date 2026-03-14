@@ -22,21 +22,13 @@ impl ToolRuntime {
         }
 
         match tool.id.as_str() {
-            "Read" | "Edit" | "MultiEdit" | "Write" | "NotebookEdit" | "LS" => {
+            "Read" | "Edit" | "Write" | "LS" => {
                 let parsed = serde_json::from_str::<serde_json::Value>(&input).ok();
-                let path = match tool.id.as_str() {
-                    "Read" | "Edit" | "MultiEdit" | "Write" | "LS" => parsed
-                        .as_ref()
-                        .and_then(|value| value.get("file_path").or_else(|| value.get("path")))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or(""),
-                    "NotebookEdit" => parsed
-                        .as_ref()
-                        .and_then(|value| value.get("notebook_path"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or(""),
-                    _ => "",
-                };
+                let path = parsed
+                    .as_ref()
+                    .and_then(|value| value.get("file_path").or_else(|| value.get("path")))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
                 if !path.is_empty() {
                     let create_parent = matches!(tool.id.as_str(), "Write");
                     let path = self.resolve_path(path, create_parent, &execution_root)?;

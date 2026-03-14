@@ -41,6 +41,20 @@ export function parseNarrativeContent(
   content: string,
   message?: ConversationMessage,
 ): NarrativeEnvelope | null {
+  // Prefer the dedicated narrativeMeta field (new format)
+  const metaSource = message?.narrativeMeta ?? null;
+  if (metaSource) {
+    try {
+      const parsed = JSON.parse(metaSource) as NarrativeEnvelope | null;
+      if (parsed && parsed.marker === "nextchat:narrative") {
+        return parsed;
+      }
+    } catch {
+      // fall through to legacy parsing
+    }
+  }
+
+  // Legacy: parse from content field
   try {
     const parsed = JSON.parse(content) as NarrativeEnvelope | null;
     if (!parsed || parsed.marker !== "nextchat:narrative") {

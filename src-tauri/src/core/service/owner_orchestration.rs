@@ -200,16 +200,25 @@ impl AppService {
     {
         let settings = self.storage.get_settings()?;
         let preamble = format!(
-            "你是工作群的群主。你的职责是理解用户目标、组织团队协作、选择合适成员并用自然中文在群里推进任务。\
-你必须只返回 JSON，不要输出 Markdown、代码块或解释。\
-你只能从给定候选成员中做决定，不能编造新的成员、阶段或工具权限。\
-如果信息不足，可以返回保守决策，但仍需给出可执行安排。\
+            "你是工作群的群主。你的职责是理解用户目标、组织团队协作、选择合适成员并用自然中文在群里推进任务。\n\n\
+你必须只返回 JSON，不要输出 Markdown、代码块或解释。\n\n\
+重要：直接输出纯 JSON 对象格式。\n\
+- 不要用 ```json``` 代码块包裹\n\
+- 不要在 JSON 后追加多余字符或符号\n\
+- 只返回有效的 JSON 对象\n\n\
+你只能从给定候选成员中做决定，不能编造新的成员、阶段或工具权限。\n\
+如果信息不足，可以返回保守决策，但仍需给出可执行安排。\n\n\
 群主身份信息：{} / {} / {}。",
             owner.name, owner.role, owner.objective
         );
 
-        let raw =
-            if owner.model_policy.provider == "mock" || owner.model_policy.model == "simulation" {
+        // Retry mechanism: attempt up to 3 times to get valid JSON
+        const MAX_ATTEMPTS: usize = 3;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            let raw = if owner.model_policy.provider == "mock"
+                || owner.model_policy.model == "simulation"
+            {
                 mock_owner_completion(decision_kind, &prompt)
             } else {
                 RigModelAdapter
@@ -218,55 +227,114 @@ impl AppService {
                     .ok_or_else(|| anyhow!("owner model is unavailable or not configured"))?
             };
 
-        let Some(payload) = extract_json_object(&raw) else {
-            self.record_audit(
-                "owner.decision.parse_failed",
-                "owner_decision",
-                decision_kind,
-                json!({
-                    "provider": owner.model_policy.provider,
-                    "model": owner.model_policy.model,
-                    "prompt": truncate_text(&prompt, 4_000),
-                    "raw": truncate_text(&raw, 8_000),
-                    "context": audit_context,
-                }),
-            )?;
-            return Err(anyhow!("owner model did not return valid JSON"));
-        };
+            let Some(payload) = extract_json_object(&raw) else {
+                if attempt < MAX_ATTEMPTS - 1 {
+                    eprintln!(
+                        "Attempt {}/{}: Failed to extract JSON object from raw response, retrying...",
+                        attempt + 1,
+                        MAX_ATTEMPTS
+                    );
+                    continue;
+                } else {
+                    self.record_audit(
+                        "owner.decision.parse_failed",
+                        "owner_decision",
+                        decision_kind,
+                        json!({
+                            "provider": owner.model_policy.provider,
+                            "model": owner.model_policy.model,
+                            "prompt": truncate_text(&prompt, 4_000),
+                            "raw": truncate_text(&raw, 8_000),
+                            "context": audit_context,
+                            "attempt": attempt + 1,
+                            "maxAttempts": MAX_ATTEMPTS,
+                            "reason": "json_extraction_failed",
+                        }),
+                    )?;
+                    return Err(anyhow!("owner model did not return valid JSON"));
+                }
+            };
 
-        match serde_json::from_str::<T>(payload) {
-            Ok(parsed) => {
-                self.record_audit(
-                    "owner.decision.generated",
-                    "owner_decision",
-                    decision_kind,
-                    json!({
-                        "provider": owner.model_policy.provider,
-                        "model": owner.model_policy.model,
-                        "prompt": truncate_text(&prompt, 4_000),
-                        "raw": truncate_text(payload, 8_000),
-                        "context": audit_context,
-                    }),
-                )?;
-                Ok(parsed)
-            }
-            Err(error) => {
-                self.record_audit(
-                    "owner.decision.parse_failed",
-                    "owner_decision",
-                    decision_kind,
-                    json!({
-                        "provider": owner.model_policy.provider,
-                        "model": owner.model_policy.model,
-                        "error": error.to_string(),
-                        "prompt": truncate_text(&prompt, 4_000),
-                        "raw": truncate_text(payload, 8_000),
-                        "context": audit_context,
-                    }),
-                )?;
-                Err(error).context("failed to parse owner decision JSON")
+            match serde_json::from_str::<T>(payload) {
+                Ok(parsed) => {
+                    self.record_audit(
+                        "owner.decision.generated",
+                        "owner_decision",
+                        decision_kind,
+                        json!({
+                            "provider": owner.model_policy.provider,
+                            "model": owner.model_policy.model,
+                            "prompt": truncate_text(&prompt, 4_000),
+                            "raw": truncate_text(payload, 8_000),
+                            "context": audit_context,
+                            "attempt": attempt + 1,
+                        }),
+                    )?;
+                    return Ok(parsed);
+                }
+                Err(error) => {
+                    if attempt < MAX_ATTEMPTS - 1 {
+                        eprintln!(
+                            "Attempt {}/{}: Failed to parse JSON object: {}, retrying...",
+                            attempt + 1,
+                            MAX_ATTEMPTS,
+                            error
+                        );
+                        continue;
+                    } else {
+                        // 方案五：最后一次重试失败时，尝试自动修复 JSON
+                        eprintln!(
+                            "Attempt {}/{}: Final attempt failed, attempting auto-repair...",
+                            attempt + 1,
+                            MAX_ATTEMPTS
+                        );
+
+                        if let Some(repaired) = auto_repair_json(payload) {
+                            if let Ok(parsed) = serde_json::from_str::<T>(&repaired) {
+                                eprintln!("Auto-repair succeeded! JSON was fixed and parsed.");
+                                self.record_audit(
+                                    "owner.decision.generated",
+                                    "owner_decision",
+                                    decision_kind,
+                                    json!({
+                                        "provider": owner.model_policy.provider,
+                                        "model": owner.model_policy.model,
+                                        "prompt": truncate_text(&prompt, 4_000),
+                                        "raw": truncate_text(&repaired, 8_000),
+                                        "context": audit_context,
+                                        "attempt": attempt + 1,
+                                        "repaired": true,
+                                    }),
+                                )?;
+                                return Ok(parsed);
+                            }
+                        }
+
+                        // Auto-repair failed, record final error
+                        self.record_audit(
+                            "owner.decision.parse_failed",
+                            "owner_decision",
+                            decision_kind,
+                            json!({
+                                "provider": owner.model_policy.provider,
+                                "model": owner.model_policy.model,
+                                "error": error.to_string(),
+                                "prompt": truncate_text(&prompt, 4_000),
+                                "raw": truncate_text(payload, 8_000),
+                                "context": audit_context,
+                                "attempt": attempt + 1,
+                                "maxAttempts": MAX_ATTEMPTS,
+                                "reason": "json_parse_failed_and_auto_repair_failed",
+                            }),
+                        )?;
+                        return Err(error).context("failed to parse owner decision JSON after all retry attempts and auto-repair");
+                    }
+                }
             }
         }
+
+        // Should never reach here
+        unreachable!()
     }
 
     fn owner_workflow_plan_from_decision(
@@ -405,6 +473,8 @@ impl AppService {
             },
             entry_message_id: None,
             completion_message_id: None,
+            deliverables_json: None,
+            quality_gate_json: None,
             created_at: now(),
         };
 
@@ -683,14 +753,108 @@ fn narrative_text_or_raw(content: &str) -> String {
         .unwrap_or_else(|_| content.to_string())
 }
 
+/// Attempts to auto-repair common JSON formatting errors
+/// Fixes: trailing brackets, trailing commas, missing closing braces
+/// 方案五：宽松JSON修复 - 自动修复简单格式错误
+fn auto_repair_json(malformed: &str) -> Option<String> {
+    let trimmed = malformed.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut result = trimmed.to_string();
+    const MAX_ITERATIONS: usize = 10;
+
+    for _ in 0..MAX_ITERATIONS {
+        let original_len = result.len();
+
+        // Remove trailing commas before closing braces/brackets
+        while result.ends_with(",}") || result.ends_with(",]") {
+            result.pop();
+            result.pop();
+            result.push(result.chars().nth_back(0).unwrap_or('}'));
+        }
+
+        // Remove trailing commas at the end (before we check structure)
+        if result.ends_with(',') && !result.ends_with(",}") && !result.ends_with(",]") {
+            result.pop();
+        }
+
+        // Remove extra closing brackets/braces at the end
+        while result.ends_with("}}") || result.ends_with("]]") {
+            result.pop();
+        }
+
+        // Remove leading extra opening braces/brackets
+        while result.starts_with("{{") || result.starts_with("[[") {
+            result.remove(0);
+        }
+
+        // If nothing changed, we're done
+        if result.len() == original_len {
+            break;
+        }
+    }
+
+    // Validate it's now valid JSON by ensuring basic structure
+    if result.starts_with('{') && result.ends_with('}') {
+        Some(result)
+    } else if result.starts_with('[') && result.ends_with(']') {
+        Some(result)
+    } else {
+        None
+    }
+}
+
+/// Extracts a valid JSON object from raw text using bracket balancing
+/// Handles markdown code fences (```json ... ```), extra trailing brackets, and malformed JSON
 pub(super) fn extract_json_object(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
-    if trimmed.starts_with('{') && trimmed.ends_with('}') {
-        return Some(trimmed);
+
+    // Strip markdown code fences first (```json ... ``` or ``` ... ```)
+    let content = if trimmed.starts_with("```") {
+        let inner = trimmed
+            .strip_prefix("```json")
+            .or_else(|| trimmed.strip_prefix("```"))
+            .unwrap_or(trimmed)
+            .trim();
+        inner.strip_suffix("```").unwrap_or(inner).trim()
+    } else {
+        trimmed
+    };
+
+    let start = content.find('{')?;
+    let bytes = content.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut end_pos = None;
+
+    for i in start..bytes.len() {
+        let ch = bytes[i];
+
+        // Handle escape sequences in strings
+        if escape {
+            escape = false;
+            continue;
+        }
+
+        match ch {
+            b'\\' if in_string => escape = true,
+            b'"' => in_string = !in_string,
+            b'{' if !in_string => depth += 1,
+            b'}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    end_pos = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
     }
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    (end > start).then_some(&trimmed[start..=end])
+
+    end_pos.map(|e| &content[start..=e])
 }
 
 fn compact_title(value: &str) -> String {

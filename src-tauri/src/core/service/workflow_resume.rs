@@ -357,7 +357,7 @@ impl AppService {
 
         let mut updated_dispatch = dispatch.clone();
         updated_dispatch.target_agent_id = fallback_agent.id.clone();
-        updated_dispatch.acknowledged_at = None;
+        updated_dispatch.acknowledged_at = Some(now());
         self.storage.insert_task_dispatch(&updated_dispatch)?;
 
         if let Some(tool_run_id) = tool_run_id {
@@ -385,28 +385,6 @@ impl AppService {
             ),
         )?;
         self.storage.insert_message(&owner_message)?;
-
-        let ack = ConversationMessage {
-            id: new_id(),
-            conversation_id: task.work_group_id.clone(),
-            work_group_id: task.work_group_id.clone(),
-            sender_kind: SenderKind::Agent,
-            sender_id: fallback_agent.id.clone(),
-            sender_name: fallback_agent.name.clone(),
-            kind: MessageKind::Status,
-            visibility: Visibility::Main,
-            content: self.build_task_narrative_content(
-                &task,
-                NarrativeMessageType::AgentAck,
-                self.build_agent_ack_text(&task, &fallback_agent)?,
-            )?,
-            mentions: vec![],
-            task_card_id: Some(task.id.clone()),
-            execution_mode: None,
-            created_at: now(),
-        };
-        self.storage.insert_message(&ack)?;
-        emit(app, "chat:message-created", &ack)?;
 
         let audit_event = AuditEvent {
             id: new_id(),
@@ -503,6 +481,7 @@ impl AppService {
             kind: MessageKind::Status,
             visibility: Visibility::Main,
             content,
+            narrative_meta: None,
             mentions: vec![],
             task_card_id: Some(task.id.clone()),
             execution_mode: None,
@@ -597,7 +576,7 @@ fn looks_like_execution_agent(agent: &AgentProfile) -> bool {
         || agent
             .tool_ids
             .iter()
-            .any(|tool_id| matches!(tool_id.as_str(), "Write" | "Edit" | "MultiEdit" | "Bash"))
+            .any(|tool_id| matches!(tool_id.as_str(), "Write" | "Edit" | "Bash"))
 }
 
 fn retry_backoff_duration(failure_count: i64) -> Duration {

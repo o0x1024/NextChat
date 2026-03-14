@@ -213,6 +213,7 @@ mod tests {
             work_group_id: "wg-1".into(),
             created_by: "human".into(),
             assigned_agent_id: None,
+            output_summary: None,
             created_at: "now".into(),
         }
     }
@@ -423,6 +424,7 @@ impl ClaimScorer for Coordinator {
             } else {
                 "Task card created, but no eligible agent claimed it.".into()
             },
+            narrative_meta: None,
             mentions: vec![],
             task_card_id: Some(task_card.id.clone()),
             execution_mode: None,
@@ -448,6 +450,7 @@ impl ClaimScorer for Coordinator {
                     "Bid from {bidder_name}: {:.1} points. {}",
                     bid.capability_score, bid.rationale
                 ),
+                narrative_meta: None,
                 mentions: vec![bid.agent_id.clone()],
                 task_card_id: Some(task_card.id.clone()),
                 execution_mode: None,
@@ -470,6 +473,7 @@ impl ClaimScorer for Coordinator {
             kind: MessageKind::Summary,
             visibility: Visibility::Backstage,
             content: payload.to_string(),
+            narrative_meta: None,
             mentions: vec![],
             task_card_id: Some(task_card.id.clone()),
             execution_mode: None,

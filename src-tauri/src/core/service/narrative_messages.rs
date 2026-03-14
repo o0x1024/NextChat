@@ -48,6 +48,7 @@ impl AppService {
         envelope: NarrativeEnvelope,
         kind: MessageKind,
     ) -> Result<ConversationMessage> {
+        let narrative_json = serde_json::to_string(&envelope)?;
         let mut message = ConversationMessage {
             id: new_id(),
             conversation_id: work_group_id.to_string(),
@@ -57,7 +58,8 @@ impl AppService {
             sender_name: "Coordinator".into(),
             kind,
             visibility: crate::core::domain::Visibility::Main,
-            content: serde_json::to_string(&envelope)?,
+            content: envelope.text.clone(),
+            narrative_meta: Some(narrative_json),
             mentions: vec![],
             task_card_id: envelope.task_id.clone(),
             execution_mode: None,
@@ -75,6 +77,7 @@ impl AppService {
         kind: MessageKind,
         task_card_id: Option<String>,
     ) -> Result<ConversationMessage> {
+        let narrative_json = serde_json::to_string(&envelope)?;
         Ok(ConversationMessage {
             id: new_id(),
             conversation_id: work_group_id.to_string(),
@@ -84,7 +87,8 @@ impl AppService {
             sender_name: agent.name.clone(),
             kind,
             visibility: crate::core::domain::Visibility::Main,
-            content: serde_json::to_string(&envelope)?,
+            content: envelope.text.clone(),
+            narrative_meta: Some(narrative_json),
             mentions: vec![],
             task_card_id,
             execution_mode: None,

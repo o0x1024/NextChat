@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
-use crate::core::workflow::{TaskBlockerRecord, WorkflowCheckpointRecord};
+use crate::core::workflow::{
+    TaskBlockerRecord, WorkflowCheckpointRecord, WorkflowRecord, WorkflowStageRecord,
+};
 
 pub fn new_id() -> String {
     Uuid::new_v4().to_string()
@@ -207,19 +209,6 @@ pub struct AgentPermissionPolicy {
     pub allow_network_domains: Vec<String>,
 }
 
-impl AgentPermissionPolicy {
-    pub fn allows_tool_id(&self, tool_id: &str) -> bool {
-        let tool_id = tool_id.to_string();
-        (self.allow_tool_ids.is_empty() || self.allow_tool_ids.contains(&tool_id))
-            && !self.deny_tool_ids.contains(&tool_id)
-    }
-
-    pub fn requires_approval(&self, tool_id: &str) -> bool {
-        self.require_approval_tool_ids
-            .contains(&tool_id.to_string())
-    }
-}
-
 impl Default for AgentPermissionPolicy {
     fn default() -> Self {
         Self {
@@ -277,6 +266,7 @@ pub struct ConversationMessage {
     pub kind: MessageKind,
     pub visibility: Visibility,
     pub content: String,
+    pub narrative_meta: Option<String>,
     pub mentions: Vec<String>,
     pub task_card_id: Option<String>,
     pub execution_mode: Option<ExecutionMode>,
@@ -323,6 +313,7 @@ pub struct TaskCard {
     pub work_group_id: String,
     pub created_by: String,
     pub assigned_agent_id: Option<String>,
+    pub output_summary: Option<String>,
     pub created_at: String,
 }
 
@@ -884,6 +875,8 @@ pub struct DashboardState {
     pub pending_user_questions: Vec<PendingUserQuestion>,
     pub task_blockers: Vec<TaskBlockerRecord>,
     pub workflow_checkpoints: Vec<WorkflowCheckpointRecord>,
+    pub workflows: Vec<WorkflowRecord>,
+    pub workflow_stages: Vec<WorkflowStageRecord>,
     pub claim_bids: Vec<ClaimBid>,
     pub leases: Vec<Lease>,
     pub tool_runs: Vec<ToolRun>,
@@ -978,6 +971,7 @@ pub struct TaskExecutionContext {
     pub available_skills: Vec<SkillPack>,
     pub approved_tool: Option<ToolManifest>,
     pub approved_tool_input: Option<String>,
+    pub upstream_context: Option<String>,
     pub settings: SystemSettings,
     #[serde(skip)]
     pub summary_stream: Option<UnboundedSender<SummaryStreamSignal>>,

@@ -28,6 +28,10 @@ import type {
   UpdateAgentInput,
   UpdateWorkGroupInput,
   WorkGroup,
+  WorkflowRecord,
+  WorkflowStageRecord,
+  AddWorkflowStageInput,
+  UpdateWorkflowStageInput,
 } from "../types";
 
 type RawGlobalConfig = Partial<
@@ -197,6 +201,41 @@ export async function pauseLease(leaseId: string) {
 
 export async function resumeTaskCard(taskCardId: string) {
   return invoke("resume_task_card", { taskCardId });
+}
+
+export async function cancelWorkflow(workflowId: string): Promise<WorkflowRecord> {
+  return invoke<WorkflowRecord>("cancel_workflow", { workflowId });
+}
+
+export async function pauseWorkflow(workflowId: string): Promise<WorkflowRecord> {
+  return invoke<WorkflowRecord>("pause_workflow", { workflowId });
+}
+
+export async function resumeWorkflow(workflowId: string): Promise<WorkflowRecord> {
+  return invoke<WorkflowRecord>("resume_workflow", { workflowId });
+}
+
+export async function skipWorkflowStage(
+  workflowId: string,
+  stageId: string,
+): Promise<WorkflowStageRecord> {
+  return invoke<WorkflowStageRecord>("skip_workflow_stage", { workflowId, stageId });
+}
+
+export async function addWorkflowStage(
+  input: AddWorkflowStageInput,
+): Promise<WorkflowStageRecord> {
+  return invoke<WorkflowStageRecord>("add_workflow_stage", { input });
+}
+
+export async function updateWorkflowStage(
+  input: UpdateWorkflowStageInput,
+): Promise<WorkflowStageRecord> {
+  return invoke<WorkflowStageRecord>("update_workflow_stage", { input });
+}
+
+export async function removeWorkflowStage(stageId: string): Promise<void> {
+  return invoke("remove_workflow_stage", { stageId });
 }
 
 export async function getAuditEvents(limit?: number) {

@@ -1,10 +1,27 @@
 import { useTranslation } from "react-i18next";
 import { usePreferencesStore } from "../../../store/preferencesStore";
+import { useAppStore } from "../../../store/appStore";
 import { daisyThemes, type ThemeMode } from "../../../constants/themes";
 
 export function SystemSettings() {
     const { t } = useTranslation();
     const { fontSize, setFontSize, componentSpacing, setComponentSpacing, theme, setTheme } = usePreferencesStore();
+    const { showToast } = useAppStore();
+
+    const handleFontSizeChange = (value: number) => {
+        setFontSize(value);
+        showToast(t("settingsSaved"), 'success');
+    };
+
+    const handleSpacingChange = (value: number) => {
+        setComponentSpacing(value);
+        showToast(t("settingsSaved"), 'success');
+    };
+
+    const handleThemeChange = (themeName: ThemeMode) => {
+        setTheme(themeName);
+        showToast(t("settingsSaved"), 'success');
+    };
 
     return (
         <div className="space-y-6 animate-in fade-in slide-in-from-right-2 duration-300">
@@ -36,7 +53,7 @@ export function SystemSettings() {
                                             step="1"
                                             className="range range-primary range-xs flex-1"
                                             value={fontSize}
-                                            onChange={(e) => setFontSize(parseInt(e.target.value))}
+                                            onChange={(e) => handleFontSizeChange(parseInt(e.target.value))}
                                         />
                                         <span className="text-sm opacity-40">A</span>
                                     </div>
@@ -59,7 +76,7 @@ export function SystemSettings() {
                                             step="1"
                                             className="range range-primary range-xs flex-1"
                                             value={componentSpacing}
-                                            onChange={(e) => setComponentSpacing(parseInt(e.target.value))}
+                                            onChange={(e) => handleSpacingChange(parseInt(e.target.value))}
                                         />
                                         <i className="fas fa-expand text-sm opacity-40" />
                                     </div>
@@ -76,7 +93,7 @@ export function SystemSettings() {
                                     {daisyThemes.map((themeName) => (
                                         <button
                                             key={themeName}
-                                            onClick={() => setTheme(themeName as ThemeMode)}
+                                            onClick={() => handleThemeChange(themeName as ThemeMode)}
                                             className={`flex items-center justify-between p-2.5 rounded-xl border text-xs transition-all ${theme === themeName
                                                 ? "border-primary bg-primary/5 text-primary shadow-sm"
                                                 : "border-base-content/5 hover:border-base-content/20 bg-base-200/50"

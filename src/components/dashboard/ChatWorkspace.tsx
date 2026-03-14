@@ -2,6 +2,7 @@ import type { ChangeEvent, FormEvent } from "react";
 import { useTranslation } from "react-i18next";
 import type { Language } from "../../store/preferencesStore";
 import type { AgentProfile, ConversationMessage, WorkGroup } from "../../types";
+import { MarkdownMessage } from "./MarkdownMessage";
 import { formatTime } from "./ui";
 
 interface ChatWorkspaceProps {
@@ -30,6 +31,10 @@ function bubbleClass(message: ConversationMessage) {
   if (message.senderKind === "human") return "chat-bubble-primary";
   if (message.senderKind === "agent") return "chat-bubble-secondary";
   return "chat-bubble-neutral";
+}
+
+function shouldRenderMarkdown(message: ConversationMessage) {
+  return message.kind !== "tool_call" && message.kind !== "tool_result";
 }
 
 export function ChatWorkspace({
@@ -146,8 +151,12 @@ export function ChatWorkspace({
                     <span className="badge badge-neutral">{message.kind}</span>
                     <time>{formatTime(message.createdAt, language)}</time>
                   </div>
-                  <div className={`chat-bubble whitespace-pre-wrap ${bubbleClass(message)}`}>
-                    {message.content}
+                  <div className={`chat-bubble min-w-0 max-w-full ${bubbleClass(message)}`}>
+                    {shouldRenderMarkdown(message) ? (
+                      <MarkdownMessage content={message.content} />
+                    ) : (
+                      <div className="whitespace-pre-wrap break-words">{message.content}</div>
+                    )}
                   </div>
                   {message.taskCardId ? (
                     <button
@@ -198,7 +207,13 @@ export function ChatWorkspace({
                         <span className="badge badge-neutral">{message.kind}</span>
                         <time>{formatTime(message.createdAt, language)}</time>
                       </div>
-                      <div className="whitespace-pre-wrap text-sm">{message.content}</div>
+                      {shouldRenderMarkdown(message) ? (
+                        <MarkdownMessage content={message.content} />
+                      ) : (
+                        <div className="whitespace-pre-wrap break-words text-sm">
+                          {message.content}
+                        </div>
+                      )}
                       {message.taskCardId ? (
                         <button
                           className="btn btn-link btn-sm mt-1 px-0"

@@ -73,9 +73,6 @@ export function AgentManagement({
         model: "",
         temperature: emptyForm.temperature,
         applyPermissionPolicy: false,
-        allowToolIds: "",
-        denyToolIds: "",
-        requireApprovalToolIds: "",
         allowFsRoots: "",
         allowNetworkDomains: "",
     });
@@ -251,9 +248,6 @@ export function AgentManagement({
             model: modelForm.model,
             temperature: modelForm.temperature,
             applyPermissionPolicy: false,
-            allowToolIds: "",
-            denyToolIds: "",
-            requireApprovalToolIds: "",
             allowFsRoots: "",
             allowNetworkDomains: "",
         });
@@ -301,9 +295,9 @@ export function AgentManagement({
                       };
                 const permissionPolicy = bulkEditDraft.applyPermissionPolicy
                     ? {
-                          allowToolIds: splitPolicyList(bulkEditDraft.allowToolIds),
-                          denyToolIds: splitPolicyList(bulkEditDraft.denyToolIds),
-                          requireApprovalToolIds: splitPolicyList(bulkEditDraft.requireApprovalToolIds),
+                          allowToolIds: [...agent.permissionPolicy.allowToolIds],
+                          denyToolIds: [...agent.permissionPolicy.denyToolIds],
+                          requireApprovalToolIds: [...agent.permissionPolicy.requireApprovalToolIds],
                           allowFsRoots: splitPolicyList(bulkEditDraft.allowFsRoots),
                           allowNetworkDomains: splitPolicyList(bulkEditDraft.allowNetworkDomains),
                       }
@@ -715,40 +709,29 @@ export function AgentManagement({
                             </div>
 
                             {/* Capabilities Sections */}
-                            <div className="grid gap-6 md:grid-cols-2">
-                                <div className="space-y-4">
-                                    <div className="flex items-center gap-2 text-xs font-bold text-secondary uppercase tracking-widest">
-                                        <i className="fas fa-wrench" /> {t("toolBinding")}
-                                    </div>
-                                    <div className="flex flex-wrap gap-2 max-h-48 overflow-y-auto p-1">
-                                        {tools.map((tool) => (
-                                            <label
-                                                key={tool.id}
-                                                className={`badge cursor-pointer gap-2 py-4 px-3 border-none transition-all ${form.toolIds.includes(tool.id) ? "bg-primary text-primary-content shadow-md shadow-primary/20 scale-105" : "bg-base-200 hover:bg-base-300"
-                                                    }`}
-                                            >
-                                                <input
-                                                    type="checkbox"
-                                                    className="checkbox checkbox-xs checkbox-primary hidden"
-                                                    checked={form.toolIds.includes(tool.id)}
-                                                    onChange={() =>
-                                                        setForm((f) => ({ ...f, toolIds: toggleArrayItem(f.toolIds, tool.id) }))
-                                                    }
-                                                />
-                                                <i className="fas fa-cube text-[10px] opacity-60" />
-                                                <span className="text-xs font-medium">{tool.name}</span>
-                                            </label>
-                                        ))}
-                                    </div>
+                            <div className="space-y-4">
+                                <div className="flex items-center gap-2 text-xs font-bold text-secondary uppercase tracking-widest">
+                                    <i className="fas fa-wrench" /> {t("toolBinding")}
                                 </div>
-
-                                <div className="space-y-4">
-                                    <div className="flex items-center gap-2 text-xs font-bold text-accent uppercase tracking-widest">
-                                        <i className="fas fa-bolt" /> {t("skills")}
-                                    </div>
-                                    <div className="rounded-2xl border border-accent/15 bg-accent/5 px-4 py-3 text-sm text-base-content/70">
-                                        {t("agentSkillsHint")}
-                                    </div>
+                                <div className="flex flex-wrap gap-2 max-h-48 overflow-y-auto p-1">
+                                    {tools.map((tool) => (
+                                        <label
+                                            key={tool.id}
+                                            className={`badge cursor-pointer gap-2 py-4 px-3 border-none transition-all ${form.toolIds.includes(tool.id) ? "bg-primary text-primary-content shadow-md shadow-primary/20 scale-105" : "bg-base-200 hover:bg-base-300"
+                                                }`}
+                                        >
+                                            <input
+                                                type="checkbox"
+                                                className="checkbox checkbox-xs checkbox-primary hidden"
+                                                checked={form.toolIds.includes(tool.id)}
+                                                onChange={() =>
+                                                    setForm((f) => ({ ...f, toolIds: toggleArrayItem(f.toolIds, tool.id) }))
+                                                }
+                                            />
+                                            <i className="fas fa-cube text-[10px] opacity-60" />
+                                            <span className="text-xs font-medium">{tool.name}</span>
+                                        </label>
+                                    ))}
                                 </div>
                             </div>
 
@@ -828,66 +811,6 @@ export function AgentManagement({
                                     <i className="fas fa-shield-halved" /> {t("permissions")}
                                 </div>
                                 <div className="grid gap-4 md:grid-cols-2">
-                                    <div className="form-control">
-                                        <label className="label">
-                                            <span className="label-text text-xs opacity-60">{t("permissionAllowTools")}</span>
-                                        </label>
-                                        <textarea
-                                            rows={2}
-                                            className="textarea textarea-bordered w-full bg-base-100/70 text-sm"
-                                            placeholder={t("permissionAllowToolsHint")}
-                                            value={joinPolicyList(form.permissionPolicy.allowToolIds)}
-                                            onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
-                                                setForm((f) => ({
-                                                    ...f,
-                                                    permissionPolicy: {
-                                                        ...f.permissionPolicy,
-                                                        allowToolIds: splitPolicyList(e.target.value),
-                                                    },
-                                                }))
-                                            }
-                                        />
-                                    </div>
-                                    <div className="form-control">
-                                        <label className="label">
-                                            <span className="label-text text-xs opacity-60">{t("permissionDenyTools")}</span>
-                                        </label>
-                                        <textarea
-                                            rows={2}
-                                            className="textarea textarea-bordered w-full bg-base-100/70 text-sm"
-                                            placeholder={t("permissionDenyToolsHint")}
-                                            value={joinPolicyList(form.permissionPolicy.denyToolIds)}
-                                            onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
-                                                setForm((f) => ({
-                                                    ...f,
-                                                    permissionPolicy: {
-                                                        ...f.permissionPolicy,
-                                                        denyToolIds: splitPolicyList(e.target.value),
-                                                    },
-                                                }))
-                                            }
-                                        />
-                                    </div>
-                                    <div className="form-control">
-                                        <label className="label">
-                                            <span className="label-text text-xs opacity-60">{t("permissionRequireApprovalTools")}</span>
-                                        </label>
-                                        <textarea
-                                            rows={2}
-                                            className="textarea textarea-bordered w-full bg-base-100/70 text-sm"
-                                            placeholder={t("permissionRequireApprovalToolsHint")}
-                                            value={joinPolicyList(form.permissionPolicy.requireApprovalToolIds)}
-                                            onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
-                                                setForm((f) => ({
-                                                    ...f,
-                                                    permissionPolicy: {
-                                                        ...f.permissionPolicy,
-                                                        requireApprovalToolIds: splitPolicyList(e.target.value),
-                                                    },
-                                                }))
-                                            }
-                                        />
-                                    </div>
                                     <div className="form-control">
                                         <label className="label">
                                             <span className="label-text text-xs opacity-60">{t("permissionAllowFsRoots")}</span>

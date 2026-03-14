@@ -43,6 +43,74 @@ export type BlockerCategory =
   | "need_user_decision";
 export type BlockerStatus = "open" | "resolved" | "cancelled";
 
+export type WorkflowStatus =
+  | "planning"
+  | "running"
+  | "blocked"
+  | "needs_user_input"
+  | "completed"
+  | "needs_review"
+  | "cancelled";
+
+export type StageStatus =
+  | "pending"
+  | "ready"
+  | "running"
+  | "blocked"
+  | "completed"
+  | "needs_review"
+  | "cancelled";
+
+export type WorkflowExecutionMode = "serial" | "parallel";
+
+export type RequestRouteMode =
+  | "owner_orchestrated"
+  | "direct_agent_assign"
+  | "direct_answer";
+
+export interface WorkflowRecord {
+  id: string;
+  workGroupId: string;
+  sourceMessageId: string;
+  routeMode: RequestRouteMode;
+  title: string;
+  normalizedIntent: string;
+  status: WorkflowStatus;
+  ownerAgentId: string;
+  currentStageId?: string | null;
+  createdAt: string;
+}
+
+export interface WorkflowStageRecord {
+  id: string;
+  workflowId: string;
+  title: string;
+  goal: string;
+  orderIndex: number;
+  executionMode: WorkflowExecutionMode;
+  status: StageStatus;
+  entryMessageId?: string | null;
+  completionMessageId?: string | null;
+  deliverablesJson?: string | null;
+  qualityGateJson?: string | null;
+  createdAt: string;
+}
+
+export interface AddWorkflowStageInput {
+  workflowId: string;
+  title: string;
+  goal: string;
+  afterStageId?: string | null;
+  executionMode: WorkflowExecutionMode;
+}
+
+export interface UpdateWorkflowStageInput {
+  stageId: string;
+  title?: string | null;
+  goal?: string | null;
+  executionMode?: WorkflowExecutionMode | null;
+}
+
 export interface ModelPolicy {
   provider: string;
   model: string;
@@ -100,6 +168,7 @@ export interface ConversationMessage {
   kind: MessageKind;
   visibility: Visibility;
   content: string;
+  narrativeMeta?: string | null;
   mentions: string[];
   taskCardId?: string | null;
   executionMode?: ExecutionMode | null;
@@ -151,6 +220,7 @@ export interface TaskCard {
   workGroupId: string;
   createdBy: string;
   assignedAgentId?: string | null;
+  outputSummary?: string | null;
   createdAt: string;
 }
 
@@ -438,6 +508,8 @@ export interface DashboardState {
   pendingUserQuestions: PendingUserQuestion[];
   taskBlockers: TaskBlockerRecord[];
   workflowCheckpoints: WorkflowCheckpointRecord[];
+  workflows: WorkflowRecord[];
+  workflowStages: WorkflowStageRecord[];
   claimBids: ClaimBid[];
   leases: Lease[];
   toolRuns: ToolRun[];

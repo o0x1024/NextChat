@@ -3,7 +3,7 @@ import { useAppStore } from "../../../store/appStore";
 
 export function SecuritySettings() {
     const { t } = useTranslation();
-    const { settings, updateSettings } = useAppStore();
+    const { settings, updateSettings, showToast } = useAppStore();
     const { globalConfig } = settings;
 
     const toggleSecuritySetting = (key: 'maskApiKeys' | 'enableAuditLog') => {
@@ -13,6 +13,8 @@ export function SecuritySettings() {
                 ...globalConfig,
                 [key]: !globalConfig[key]
             }
+        }).then(() => {
+            showToast(t("settingsSaved"), 'success');
         });
     };
 

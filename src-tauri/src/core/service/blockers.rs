@@ -75,7 +75,8 @@ impl AppService {
             sender_name: agent.name.clone(),
             kind: MessageKind::Status,
             visibility: Visibility::Main,
-            content: serde_json::to_string(&envelope)?,
+            content: envelope.text.clone(),
+            narrative_meta: Some(serde_json::to_string(&envelope)?),
             mentions,
             task_card_id: Some(task.id.clone()),
             execution_mode: None,
@@ -264,27 +265,6 @@ impl AppService {
                 self.storage.insert_message(&message)?;
                 emit(&app, "chat:message-created", &message)?;
 
-                let ack = ConversationMessage {
-                    id: new_id(),
-                    conversation_id: work_group.id.clone(),
-                    work_group_id: work_group.id.clone(),
-                    sender_kind: SenderKind::Agent,
-                    sender_id: target.id.clone(),
-                    sender_name: target.name.clone(),
-                    kind: MessageKind::Status,
-                    visibility: Visibility::Main,
-                    content: self.build_task_narrative_content(
-                        &task,
-                        NarrativeMessageType::AgentAck,
-                        self.build_agent_ack_text(&task, &target)?,
-                    )?,
-                    mentions: vec![],
-                    task_card_id: Some(task.id.clone()),
-                    execution_mode: None,
-                    created_at: now(),
-                };
-                self.storage.insert_message(&ack)?;
-                emit(&app, "chat:message-created", &ack)?;
                 if let Some(mut dispatch) = self.storage.get_task_dispatch(&task.id)? {
                     dispatch.acknowledged_at = Some(now());
                     self.storage.insert_task_dispatch(&dispatch)?;
@@ -325,6 +305,7 @@ impl AppService {
                     work_group_id: task.work_group_id.clone(),
                     created_by: owner.id.clone(),
                     assigned_agent_id: Some(dependency_agent.id.clone()),
+                    output_summary: None,
                     created_at: now(),
                 };
                 self.storage.insert_task_card(&dependency_task)?;
@@ -387,27 +368,6 @@ impl AppService {
                 self.storage.insert_message(&dispatch_message)?;
                 emit(&app, "chat:message-created", &dispatch_message)?;
 
-                let ack = ConversationMessage {
-                    id: new_id(),
-                    conversation_id: work_group.id.clone(),
-                    work_group_id: work_group.id.clone(),
-                    sender_kind: SenderKind::Agent,
-                    sender_id: dependency_agent.id.clone(),
-                    sender_name: dependency_agent.name.clone(),
-                    kind: MessageKind::Status,
-                    visibility: Visibility::Main,
-                    content: self.build_task_narrative_content(
-                        &dependency_task,
-                        NarrativeMessageType::AgentAck,
-                        self.build_agent_ack_text(&dependency_task, &dependency_agent)?,
-                    )?,
-                    mentions: vec![],
-                    task_card_id: Some(dependency_task.id.clone()),
-                    execution_mode: None,
-                    created_at: now(),
-                };
-                self.storage.insert_message(&ack)?;
-                emit(&app, "chat:message-created", &ack)?;
                 if let Some(mut dependency_dispatch) =
                     self.storage.get_task_dispatch(&dependency_task.id)?
                 {
@@ -473,7 +433,8 @@ impl AppService {
                     created_at: now(),
                     answered_at: None,
                 };
-                self.storage.insert_pending_user_question(&pending_question)?;
+                self.storage
+                    .insert_pending_user_question(&pending_question)?;
                 emit(&app, "pending-user-question:updated", &pending_question)?;
             }
             OwnerBlockerResolution::AskUser {
@@ -529,7 +490,8 @@ impl AppService {
                     created_at: now(),
                     answered_at: None,
                 };
-                self.storage.insert_pending_user_question(&pending_question)?;
+                self.storage
+                    .insert_pending_user_question(&pending_question)?;
                 emit(&app, "pending-user-question:updated", &pending_question)?;
             }
             OwnerBlockerResolution::PauseTask { message } => {
@@ -635,7 +597,7 @@ impl AppService {
         Ok(())
     }
 
-    fn activate_task_for_agent<R: Runtime>(
+    pub(super) fn activate_task_for_agent<R: Runtime>(
         &self,
         app: &AppHandle<R>,
         task: &mut TaskCard,
@@ -677,7 +639,7 @@ impl AppService {
         Ok(())
     }
 
-    fn pause_lease_for_task(&self, task_id: &str) -> Result<()> {
+    pub(super) fn pause_lease_for_task(&self, task_id: &str) -> Result<()> {
         if let Some(mut lease) = self.storage.get_lease_by_task(task_id)? {
             lease.state = LeaseState::Paused;
             lease.preempt_requested_at = None;
@@ -686,7 +648,7 @@ impl AppService {
         Ok(())
     }
 
-    fn requeue_active_tool_runs(&self, task_id: &str) -> Result<()> {
+    pub(super) fn requeue_active_tool_runs(&self, task_id: &str) -> Result<()> {
         for mut tool_run in self
             .storage
             .list_tool_runs()?

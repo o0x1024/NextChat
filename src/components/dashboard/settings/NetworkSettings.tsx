@@ -1,10 +1,13 @@
 import { useTranslation } from "react-i18next";
+import { useState } from "react";
 import { useAppStore } from "../../../store/appStore";
+import { testProviderConnection } from "../../../lib/tauri";
 
 export function NetworkSettings() {
     const { t } = useTranslation();
-    const { settings, updateSettings } = useAppStore();
-    const { globalConfig } = settings;
+    const { settings, updateSettings, showToast } = useAppStore();
+    const { globalConfig, providers } = settings;
+    const [testStatus, setTestStatus] = useState<"idle" | "testing" | "success" | "error">("idle");
 
     const updateProxy = (value: string) => {
         void updateSettings({
@@ -13,8 +16,38 @@ export function NetworkSettings() {
                 ...globalConfig,
                 proxyUrl: value
             }
+        }).then(() => {
+            showToast(t("settingsSaved"), 'success');
         });
     };
+
+    async function handleTestProxyConnection() {
+        if (providers.length === 0) {
+            showToast(t("noProvidersAvailable") || "No providers available for testing", 'error');
+            return;
+        }
+
+        // Use the first enabled provider for testing, or the first provider if none are enabled
+        const providerToTest = providers.find(p => p.enabled) || providers[0];
+        if (!providerToTest) {
+            showToast(t("noProvidersAvailable") || "No providers available for testing", 'error');
+            return;
+        }
+
+        setTestStatus("testing");
+        try {
+            await testProviderConnection(providerToTest);
+            setTestStatus("success");
+            showToast(t("connectionSuccessful") || "Connection successful", 'success');
+        } catch (error) {
+            console.error("Proxy connection test failed:", error);
+            setTestStatus("error");
+            const errorMsg = error instanceof Error ? error.message : "Connection failed";
+            showToast(errorMsg, 'error');
+        } finally {
+            setTimeout(() => setTestStatus("idle"), 3000);
+        }
+    }
 
     return (
         <div className="space-y-6 animate-in fade-in slide-in-from-right-2 duration-300">
@@ -39,7 +72,19 @@ export function NetworkSettings() {
                                         value={globalConfig.proxyUrl}
                                         onChange={(e) => updateProxy(e.target.value)}
                                     />
-                                    <button className="btn btn-sm btn-ghost hover:bg-primary/10 hover:text-primary transition-all">
+                                    <button
+                                        className={`btn btn-sm join-item ${testStatus === "testing" ? "btn-disabled" : testStatus === "success" ? "btn-success" : testStatus === "error" ? "btn-error" : "btn-ghost"}`}
+                                        type="button"
+                                        onClick={handleTestProxyConnection}
+                                        disabled={testStatus === "testing"}
+                                    >
+                                        {testStatus === "testing" ? (
+                                            <span className="loading loading-spinner loading-xs" />
+                                        ) : testStatus === "success" ? (
+                                            "✓"
+                                        ) : testStatus === "error" ? (
+                                            "✕"
+                                        ) : null}
                                         {t("testConnection")}
                                     </button>
                                 </div>

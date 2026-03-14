@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{
     collect_allowed_tools, emit, execution_payloads, scored_candidates,
-    should_skip_implicit_todowrite_fallback, summary_stream::SummaryStreamSession,
+    should_skip_implicit_task_fallback, summary_stream::SummaryStreamSession,
     tool_stream::ToolStreamSession, AppService,
 };
 use crate::core::domain::{
@@ -47,6 +47,12 @@ impl AppService {
                         let _ = emit(&app, "chat:message-created", &message);
                     }
                     let _ = emit(&app, "audit:event-created", &report.audit_event);
+                    return;
+                }
+                // Handle RequestPeerInput signal: pause calling task, spawn peer sub-task.
+                if let Ok(Some(_)) =
+                    service.handle_peer_input_request(&app, &task_card_id, &error)
+                {
                     return;
                 }
                 if let Ok(Some(report)) = service.handle_retryable_task_execution_failure(
@@ -115,10 +121,6 @@ impl AppService {
         let available_tools = self.tool_runtime.available_tools_for_agent(&agent);
         let auto_runnable_tool_ids = available_tools
             .iter()
-            .filter(|tool| {
-                !agent.permission_policy.requires_approval(&tool.id)
-                    && tool.risk_level != crate::core::domain::ToolRiskLevel::High
-            })
             .map(|tool| tool.id.clone())
             .collect::<Vec<_>>();
         let work_group_members = self
@@ -129,6 +131,8 @@ impl AppService {
             .collect();
         let messages = self.storage.list_messages_for_group(&work_group.id)?;
         let memory_context = self.load_memory_context(&agent, &work_group)?;
+        // Build upstream context from completed stages for cross-stage knowledge transfer
+        let upstream_context = self.build_upstream_context(&task)?;
         self.record_memory_context(&app, &task, &memory_context)?;
         if let Some(progress_message) = self.build_agent_progress_message(&task, &agent).await? {
             self.storage.insert_message(&progress_message)?;
@@ -149,7 +153,7 @@ impl AppService {
         };
         if approved_tool
             .as_ref()
-            .is_some_and(|tool| should_skip_implicit_todowrite_fallback(&task.input_payload, tool))
+            .is_some_and(|tool| should_skip_implicit_task_fallback(&task.input_payload, tool))
         {
             approved_tool = None;
         }
@@ -212,6 +216,7 @@ impl AppService {
                         .as_deref()
                         .unwrap_or(task.input_payload.as_str()),
                 ),
+                narrative_meta: None,
                 mentions: vec![agent.id.clone()],
                 task_card_id: Some(task.id.clone()),
                 execution_mode: None,
@@ -322,6 +327,7 @@ impl AppService {
                     },
                     visibility: Visibility::Backstage,
                     content,
+                    narrative_meta: None,
                     mentions: vec![tool_call_agent_id.clone()],
                     task_card_id: Some(tool_call_task_card_id.clone()),
                     execution_mode: None,
@@ -345,6 +351,7 @@ impl AppService {
                 available_skills,
                 approved_tool: approved_tool.clone(),
                 approved_tool_input: normalized_tool_input.clone(),
+                upstream_context,
                 settings: self.storage.get_settings()?,
                 summary_stream: Some(summary_stream_tx.clone()),
                 tool_stream: Some(tool_stream_tx.clone()),
@@ -452,6 +459,7 @@ impl AppService {
                 kind: MessageKind::ToolResult,
                 visibility: Visibility::Backstage,
                 content: tool_result_content,
+                narrative_meta: None,
                 mentions: vec![agent.id.clone()],
                 task_card_id: Some(task.id.clone()),
                 execution_mode: Some(execution.execution_mode.clone()),
@@ -478,6 +486,7 @@ impl AppService {
                 kind: MessageKind::Summary,
                 visibility: Visibility::Main,
                 content: segment.content.clone(),
+                narrative_meta: None,
                 mentions: vec![],
                 task_card_id: Some(task.id.clone()),
                 execution_mode: Some(execution.execution_mode.clone()),
@@ -529,6 +538,7 @@ impl AppService {
             } else {
                 execution.summary.clone()
             },
+            narrative_meta: None,
             mentions: vec![],
             task_card_id: Some(task.id.clone()),
             execution_mode: Some(execution.execution_mode.clone()),
@@ -547,6 +557,7 @@ impl AppService {
             kind: MessageKind::Status,
             visibility: Visibility::Backstage,
             content: execution.backstage_notes.clone(),
+            narrative_meta: None,
             mentions: vec![],
             task_card_id: Some(task.id.clone()),
             execution_mode: Some(execution.execution_mode.clone()),
@@ -592,6 +603,7 @@ impl AppService {
                     task.title,
                     spawned_subtasks.len()
                 ),
+                narrative_meta: None,
                 mentions: vec![agent.id.clone()],
                 task_card_id: Some(task.id.clone()),
                 execution_mode: None,
@@ -631,6 +643,7 @@ impl AppService {
         lease.released_at = Some(now());
         self.storage.update_lease(&lease)?;
 
+        task.output_summary = Some(execution.summary.clone());
         task.status = TaskStatus::Completed;
         self.storage.update_task_card(&task)?;
         self.record_task_checkpoint(
@@ -647,11 +660,123 @@ impl AppService {
             &task.id,
             json!({ "ownerAgentId": agent.id }),
         )?;
-        self.handle_narrative_task_completion(&app, &task, &summary_message.id)?;
+
+        // Handle post-task routing (stage dispatch/transition) independently from task completion
+        // If routing fails, it should NOT revert the task's completed status since the task itself succeeded
+        if let Err(routing_error) =
+            self.handle_narrative_task_completion(&app, &task, &summary_message.id)
+        {
+            eprintln!(
+                "Post-task routing failed for completed task {}: {routing_error:#}",
+                task.id
+            );
+            self.record_audit(
+                "task.routing_error",
+                "task_card",
+                &task.id,
+                json!({
+                    "error": routing_error.to_string(),
+                    "taskStatus": "Completed",
+                    "note": "Task completed successfully but post-task workflow routing encountered an error"
+                }),
+            )?;
+            // Attempt to generate a system message to notify about the routing error
+            let error_message = ConversationMessage {
+                id: new_id(),
+                conversation_id: task.work_group_id.clone(),
+                work_group_id: task.work_group_id.clone(),
+                sender_kind: SenderKind::System,
+                sender_id: "coordinator".into(),
+                sender_name: "Coordinator".into(),
+                kind: MessageKind::Status,
+                visibility: Visibility::Main,
+                content: format!(
+                    "任务 \"{}\" 已完成，但工作流进度推进失败。请稍后重试或手动触发下一阶段。错误: {}",
+                    task.title.chars().take(48).collect::<String>(),
+                    routing_error
+                ),
+                narrative_meta: None,
+                mentions: vec![],
+                task_card_id: Some(task.id.clone()),
+                execution_mode: None,
+                created_at: now(),
+            };
+            let _ = self.storage.insert_message(&error_message);
+            let _ = emit(&app, "chat:message-created", &error_message);
+        }
+
         if let Some(parent_id) = task.parent_id.clone() {
             self.reconcile_parent_task(&app, &parent_id)?;
         }
         Ok(())
+    }
+
+    /// Build upstream context from completed stages in the same workflow.
+    /// Returns None if the task is not part of a workflow or is in the first stage.
+    fn build_upstream_context(&self, task: &TaskCard) -> Result<Option<String>> {
+        let Some(dispatch) = self.storage.get_task_dispatch(&task.id)? else {
+            return Ok(None);
+        };
+        let Some(workflow_id) = dispatch.workflow_id.as_deref() else {
+            return Ok(None);
+        };
+        let Some(stage_id) = dispatch.stage_id.as_deref() else {
+            return Ok(None);
+        };
+
+        let current_stage = self.storage.get_workflow_stage(stage_id)?;
+        let stages = self.storage.list_workflow_stages(workflow_id)?;
+
+        let completed_stages: Vec<_> = stages
+            .iter()
+            .filter(|s| {
+                s.order_index < current_stage.order_index
+                    && matches!(
+                        s.status,
+                        crate::core::workflow::StageStatus::Completed
+                    )
+            })
+            .collect();
+
+        if completed_stages.is_empty() {
+            return Ok(None);
+        }
+
+        let mut context_parts = Vec::new();
+        for stage in &completed_stages {
+            let mut stage_section = format!("## Stage: {} ({})\n", stage.title, stage.goal);
+            if let Some(ref deliverables) = stage.deliverables_json {
+                if let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(deliverables) {
+                    for item in &items {
+                        let title = item["taskTitle"].as_str().unwrap_or("Unknown");
+                        let summary = item["summary"].as_str().unwrap_or("No summary");
+                        stage_section.push_str(&format!("- **{}**: {}\n", title, summary));
+                    }
+                }
+            } else {
+                // Fallback: collect from task output_summary
+                if let Ok(dispatches) = self.storage.list_stage_task_dispatches(&stage.id) {
+                    for d in &dispatches {
+                        if let Ok(t) = self.storage.get_task_card(&d.task_id) {
+                            if let Some(ref out) = t.output_summary {
+                                stage_section
+                                    .push_str(&format!("- **{}**: {}\n", t.title, out));
+                            }
+                        }
+                    }
+                }
+            }
+            context_parts.push(stage_section);
+        }
+
+        if context_parts.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(format!(
+            "# Upstream Stage Deliverables\n\n{}",
+            context_parts.join("\n")
+        )))
     }
 
     async fn build_agent_progress_message(
@@ -697,6 +822,7 @@ impl AppService {
             kind: MessageKind::Status,
             visibility: Visibility::Main,
             content: serde_json::to_string(&envelope)?,
+            narrative_meta: None,
             mentions: vec![],
             task_card_id: Some(task.id.clone()),
             execution_mode: None,
@@ -738,6 +864,7 @@ impl AppService {
             work_group_id: work_group.id.clone(),
             created_by: owner_agent.id.clone(),
             assigned_agent_id: None,
+            output_summary: None,
             created_at: now(),
         };
         let active_loads = self
@@ -749,7 +876,7 @@ impl AppService {
         );
         if selected_tool
             .as_ref()
-            .is_some_and(|tool| should_skip_implicit_todowrite_fallback(content, tool))
+            .is_some_and(|tool| should_skip_implicit_task_fallback(content, tool))
         {
             selected_tool = None;
         }
@@ -863,6 +990,7 @@ impl AppService {
                         kind: MessageKind::Approval,
                         visibility: Visibility::Main,
                         content: format!("Approval required for {} before execution.", tool.name),
+                        narrative_meta: None,
                         mentions: vec![lease.owner_agent_id.clone()],
                         task_card_id: Some(claim_plan.task_card.id.clone()),
                         execution_mode: None,
@@ -892,6 +1020,33 @@ impl AppService {
         parent_id: &str,
     ) -> Result<()> {
         let parent_task_before = self.storage.get_task_card(parent_id)?;
+
+        // If the parent is Paused waiting for peer input, handle resolution
+        // via the peer collaboration path rather than the normal child reconcile.
+        if matches!(parent_task_before.status, TaskStatus::Paused) {
+            let all_blockers = self.storage.list_task_blockers()?;
+            let has_open_peer_blocker = all_blockers.iter().any(|b| {
+                b.task_id == *parent_id
+                    && matches!(b.category, crate::core::workflow::BlockerCategory::PeerInputRequired)
+                    && matches!(b.status, crate::core::workflow::BlockerStatus::Open)
+            });
+            if has_open_peer_blocker {
+                // Find the peer sub-task that just completed (it's among the children).
+                let child_tasks = self.storage.list_child_tasks(parent_id)?;
+                for child in &child_tasks {
+                    if matches!(child.status, TaskStatus::Completed) {
+                        let output = child.output_summary.clone().unwrap_or_default();
+                        if let Err(e) = self.resolve_peer_input_blocker(app, child, &output) {
+                            eprintln!(
+                                "resolve_peer_input_blocker failed for parent {parent_id}: {e:#}"
+                            );
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
+
         let child_tasks = self.storage.list_child_tasks(parent_id)?;
         if !self.reconcile_parent_task_state(parent_id)? {
             return Ok(());
@@ -934,6 +1089,7 @@ impl AppService {
                     child_tasks.len()
                 )
             },
+            narrative_meta: None,
             mentions: vec![],
             task_card_id: Some(parent_task.id.clone()),
             execution_mode: None,

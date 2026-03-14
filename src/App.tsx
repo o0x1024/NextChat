@@ -34,6 +34,8 @@ function App() {
     taskCards,
     taskBlockers,
     workflowCheckpoints,
+    workflows,
+    workflowStages,
     leases,
     claimBids,
     toolRuns,
@@ -42,6 +44,7 @@ function App() {
     skills,
     selectedWorkGroupId,
     settings,
+    toast,
   } = store;
 
   const [activeView, setActiveView] = useState<ViewType>("agents");
@@ -162,6 +165,20 @@ function App() {
             </div>
           )}
 
+          {toast && (
+            <div className="toast toast-top toast-center z-[101] mt-16 animate-in slide-in-from-top duration-300">
+              <div className={`alert alert-${toast.type === 'success' ? 'success' : toast.type === 'error' ? 'error' : toast.type === 'warning' ? 'warning' : 'info'} shadow-2xl rounded-2xl border border-white/10`}>
+                <i className={`fas ${
+                  toast.type === 'success' ? 'fa-check-circle' : 
+                  toast.type === 'error' ? 'fa-exclamation-circle' :
+                  toast.type === 'warning' ? 'fa-exclamation-triangle' :
+                  'fa-info-circle'
+                }`} />
+                <span className="font-semibold text-sm">{toast.message}</span>
+              </div>
+            </div>
+          )}
+
           {loading && (
             <div className="absolute inset-0 z-30 flex items-center justify-center bg-base-200/40 backdrop-blur-md">
               <div className="flex flex-col items-center gap-4">
@@ -207,6 +224,8 @@ function App() {
                   pendingUserQuestions={store.pendingUserQuestions}
                   taskBlockers={taskBlockers}
                   workflowCheckpoints={workflowCheckpoints}
+                  workflows={workflows}
+                  workflowStages={workflowStages}
                   leases={leases}
                   claimBids={claimBids}
                   toolRuns={toolRuns}
@@ -237,6 +256,27 @@ function App() {
                   }}
                   onResolveBlocker={async (blockerId, resolution) => {
                     await store.resolveBlocker(blockerId, resolution);
+                  }}
+                  onCancelWorkflow={async (workflowId) => {
+                    await store.cancelWorkflow(workflowId);
+                  }}
+                  onPauseWorkflow={async (workflowId) => {
+                    await store.pauseWorkflow(workflowId);
+                  }}
+                  onResumeWorkflow={async (workflowId) => {
+                    await store.resumeWorkflow(workflowId);
+                  }}
+                  onSkipStage={async (workflowId, stageId) => {
+                    await store.skipWorkflowStage(workflowId, stageId);
+                  }}
+                  onAddStage={async (input) => {
+                    await store.addWorkflowStage(input);
+                  }}
+                  onUpdateStage={async (input) => {
+                    await store.updateWorkflowStage(input);
+                  }}
+                  onRemoveStage={async (stageId) => {
+                    await store.removeWorkflowStage(stageId);
                   }}
                 />
               </section>

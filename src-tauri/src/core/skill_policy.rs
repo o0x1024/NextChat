@@ -9,7 +9,7 @@ pub enum ToolExposureReason {
 }
 
 pub fn selected_skills_for_agent(agent: &AgentProfile, skills: &[SkillPack]) -> Vec<SkillPack> {
-    if !is_tool_enabled_for_agent(agent, "Skills") {
+    if !is_tool_enabled_for_agent(agent, "Skill") {
         return Vec::new();
     }
 
@@ -56,10 +56,13 @@ fn compat_tool_binding_matches(bound_tool_id: &str, requested_tool_id: &str) -> 
     matches!(
         (bound_tool_id, requested_tool_id),
         ("shell.exec", "Bash")
-            | ("file.readwrite", "Read" | "Write" | "Edit" | "MultiEdit")
+            | ("file.readwrite", "Read" | "Write" | "Edit")
             | ("project.search", "Grep" | "Glob" | "LS")
             | ("http.request", "WebFetch" | "WebSearch")
-            | ("plan.summarize", "TodoWrite")
+            | (
+                "plan.summarize",
+                "TaskCreate" | "TaskGet" | "TaskUpdate" | "TaskList"
+            )
     )
 }
 
@@ -81,7 +84,7 @@ mod tests {
             model_policy: ModelPolicy::default(),
             skill_ids: vec![],
             tool_ids: vec![
-                "Skills".into(),
+                "Skill".into(),
                 "project.search".into(),
                 "http.request".into(),
                 "shell.exec".into(),

@@ -111,7 +111,8 @@ impl AppService {
             created_at: now(),
             answered_at: None,
         };
-        self.storage.insert_pending_user_question(&pending_question)?;
+        self.storage
+            .insert_pending_user_question(&pending_question)?;
         emit(app, "pending-user-question:updated", &pending_question)?;
 
         let audit_event = AuditEvent {
@@ -417,6 +418,7 @@ impl AppService {
                 } else {
                     format!("Task execution failed and was moved to review. {error_message}")
                 },
+                narrative_meta: None,
                 mentions: vec![],
                 task_card_id: Some(current_task.id.clone()),
                 execution_mode: None,

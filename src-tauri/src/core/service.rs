@@ -12,9 +12,15 @@ mod memory;
 mod narrative_messages;
 mod owner_blocker_orchestration;
 mod owner_orchestration;
+mod peer_collaboration;
 mod routing;
 mod runtime;
 mod runtime_recovery;
+mod semantic_routing;
+mod stage_adjustment;
+mod quality_gate;
+pub use stage_adjustment::{AddWorkflowStageInput, UpdateWorkflowStageInput};
+pub use quality_gate::{QualityGateOutcome, QualityGateResult};
 mod summary_stream;
 #[cfg(test)]
 mod tests;
@@ -22,6 +28,7 @@ mod tests;
 mod todo_fallback_tests;
 mod tool_stream;
 mod work_group_owner;
+mod workflow_control;
 mod workflow_resume;
 use crate::core::{
     agent_runtime::AgentRuntime,
@@ -44,7 +51,7 @@ use tauri::{AppHandle, Emitter, Runtime};
 
 fn normalize_agent_tool_ids(tool_ids: Vec<String>) -> Vec<String> {
     let mut normalized = Vec::new();
-    for tool_id in std::iter::once("Skills".to_string()).chain(tool_ids.into_iter()) {
+    for tool_id in std::iter::once("Skill".to_string()).chain(tool_ids.into_iter()) {
         if !normalized.contains(&tool_id) {
             normalized.push(tool_id);
         }
@@ -508,7 +515,8 @@ impl AppService {
             .position(|provider| provider.id == config.id)
             .ok_or_else(|| anyhow!("provider not found: {}", config.id))?;
 
-        let models = refresh_models(&config).await?;
+        let proxy_url = &settings.global_config.proxy_url;
+        let models = refresh_models(&config, proxy_url).await?;
         let mut updated_provider = config;
         updated_provider.models = models;
         if !updated_provider
@@ -576,6 +584,7 @@ impl AppService {
                 "Permission denied: {} cannot use {}. {}",
                 agent.name, tool.name, reason
             ),
+            narrative_meta: None,
             mentions: vec![agent.id.clone()],
             task_card_id: Some(task_id.to_string()),
             execution_mode: None,
@@ -679,6 +688,7 @@ impl AppService {
             kind: MessageKind::Approval,
             visibility: Visibility::Main,
             content: format!("Approval required for {} before execution.", tool.name),
+            narrative_meta: None,
             mentions: vec![agent.id.clone()],
             task_card_id: Some(task.id.clone()),
             execution_mode: None,
@@ -852,18 +862,21 @@ fn collect_allowed_tools(tool_runtime: &ToolRuntime, agents: &[AgentProfile]) ->
     ids
 }
 
-fn should_skip_implicit_todowrite_fallback(
+fn should_skip_implicit_task_fallback(
     content: &str,
     tool: &crate::core::domain::ToolManifest,
 ) -> bool {
-    if tool.id != "TodoWrite" {
+    if !matches!(
+        tool.id.as_str(),
+        "TaskCreate" | "TaskGet" | "TaskUpdate" | "TaskList"
+    ) {
         return false;
     }
     let lowered = content.to_lowercase();
-    let explicit_todo_request = ["todo", "task list", "待办"]
+    let explicit_task_request = ["task", "todo", "task list", "任务", "待办"]
         .iter()
         .any(|keyword| lowered.contains(keyword));
-    if explicit_todo_request {
+    if explicit_task_request {
         return false;
     }
     true

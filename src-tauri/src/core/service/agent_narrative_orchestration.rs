@@ -3,7 +3,6 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use super::{
-    block_on_service_future,
     owner_orchestration::{extract_json_object, extract_prompt_value, require_text, truncate_text},
     AppService,
 };
@@ -12,27 +11,6 @@ use crate::core::llm_rig::RigModelAdapter;
 use crate::core::workflow::{AgentNarrativeDecision, RequestRouteMode};
 
 impl AppService {
-    pub(super) fn build_agent_ack_text(
-        &self,
-        task: &TaskCard,
-        agent: &AgentProfile,
-    ) -> Result<String> {
-        let dispatch = self.storage.get_task_dispatch(&task.id)?;
-        let decision =
-            block_on_service_future(self.complete_agent_json::<AgentNarrativeDecision>(
-                agent,
-                "agent.task_ack",
-                build_agent_narrative_prompt(task, agent, dispatch.as_ref(), "ack", None),
-                json!({
-                    "workGroupId": task.work_group_id,
-                    "taskId": task.id,
-                    "routeMode": dispatch.as_ref().map(|item| item.route_mode.clone()),
-                    "actorId": agent.id,
-                }),
-            ))?;
-        require_text(decision.text, "agent ack text missing")
-    }
-
     pub(super) async fn build_agent_progress_decision_async(
         &self,
         task: &TaskCard,
@@ -43,7 +21,7 @@ impl AppService {
             .complete_agent_json::<AgentNarrativeDecision>(
                 agent,
                 "agent.task_progress",
-                build_agent_narrative_prompt(task, agent, dispatch.as_ref(), "progress", None),
+                build_agent_progress_prompt(task, agent, dispatch.as_ref(), None),
                 json!({
                     "workGroupId": task.work_group_id,
                     "taskId": task.id,
@@ -144,11 +122,10 @@ impl AppService {
     }
 }
 
-fn build_agent_narrative_prompt(
+fn build_agent_progress_prompt(
     task: &TaskCard,
     agent: &AgentProfile,
     dispatch: Option<&crate::core::workflow::TaskDispatchRecord>,
-    message_kind: &str,
     current_summary: Option<&str>,
 ) -> String {
     let route_mode = dispatch
@@ -164,14 +141,12 @@ fn build_agent_narrative_prompt(
 只输出 JSON，对象字段为 text, progressPercent。\n\
 规则：\n\
 - text 必填，必须是自然中文，第一人称口吻。\n\
-- 如果 messageKind=ack，表示刚接单，应该说明先做什么；progressPercent 返回 null。\n\
-- 如果 messageKind=progress，表示任务已开始处理中，应该说明当前关注点；progressPercent 返回 5 到 95 的整数。\n\
+- 当前消息表示任务已开始处理中，应该说明当前关注点；progressPercent 返回 5 到 95 的整数。\n\
 - 不要假装任务已经完成，不要杜撰结果。\n\
 agentName：{}\n\
 agentRole：{}\n\
 taskTitle：{}\n\
 taskGoal：{}\n\
-messageKind：{}\n\
 routeMode：{}\n\
 workflowId：{}\n\
 stageId：{}\n\
@@ -182,7 +157,6 @@ currentSummary：{}\n",
         agent.role,
         task.title,
         task.normalized_goal,
-        message_kind,
         route_mode,
         dispatch
             .and_then(|item| item.workflow_id.clone())
@@ -206,17 +180,6 @@ fn mock_agent_narrative_completion(decision_kind: &str, prompt: &str) -> String 
     let route_mode =
         extract_prompt_value(prompt, "routeMode：").unwrap_or_else(|| "owner_orchestrated".into());
     match decision_kind {
-        "agent.task_ack" => {
-            let text = if route_mode == "owner_orchestrated" {
-                format!(
-                    "收到，我先处理{}，先把关键点梳理清楚，再同步给群主。",
-                    task_title
-                )
-            } else {
-                format!("收到，我来处理{}，先从关键问题开始推进。", task_title)
-            };
-            json!({ "text": text, "progressPercent": serde_json::Value::Null }).to_string()
-        }
         "agent.task_progress" => {
             let text = if route_mode == "owner_orchestrated" {
                 format!(

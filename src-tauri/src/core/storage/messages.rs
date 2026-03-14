@@ -11,8 +11,8 @@ impl Storage {
                 r#"
                 INSERT INTO messages (
                   id, conversation_id, work_group_id, sender_kind, sender_id, sender_name, kind,
-                  visibility, content, mentions, task_card_id, execution_mode, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                  visibility, content, narrative_meta, mentions, task_card_id, execution_mode, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                 "#,
                 params![
                     message.id,
@@ -24,6 +24,7 @@ impl Storage {
                     json(&message.kind)?,
                     json(&message.visibility)?,
                     message.content,
+                    message.narrative_meta,
                     json(&message.mentions)?,
                     message.task_card_id,
                     message.execution_mode.as_ref().map(json).transpose()?,
@@ -64,6 +65,7 @@ fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationMessage>
         kind: decode(row.get("kind")?)?,
         visibility: decode(row.get("visibility")?)?,
         content: row.get("content")?,
+        narrative_meta: row.get("narrative_meta").unwrap_or(None),
         mentions: decode(row.get("mentions")?)?,
         task_card_id: row.get("task_card_id")?,
         execution_mode: row

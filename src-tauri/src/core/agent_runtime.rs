@@ -122,7 +122,7 @@ fn build_execution_preamble(context: &TaskExecutionContext) -> String {
     };
 
     format!(
-        "You are {}. Role: {}. Objective: {}. Enabled skills: {}. Available tools: {}.\nRuntime environment:\n{}\nUse tools when they materially improve accuracy. High-risk tools require approval before execution. If the Skills tool is available, inspect a skill with it before relying on the skill's detailed instructions.",
+        "You are {}. Role: {}. Objective: {}. Enabled skills: {}. Available tools: {}.\nRuntime environment:\n{}\nUse tools when they materially improve accuracy. If the Skill tool is available and a skill matches the request, invoking Skill is a BLOCKING REQUIREMENT — do it before generating any other response about the task.",
         context.agent.name,
         context.agent.role,
         context.agent.objective,
@@ -163,11 +163,18 @@ fn build_execution_prompt(context: &TaskExecutionContext) -> String {
         .collect::<Vec<_>>()
         .join("\n");
 
+    let upstream_section = if let Some(ref upstream) = context.upstream_context {
+        format!("\nUpstream stage deliverables (use these as context for your work):\n{}\n", upstream)
+    } else {
+        String::new()
+    };
+
     format!(
-        "Work group goal: {}\nWorking directory: {}\nTask: {}\nConversation items:\n{}\nMemory context:\n{}\nEnabled skills catalog:\n{}\nReturn a concise progress summary. If a skill seems relevant, inspect it with the Skills tool before using it. If you need to delegate follow-up work, append one line per child task in the exact format `Delegate @AgentName: task details`. If you used tools, cite the concrete outcome instead of generic statements.",
+        "Work group goal: {}\nWorking directory: {}\nTask: {}\n{}\nConversation items:\n{}\nMemory context:\n{}\nEnabled skills catalog:\n{}\nReturn a concise progress summary. If a skill from the catalog matches this task, invoke the Skill tool BEFORE doing anything else — this is a BLOCKING REQUIREMENT. If you need to delegate follow-up work, append one line per child task in the exact format `Delegate @AgentName: task details`. If you used tools, cite the concrete outcome instead of generic statements.",
         context.work_group.goal,
         context.work_group.working_directory,
         context.task_card.normalized_goal,
+        upstream_section,
         conversation_items,
         memory_summary,
         if skill_catalog.is_empty() {
@@ -538,6 +545,7 @@ mod tests {
                 work_group_id: "wg-1".into(),
                 created_by: "human".into(),
                 assigned_agent_id: Some("a1".into()),
+                output_summary: None,
                 created_at: "now".into(),
             },
             conversation_window: vec![],
@@ -557,6 +565,7 @@ mod tests {
             available_skills: vec![],
             approved_tool: None,
             approved_tool_input: None,
+            upstream_context: None,
             settings: crate::core::domain::SystemSettings::default(),
             summary_stream: None,
             tool_stream: None,

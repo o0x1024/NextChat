@@ -12,17 +12,27 @@ struct BashCompatInput {
     timeout: Option<u64>,
     description: Option<String>,
     run_in_background: Option<bool>,
+    #[allow(dead_code)]
+    dangerously_disable_sandbox: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
-struct BashOutputToolInput {
-    bash_id: String,
+struct TaskOutputToolInput {
+    task_id: String,
+    #[serde(default = "default_true")]
+    block: bool,
     filter: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct KillBashToolInput {
-    shell_id: String,
+struct TaskStopToolInput {
+    task_id: Option<String>,
+    /// Deprecated: use task_id instead
+    shell_id: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl ToolRuntime {
@@ -73,7 +83,7 @@ impl ToolRuntime {
             }
 
             let output = json!({
-                "bash_id": bash_id,
+                "task_id": bash_id,
                 "status": "running",
                 "command": input.command,
                 "description": input.description,
@@ -108,20 +118,20 @@ impl ToolRuntime {
         })
     }
 
-    pub(crate) async fn run_bash_output_compat_tool(
+    pub(crate) async fn run_task_output_compat_tool(
         &self,
         request: &ToolExecutionRequest,
     ) -> Result<ToolExecutionResult> {
-        let input = self.parse_json_input::<BashOutputToolInput>(&request.input, "BashOutput")?;
+        let input = self.parse_json_input::<TaskOutputToolInput>(&request.input, "TaskOutput")?;
         let filter_regex = if let Some(filter) = input.filter.as_ref() {
-            Some(Regex::new(filter).with_context(|| "invalid BashOutput filter regex")?)
+            Some(Regex::new(filter).with_context(|| "invalid TaskOutput filter regex")?)
         } else {
             None
         };
         let mut runs = self.bash_runs.lock().await;
         let run = runs
-            .get_mut(&input.bash_id)
-            .ok_or_else(|| anyhow!("unknown bash_id '{}'", input.bash_id))?;
+            .get_mut(&input.task_id)
+            .ok_or_else(|| anyhow!("unknown task_id '{}'", input.task_id))?;
         let new_stdout = run
             .stdout
             .get(run.read_offset_stdout..)
@@ -155,7 +165,7 @@ impl ToolRuntime {
         };
 
         let output = json!({
-            "bash_id": input.bash_id,
+            "task_id": input.task_id,
             "status": run.status,
             "stdout": truncate(&stdout, 24_000),
             "stderr": truncate(&stderr, 8_000),
@@ -167,22 +177,27 @@ impl ToolRuntime {
         })
     }
 
-    pub(crate) async fn run_kill_bash_compat_tool(
+    pub(crate) async fn run_task_stop_compat_tool(
         &self,
         request: &ToolExecutionRequest,
     ) -> Result<ToolExecutionResult> {
-        let input = self.parse_json_input::<KillBashToolInput>(&request.input, "KillBash")?;
+        let input = self.parse_json_input::<TaskStopToolInput>(&request.input, "TaskStop")?;
+        let id = input
+            .task_id
+            .as_deref()
+            .or(input.shell_id.as_deref())
+            .ok_or_else(|| anyhow!("TaskStop requires task_id"))?;
         let mut killed = false;
         {
             let mut tasks = self.bash_tasks.lock().await;
-            if let Some(handle) = tasks.remove(&input.shell_id) {
+            if let Some(handle) = tasks.remove(id) {
                 handle.abort();
                 killed = true;
             }
         }
         {
             let mut runs = self.bash_runs.lock().await;
-            if let Some(run) = runs.get_mut(&input.shell_id) {
+            if let Some(run) = runs.get_mut(id) {
                 run.status = if killed {
                     "killed".to_string()
                 } else {
@@ -194,7 +209,7 @@ impl ToolRuntime {
             }
         }
         let output = json!({
-            "shell_id": input.shell_id,
+            "task_id": id,
             "killed": killed,
         })
         .to_string();

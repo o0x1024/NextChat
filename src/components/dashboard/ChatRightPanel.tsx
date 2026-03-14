@@ -1,6 +1,7 @@
 import type { PointerEvent as ReactPointerEvent } from "react";
 import type { Language } from "../../store/preferencesStore";
 import type {
+  AddWorkflowStageInput,
   AgentProfile,
   AuditEvent,
   ChatStreamTrack,
@@ -12,7 +13,10 @@ import type {
   TaskCard,
   ToolManifest,
   ToolRun,
+  UpdateWorkflowStageInput,
   WorkflowCheckpointRecord,
+  WorkflowRecord,
+  WorkflowStageRecord,
   WorkGroup,
 } from "../../types";
 import { AgentExecutionDetailsPanel } from "./AgentExecutionDetailsPanel";
@@ -40,6 +44,8 @@ interface ChatRightPanelProps {
   currentTaskBlockers: TaskBlockerRecord[];
   claimBids: ClaimBid[];
   workflowCheckpoints: WorkflowCheckpointRecord[];
+  workflows: WorkflowRecord[];
+  workflowStages: WorkflowStageRecord[];
   highlightedTaskId: string | null;
   highlightedBlockerId: string | null;
   panelTarget: PanelTarget | null;
@@ -59,6 +65,13 @@ interface ChatRightPanelProps {
   onApproveRun: (toolRunId: string, approved: boolean) => Promise<void>;
   onResolveBlocker: (blockerId: string, resolution: OwnerBlockerResolution) => Promise<void>;
   onCancelTask: (taskCardId: string) => Promise<void>;
+  onCancelWorkflow: (workflowId: string) => Promise<void>;
+  onPauseWorkflow: (workflowId: string) => Promise<void>;
+  onResumeWorkflow: (workflowId: string) => Promise<void>;
+  onSkipStage: (workflowId: string, stageId: string) => Promise<void>;
+  onAddStage: (input: AddWorkflowStageInput) => Promise<void>;
+  onUpdateStage: (input: UpdateWorkflowStageInput) => Promise<void>;
+  onRemoveStage: (stageId: string) => Promise<void>;
   onAddAgent: (agentId: string) => Promise<void>;
   onRemoveAgent: (agent: AgentProfile) => Promise<void>;
 }
@@ -83,6 +96,8 @@ export function ChatRightPanel({
   currentTaskBlockers,
   claimBids,
   workflowCheckpoints,
+  workflows,
+  workflowStages,
   highlightedTaskId,
   highlightedBlockerId,
   panelTarget,
@@ -102,6 +117,13 @@ export function ChatRightPanel({
   onApproveRun,
   onResolveBlocker,
   onCancelTask,
+  onCancelWorkflow,
+  onPauseWorkflow,
+  onResumeWorkflow,
+  onSkipStage,
+  onAddStage,
+  onUpdateStage,
+  onRemoveStage,
   onAddAgent,
   onRemoveAgent,
 }: ChatRightPanelProps) {
@@ -152,6 +174,8 @@ export function ChatRightPanel({
             agents={agents}
             tools={tools}
             workflowCheckpoints={workflowCheckpoints}
+            workflows={workflows}
+            workflowStages={workflowStages}
             highlightedTaskId={highlightedTaskId}
             highlightedBlockerId={highlightedBlockerId}
             targetBlockerId={panelTarget?.section === "blockers" ? panelTarget.blockerId : null}
@@ -162,6 +186,13 @@ export function ChatRightPanel({
             onJumpToTaskBoard={onJumpToTask}
             onApproveRun={onApproveRun}
             onResolveBlocker={onResolveBlocker}
+            onCancelWorkflow={onCancelWorkflow}
+            onPauseWorkflow={onPauseWorkflow}
+            onResumeWorkflow={onResumeWorkflow}
+            onSkipStage={onSkipStage}
+            onAddStage={onAddStage}
+            onUpdateStage={onUpdateStage}
+            onRemoveStage={onRemoveStage}
           />
         )}
 

@@ -89,8 +89,10 @@ impl AppService {
             tool_ids: vec![
                 "Task".into(),
                 "AskUserQuestion".into(),
-                "TodoWrite".into(),
-                "Skills".into(),
+                "TaskCreate".into(),
+                "TaskUpdate".into(),
+                "TaskList".into(),
+                "Skill".into(),
                 "Read".into(),
                 "Grep".into(),
                 "LS".into(),

@@ -112,7 +112,7 @@ fn build_generated_agent_input(
     tools: &[crate::core::domain::ToolManifest],
     used_names: &mut HashSet<String>,
 ) -> Result<CreateAgentInput> {
-    let mut tool_ids = vec!["Skills".to_string()];
+    let mut tool_ids = vec!["Skill".to_string()];
     for tool_id in draft.tool_ids.unwrap_or_default() {
         if tools.iter().any(|tool| tool.id == tool_id) && !tool_ids.contains(&tool_id) {
             tool_ids.push(tool_id);

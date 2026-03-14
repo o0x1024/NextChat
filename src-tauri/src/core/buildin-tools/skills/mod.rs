@@ -24,11 +24,45 @@ pub(super) enum SkillsAction {
     ReadFile,
 }
 
+/// Legacy input format with action-based routing.
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct SkillsToolInput {
     pub(super) action: SkillsAction,
     pub(super) skill_id: Option<String>,
     pub(super) path: Option<String>,
+}
+
+/// New input format matching Claude Code's Skill tool schema.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct SkillToolInput {
+    pub(super) skill: String,
+    pub(super) args: Option<String>,
+}
+
+impl SkillToolInput {
+    /// Convert the new Skill input format into the legacy SkillsToolInput.
+    pub(super) fn into_legacy(self) -> SkillsToolInput {
+        let skill_lower = self.skill.to_lowercase();
+        if skill_lower == "list" || skill_lower.is_empty() {
+            SkillsToolInput {
+                action: SkillsAction::List,
+                skill_id: None,
+                path: None,
+            }
+        } else if skill_lower == "read_file" {
+            SkillsToolInput {
+                action: SkillsAction::ReadFile,
+                skill_id: self.args.clone(),
+                path: self.args,
+            }
+        } else {
+            SkillsToolInput {
+                action: SkillsAction::Load,
+                skill_id: Some(self.skill),
+                path: self.args,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

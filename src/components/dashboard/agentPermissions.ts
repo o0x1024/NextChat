@@ -31,10 +31,7 @@ export function joinPolicyList(values: string[]): string {
   return values.join(", ");
 }
 
-export type ToolExposureReason =
-  | "available"
-  | "not_bound"
-  | "blocked_by_permission";
+export type ToolExposureReason = "available" | "not_bound";
 
 export function selectedSkillsForAgent(
   agent: AgentProfile,
@@ -47,16 +44,6 @@ export function selectedSkillsForAgent(
   return skills.filter((skill) => skill.enabled);
 }
 
-export function allowsToolId(
-  policy: AgentPermissionPolicy,
-  toolId: string,
-): boolean {
-  return (
-    (policy.allowToolIds.length === 0 || policy.allowToolIds.includes(toolId)) &&
-    !policy.denyToolIds.includes(toolId)
-  );
-}
-
 export function toolExposureReason(
   agent: AgentProfile,
   tool: ToolManifest,
@@ -64,10 +51,6 @@ export function toolExposureReason(
 ): ToolExposureReason {
   if (!agent.toolIds.includes(tool.id)) {
     return "not_bound";
-  }
-
-  if (!allowsToolId(agent.permissionPolicy, tool.id)) {
-    return "blocked_by_permission";
   }
 
   return "available";
