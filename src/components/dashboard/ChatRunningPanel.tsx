@@ -42,6 +42,7 @@ interface BlockerDraft {
 
 interface ChatRunningPanelProps {
   language: Language;
+  currentWorkGroupId: string | null;
   activeTasks: TaskCard[];
   currentLeases: Lease[];
   currentApprovals: ToolRun[];
@@ -144,6 +145,7 @@ function buildResolution(draft: BlockerDraft): OwnerBlockerResolution | null {
 
 export function ChatRunningPanel({
   language,
+  currentWorkGroupId,
   activeTasks,
   currentLeases,
   currentApprovals,
@@ -189,6 +191,40 @@ export function ChatRunningPanel({
   const blockerTasks = useMemo(
     () => new Map(currentGroupTasks.map((task) => [task.id, task])),
     [currentGroupTasks],
+  );
+
+  const currentWorkflowIds = useMemo(
+    () =>
+      new Set(
+        workflows
+          .filter((workflow) => currentWorkGroupId !== null && workflow.workGroupId === currentWorkGroupId)
+          .map((workflow) => workflow.id),
+      ),
+    [currentWorkGroupId, workflows],
+  );
+
+  const currentGroupWorkflows = useMemo(
+    () =>
+      workflows.filter(
+        (workflow) => currentWorkGroupId !== null && workflow.workGroupId === currentWorkGroupId,
+      ),
+    [currentWorkGroupId, workflows],
+  );
+
+  const currentGroupWorkflowStages = useMemo(
+    () => workflowStages.filter((stage) => currentWorkflowIds.has(stage.workflowId)),
+    [currentWorkflowIds, workflowStages],
+  );
+
+  const currentGroupWorkflowCheckpoints = useMemo(
+    () =>
+      workflowCheckpoints.filter((checkpoint) => {
+        if (checkpoint.workflowId) {
+          return currentWorkflowIds.has(checkpoint.workflowId);
+        }
+        return checkpoint.taskId ? blockerTasks.has(checkpoint.taskId) : false;
+      }),
+    [blockerTasks, currentWorkflowIds, workflowCheckpoints],
   );
 
   const blockerAgents = useMemo(
@@ -328,8 +364,8 @@ export function ChatRunningPanel({
 
       <WorkflowControlPanel
         language={language}
-        workflows={workflows}
-        workflowStages={workflowStages}
+        workflows={currentGroupWorkflows}
+        workflowStages={currentGroupWorkflowStages}
         tasks={currentGroupTasks}
         agents={agents}
         onCancelWorkflow={onCancelWorkflow}
@@ -345,7 +381,7 @@ export function ChatRunningPanel({
         language={language}
         tasks={currentGroupTasks}
         agents={agents}
-        checkpoints={workflowCheckpoints}
+        checkpoints={currentGroupWorkflowCheckpoints}
         onOpenTask={onJumpToTaskBoard}
       />
 

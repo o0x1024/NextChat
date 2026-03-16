@@ -15,6 +15,7 @@ import type {
   WorkGroup,
 } from "../../types";
 import { ChatComposer } from "./ChatComposer";
+import { ChatGroupSidebar } from "./ChatGroupSidebar";
 import { ChatMessageList } from "./ChatMessageList";
 import { ChatRightPanel } from "./ChatRightPanel";
 import {
@@ -698,116 +699,24 @@ export function ChatManagement({
   }, [resizingRightPanel, resizingSidebar]);
 
   return (
-    <div ref={rootRef} className="flex h-full gap-0">
+    <div ref={rootRef} className="flex h-full min-w-0 gap-0 overflow-hidden">
       {sidebarOpen && (
         <>
           <div
-            className={`flex shrink-0 flex-col border-r border-base-content/10 ${
+            className={`flex shrink-0 flex-col ${
               resizingSidebar ? "" : "transition-[width] duration-150"
             }`}
             style={{ width: "var(--chat-sidebar-width, 256px)" }}
           >
-            <div className="flex items-center justify-between border-b border-base-content/10 px-4 py-3">
-              <h2 className="text-sm font-bold">{t("chatManagement")}</h2>
-              <div className="flex items-center gap-1">
-                <button className="btn btn-primary btn-xs" onClick={openCreateGroupModal}>
-                  + {t("create")}
-                </button>
-                <button className="btn btn-ghost btn-xs" onClick={() => setSidebarOpen(false)}>
-                  <i className="fas fa-indent" />
-                </button>
-              </div>
-            </div>
-
-            <div className="flex-1 overflow-x-hidden overflow-y-auto">
-              <ul className="menu menu-sm w-full gap-0.5 p-2">
-                {workGroups.map((group) => {
-                  const isActive = currentGroup?.id === group.id;
-                  return (
-                    <li key={group.id} className="w-full overflow-hidden">
-                      <div
-                        role="button"
-                        tabIndex={0}
-                        className={`flex w-full items-center gap-2 overflow-hidden rounded-lg py-2.5 transition-colors ${
-                          isActive ? "bg-primary text-primary-content" : "hover:bg-base-200"
-                        }`}
-                        onClick={() => onSelectWorkGroup(group.id)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter" || event.key === " ") {
-                            event.preventDefault();
-                            onSelectWorkGroup(group.id);
-                          }
-                        }}
-                      >
-                        <div
-                          className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg text-[10px] font-bold ${
-                            isActive
-                              ? "border border-primary-content/30 bg-primary-content/10 text-primary-content"
-                              : "border border-primary/20 bg-primary/10 text-primary"
-                          }`}
-                        >
-                          {group.name.slice(0, 2).toUpperCase()}
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate text-sm font-medium">{group.name}</div>
-                          <div
-                            className={`truncate text-xs ${
-                              isActive ? "text-primary-content/75" : "text-base-content/50"
-                            }`}
-                          >
-                            {group.goal}
-                          </div>
-                        </div>
-                        <div className="flex shrink-0 items-center gap-1">
-                          <button
-                            type="button"
-                            className={`btn btn-ghost btn-xs ${
-                              isActive ? "text-primary-content hover:bg-primary-content/20" : ""
-                            }`}
-                            title={t("edit")}
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              openEditGroupModal(group);
-                            }}
-                          >
-                            <i className="fas fa-pen" />
-                          </button>
-                          <button
-                            type="button"
-                            className={`btn btn-ghost btn-xs ${
-                              isActive
-                                ? "text-primary-content hover:bg-primary-content/20"
-                                : "text-error"
-                            }`}
-                            title={t("delete")}
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              handleDeleteGroup(group);
-                            }}
-                          >
-                            <i className="fas fa-trash" />
-                          </button>
-                        </div>
-                        <span
-                          className={`badge badge-xs shrink-0 ${
-                            isActive
-                              ? "border-primary-content/30 bg-primary-content/15 text-primary-content"
-                              : "badge-ghost"
-                          }`}
-                        >
-                          {group.kind === "persistent" ? "P" : "E"}
-                        </span>
-                      </div>
-                    </li>
-                  );
-                })}
-                {workGroups.length === 0 && (
-                  <li className="py-4 text-center text-sm text-base-content/50">
-                    {t("noWorkGroupsYet")}
-                  </li>
-                )}
-              </ul>
-            </div>
+            <ChatGroupSidebar
+              workGroups={workGroups}
+              currentGroupId={currentGroup?.id}
+              onSelectWorkGroup={onSelectWorkGroup}
+              onOpenCreateGroupModal={openCreateGroupModal}
+              onCloseSidebar={() => setSidebarOpen(false)}
+              onEditGroup={openEditGroupModal}
+              onDeleteGroup={handleDeleteGroup}
+            />
           </div>
 
           <div
@@ -822,7 +731,7 @@ export function ChatManagement({
         </>
       )}
 
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         {currentGroup ? (
           <>
             <div className="flex items-center justify-between border-b border-base-content/10 px-5 py-3">
@@ -889,17 +798,20 @@ export function ChatManagement({
 
             <div
               className={`flex min-h-0 flex-1 px-3 py-4 ${
-                sidePanelOpen ? "flex-col gap-4 xl:flex-row" : "flex-col"
+                sidePanelOpen ? "flex-col gap-4 lg:flex-row" : "flex-col"
               }`}
             >
-              <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
                 <ChatMessageList
                   currentMessages={currentMessages}
                   streamTracks={currentGroupStreamTracks}
                   currentTaskTitles={currentTaskTitles}
                   currentTaskAssignees={currentTaskAssignees}
                   currentMemberNames={currentMemberNames}
+                  currentTaskIds={currentTaskIds}
                   activeTaskIds={activeTaskIds}
+                  toolRuns={toolRuns}
+                  tools={tools}
                   language={language}
                   targetMessageId={targetMessageId}
                   onJumpToTaskBoard={jumpToTaskBoard}

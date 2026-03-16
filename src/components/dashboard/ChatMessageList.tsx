@@ -1,9 +1,19 @@
 import { useEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import type { Language } from "../../store/preferencesStore";
-import type { ChatStreamTrack, ConversationMessage } from "../../types";
+import type {
+  ChatStreamTrack,
+  ConversationMessage,
+  ToolManifest,
+  ToolRun,
+} from "../../types";
 import { formatTime } from "./ui";
 import { MarkdownMessage } from "./MarkdownMessage";
+import {
+  buildChatInlineActivities,
+  formatInlineExecutionPayload,
+  type ChatInlineActivity,
+} from "./chatInlineActivities";
 import {
   narrativeBadgeClass,
   narrativeBubbleClass,
@@ -18,7 +28,10 @@ interface ChatMessageListProps {
   currentTaskTitles: Map<string, string>;
   currentTaskAssignees: Map<string, string>;
   currentMemberNames: Map<string, string>;
+  currentTaskIds: Set<string>;
   activeTaskIds: Set<string>;
+  toolRuns: ToolRun[];
+  tools: ToolManifest[];
   language: Language;
   targetMessageId: string | null;
   onJumpToTaskBoard: (taskId?: string) => void;
@@ -52,7 +65,10 @@ export function ChatMessageList({
   currentTaskTitles,
   currentTaskAssignees,
   currentMemberNames,
+  currentTaskIds,
   activeTaskIds,
+  toolRuns,
+  tools,
   language,
   targetMessageId,
   onJumpToTaskBoard,
@@ -67,22 +83,33 @@ export function ChatMessageList({
     () => new Set(currentMessages.map((message) => message.id)),
     [currentMessages],
   );
-
-  const visibleStreamTracks = useMemo(
+  const { hiddenMessageIds, activities } = useMemo(
     () =>
-      streamTracks
-        .filter((track) => track.visibility === "main" && !persistedMessageIds.has(track.streamId))
-        .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt)),
-    [streamTracks, persistedMessageIds],
+      buildChatInlineActivities({
+        currentMessages,
+        streamTracks,
+        toolRuns,
+        tools,
+        currentTaskIds,
+      }),
+    [currentMessages, currentTaskIds, streamTracks, toolRuns, tools],
+  );
+  const visibleMessages = useMemo(
+    () => currentMessages.filter((message) => !hiddenMessageIds.has(message.id)),
+    [currentMessages, hiddenMessageIds],
   );
   const streamingFingerprint = useMemo(
     () =>
-      visibleStreamTracks
-        .map((track) => `${track.streamId}:${track.updatedAt}:${track.content.length}`)
+      activities
+        .map((activity) =>
+          activity.type === "stream"
+            ? `${activity.id}:${activity.timestamp}:${activity.status}:${activity.content.length}`
+            : `${activity.id}:${activity.timestamp}`
+        )
         .join("|"),
-    [visibleStreamTracks],
+    [activities],
   );
-  const lastMessageId = currentMessages[currentMessages.length - 1]?.id ?? "";
+  const lastMessageId = visibleMessages[visibleMessages.length - 1]?.id ?? "";
 
   useEffect(() => {
     const container = containerRef.current;
@@ -113,72 +140,61 @@ export function ChatMessageList({
       className="min-h-0 flex-1 space-y-1 overflow-x-hidden overflow-y-auto"
       onScroll={handleScroll}
     >
-      {currentMessages.map((message) => (
-        <MessageRow
-          key={message.id}
-          message={message}
-          currentTaskTitles={currentTaskTitles}
-          currentTaskAssignees={currentTaskAssignees}
-          currentMemberNames={currentMemberNames}
-          activeTaskIds={activeTaskIds}
-          language={language}
-          highlighted={targetMessageId === message.id}
-          onJumpToTaskBoard={onJumpToTaskBoard}
-          onJumpToBlocker={onJumpToBlocker}
-          onJumpToExecutionAgent={onJumpToExecutionAgent}
-          onSetMessageRef={(node) => {
-            messageRefs.current[message.id] = node;
-          }}
-          t={t}
-        />
-      ))}
+      {visibleMessages.length === 0 &&
+        activities.map((activity) => (
+          <InlineActivityRow
+            key={activity.id}
+            activity={activity}
+            currentTaskTitles={currentTaskTitles}
+            activeTaskIds={activeTaskIds}
+            language={language}
+            onJumpToTaskBoard={onJumpToTaskBoard}
+            t={t}
+          />
+        ))}
 
-      {visibleStreamTracks.map((track) => (
-        <div key={`stream-${track.streamId}`} className="chat chat-start min-w-0">
-          <div className="chat-header mb-1 text-xs text-base-content/50">
-            <span className="font-medium">{track.senderName}</span>
-            {track.taskCardId && currentTaskTitles.get(track.taskCardId) && (
-              activeTaskIds.has(track.taskCardId) ? (
-                <button
-                  type="button"
-                  className="ml-1 badge badge-ghost badge-xs transition-colors hover:border-primary hover:text-primary"
-                  title={t("openTask")}
-                  onClick={() => onJumpToTaskBoard(track.taskCardId ?? undefined)}
-                >
-                  {t("linkedTask")}{" "}
-                  {compactTaskTitle(currentTaskTitles.get(track.taskCardId) ?? "")}
-                </button>
-              ) : (
-                <span
-                  className="ml-1 badge badge-ghost badge-xs"
-                  title={currentTaskTitles.get(track.taskCardId) ?? undefined}
-                >
-                  {t("linkedTask")}{" "}
-                  {compactTaskTitle(currentTaskTitles.get(track.taskCardId) ?? "")}
-                </span>
-              )
-            )}
-            <span
-              className={`ml-1 badge badge-xs ${
-                track.status === "streaming" ? "badge-info" : "badge-success"
-              }`}
-            >
-              {track.status === "streaming" ? t("streamingStatus") : t("streamCompletedStatus")}
-            </span>
-            <time className="ml-2">{formatTime(track.updatedAt, language)}</time>
-          </div>
-          <div className="chat-bubble chat-bubble-secondary min-w-0 max-w-full text-sm">
-            <div className="min-w-0 max-w-full">
-              <MarkdownMessage content={track.content} />
-              {track.status === "streaming" ? (
-                <span className="mt-1 inline-block h-4 w-1 animate-pulse bg-current align-middle" />
-              ) : null}
-            </div>
-          </div>
-        </div>
-      ))}
+      {visibleMessages.map((message, index) => {
+        const nextTimestamp = visibleMessages[index + 1]?.createdAt;
+        const inlineActivities = activities.filter(
+          (activity) =>
+            activity.timestamp >= message.createdAt &&
+            (nextTimestamp ? activity.timestamp < nextTimestamp : true),
+        );
 
-      {currentMessages.length === 0 && visibleStreamTracks.length === 0 && (
+        return (
+          <div key={message.id} className="space-y-2">
+            <MessageRow
+              message={message}
+              currentTaskTitles={currentTaskTitles}
+              currentTaskAssignees={currentTaskAssignees}
+              currentMemberNames={currentMemberNames}
+              activeTaskIds={activeTaskIds}
+              language={language}
+              highlighted={targetMessageId === message.id}
+              onJumpToTaskBoard={onJumpToTaskBoard}
+              onJumpToBlocker={onJumpToBlocker}
+              onJumpToExecutionAgent={onJumpToExecutionAgent}
+              onSetMessageRef={(node) => {
+                messageRefs.current[message.id] = node;
+              }}
+              t={t}
+            />
+            {inlineActivities.map((activity) => (
+              <InlineActivityRow
+                key={activity.id}
+                activity={activity}
+                currentTaskTitles={currentTaskTitles}
+                activeTaskIds={activeTaskIds}
+                language={language}
+                onJumpToTaskBoard={onJumpToTaskBoard}
+                t={t}
+              />
+            ))}
+          </div>
+        );
+      })}
+
+      {currentMessages.length === 0 && activities.length === 0 && (
         <div className="hero min-h-40 rounded-box bg-base-200">
           <div className="hero-content text-center">
             <div className="max-w-xs">
@@ -188,6 +204,142 @@ export function ChatMessageList({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function toolRunBadgeClass(state: ToolRun["state"]) {
+  switch (state) {
+    case "completed":
+      return "badge-success";
+    case "cancelled":
+      return "badge-error";
+    case "pending_approval":
+      return "badge-warning";
+    case "running":
+      return "badge-info";
+    default:
+      return "badge-ghost";
+  }
+}
+
+function messageKindLabel(messageKind: ConversationMessage["kind"] | ChatStreamTrack["kind"]) {
+  return messageKind.replace("_", " ");
+}
+
+function InlineActivityRow({
+  activity,
+  currentTaskTitles,
+  activeTaskIds,
+  language,
+  onJumpToTaskBoard,
+  t,
+}: {
+  activity: ChatInlineActivity;
+  currentTaskTitles: Map<string, string>;
+  activeTaskIds: Set<string>;
+  language: Language;
+  onJumpToTaskBoard: (taskId?: string) => void;
+  t: ReturnType<typeof useTranslation>["t"];
+}) {
+  const taskTitle = activity.taskCardId ? currentTaskTitles.get(activity.taskCardId) : undefined;
+
+  return (
+    <div className="chat chat-start min-w-0">
+      <div className="chat-bubble min-w-0 max-w-full border border-base-content/10 bg-base-200/70 text-sm text-base-content shadow-none">
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-2 text-xs text-base-content/60">
+            <span className="font-medium text-base-content/80">
+              {activity.type === "tool_run" ? activity.agentName : activity.senderName}
+            </span>
+            {activity.type === "stream" ? (
+              <>
+                <span className="badge badge-xs badge-ghost">{messageKindLabel(activity.kind)}</span>
+                <span className={`badge badge-xs ${activity.status === "streaming" ? "badge-info" : "badge-success"}`}>
+                  {activity.status === "streaming" ? t("streamingStatus") : t("streamCompletedStatus")}
+                </span>
+              </>
+            ) : (
+              <>
+                <span className="badge badge-xs badge-ghost">
+                  {activity.toolName}
+                </span>
+                <span className={`badge badge-xs ${toolRunBadgeClass(activity.state)}`}>
+                  {t(`toolRunState.${activity.state}`)}
+                </span>
+                {activity.approvalRequired ? (
+                  <span className="badge badge-xs badge-warning">{t("approval")}</span>
+                ) : null}
+              </>
+            )}
+            {taskTitle ? (
+              activeTaskIds.has(activity.taskCardId as string) ? (
+                <button
+                  type="button"
+                  className="badge badge-ghost badge-xs transition-colors hover:border-primary hover:text-primary"
+                  onClick={() => onJumpToTaskBoard(activity.taskCardId ?? undefined)}
+                >
+                  {t("linkedTask")} {compactTaskTitle(taskTitle)}
+                </button>
+              ) : (
+                <span className="badge badge-ghost badge-xs">
+                  {t("linkedTask")} {compactTaskTitle(taskTitle)}
+                </span>
+              )
+            ) : null}
+            <time>{formatTime(activity.timestamp, language)}</time>
+          </div>
+
+          {activity.type === "stream" ? (
+            <div className="min-w-0 rounded-xl bg-base-100/80 px-3 py-2">
+              <MarkdownMessage content={activity.content} />
+              {activity.status === "streaming" ? (
+                <span className="mt-1 inline-block h-4 w-1 animate-pulse bg-current align-middle" />
+              ) : null}
+            </div>
+          ) : activity.type === "tool_call" ? (
+            <details className="overflow-hidden rounded-xl bg-base-100/80" open={activity.state !== "completed"}>
+              <summary className="cursor-pointer list-none px-3 py-2 text-xs font-medium text-base-content/70 [&::-webkit-details-marker]:hidden">
+                {activity.state === "completed" ? activity.toolName : `${activity.toolName} · ${t("toolRunState.running")}`}
+              </summary>
+              <div className="space-y-2 border-t border-base-content/10 px-3 py-3">
+                {activity.input.trim() ? (
+                  <div className="space-y-1">
+                    <div className="text-[11px] font-semibold uppercase tracking-wide text-base-content/45">
+                      Input
+                    </div>
+                    <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-lg bg-base-200 px-2 py-2 text-xs">
+                      {formatInlineExecutionPayload(activity.input, true)}
+                    </pre>
+                  </div>
+                ) : null}
+                {activity.output.trim() ? (
+                  <div className="space-y-1">
+                    <div className="text-[11px] font-semibold uppercase tracking-wide text-base-content/45">
+                      Output
+                    </div>
+                    <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-lg bg-base-200 px-2 py-2 text-xs">
+                      {formatInlineExecutionPayload(activity.output, true)}
+                    </pre>
+                  </div>
+                ) : (
+                  <div className="text-xs text-base-content/55">
+                    {activity.state === "pending_approval"
+                      ? t("toolRunNeedsApproval", { id: activity.callId })
+                      : t(`toolRunState.${activity.state}`)}
+                  </div>
+                )}
+              </div>
+            </details>
+          ) : (
+            <div className="rounded-xl bg-base-100/80 px-3 py-2 text-xs text-base-content/70">
+              {activity.state === "pending_approval"
+                ? t("toolRunNeedsApproval", { id: activity.toolId })
+                : t(`toolRunState.${activity.state}`)}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

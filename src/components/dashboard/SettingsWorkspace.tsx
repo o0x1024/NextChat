@@ -19,7 +19,7 @@ export function SettingsWorkspace({
     const { t } = useTranslation();
 
     const tabs = [
-        { id: "ai", label: t("settingsAI"), icon: "fas fa-robot text-primary" },
+        { id: "ai", label: t("settingsAIService"), icon: "fas fa-robot text-primary" },
         { id: "system", label: t("settingsSystem"), icon: "fas fa-desktop text-secondary" },
         { id: "security", label: t("settingsSecurity"), icon: "fas fa-shield-halved text-accent" },
         { id: "network", label: t("settingsNetwork"), icon: "fas fa-network-wired text-info" },

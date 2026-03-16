@@ -27,6 +27,21 @@ const emptyNewProviderForm: NewProviderForm = {
   icon: "fas fa-plug",
 };
 
+function mergeModelNames(...groups: Array<string[] | undefined | null>) {
+  const merged: string[] = [];
+  for (const group of groups) {
+    if (!group) continue;
+    for (const rawModel of group) {
+      const model = rawModel.trim();
+      if (!model || merged.includes(model)) {
+        continue;
+      }
+      merged.push(model);
+    }
+  }
+  return merged;
+}
+
 function ProviderListItem({
   provider,
   isSelected,
@@ -142,6 +157,7 @@ export function AISettings() {
   const updateProviderDefaultModel = (provider: AIProviderConfig, inputValue: string) => {
     const nextDefaultModel = inputValue.trim();
     updateProvider(provider.id, {
+      models: mergeModelNames(provider.models, nextDefaultModel ? [nextDefaultModel] : []),
       defaultModel: nextDefaultModel,
     });
   };
@@ -162,10 +178,12 @@ export function AISettings() {
     if (!selectedGlobalProvider) {
       return [];
     }
-    return selectedGlobalProvider.models
-      .map((model) => model.trim())
-      .filter((model, index, arr) => model.length > 0 && arr.indexOf(model) === index);
-  }, [selectedGlobalProvider]);
+    return mergeModelNames(
+      selectedGlobalProvider.models,
+      [selectedGlobalProvider.defaultModel],
+      [globalConfig.defaultLLMModel],
+    );
+  }, [globalConfig.defaultLLMModel, selectedGlobalProvider]);
 
   const selectedGlobalProviderId = selectedGlobalProvider?.id ?? "";
   const selectedGlobalModel =
@@ -175,9 +193,7 @@ export function AISettings() {
     if (!activeProvider) {
       return [];
     }
-    return activeProvider.models
-      .map((model) => model.trim())
-      .filter((model, index, models) => model.length > 0 && models.indexOf(model) === index);
+    return mergeModelNames(activeProvider.models, [activeProvider.defaultModel]);
   }, [activeProvider]);
 
   useEffect(() => {
@@ -204,9 +220,23 @@ export function AISettings() {
     setRefreshMessage("");
     try {
       const updatedProvider = await refreshProviderModels(activeProvider);
-      await refresh();
+      const mergedProvider: AIProviderConfig = {
+        ...updatedProvider,
+        models: mergeModelNames(
+          updatedProvider.models,
+          activeProvider.models,
+          [activeProvider.defaultModel],
+          [updatedProvider.defaultModel],
+        ),
+      };
+      await updateSettings({
+        ...settings,
+        providers: providers.map((provider) =>
+          provider.id === mergedProvider.id ? mergedProvider : provider,
+        ),
+      });
       setRefreshStatus("success");
-      setRefreshMessage(t("modelsRefreshed", { count: updatedProvider.models.length }));
+      setRefreshMessage(t("modelsRefreshed", { count: mergedProvider.models.length }));
     } catch (error) {
       console.error("Model refresh failed:", error);
       setRefreshStatus("error");

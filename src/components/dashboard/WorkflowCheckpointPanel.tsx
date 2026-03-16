@@ -250,11 +250,15 @@ export function WorkflowCheckpointPanel({
                         <div className="text-[11px] font-semibold uppercase tracking-wide text-base-content/50">
                           {labels.artifactSummary}
                         </div>
-                        <div className="flex flex-wrap gap-2">
+                        <div className="space-y-2">
                           {previewLines(checkpoint.artifactSummary, 4).map((item) => (
-                            <span key={item} className="badge badge-outline">
+                            <p
+                              key={item}
+                              title={item}
+                              className="rounded-box bg-base-100/70 px-3 py-2 text-xs leading-5 text-base-content/75 break-all whitespace-pre-wrap line-clamp-3"
+                            >
                               {item}
-                            </span>
+                            </p>
                           ))}
                         </div>
                       </div>

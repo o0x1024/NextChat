@@ -5,7 +5,8 @@ import { ChatManagement } from "./components/dashboard/ChatManagement";
 import { SettingsWorkspace, type SettingsTabType } from "./components/dashboard/SettingsWorkspace";
 import { Sidebar, type ViewType } from "./components/dashboard/Sidebar";
 import { ToolWorkspace } from "./components/dashboard/ToolWorkspace";
-import { applyThemeToDocument, daisyThemes, type ThemeMode } from "./constants/themes";
+import { applyThemeToDocument } from "./constants/themes";
+import { syncUiScaleBaseVariables } from "./lib/uiScale";
 import { useAppStore } from "./store/appStore";
 import { usePreferencesStore, type Language } from "./store/preferencesStore";
 import type {
@@ -20,7 +21,6 @@ function App() {
   const store = useAppStore();
   const init = useAppStore((state) => state.init);
   const theme = usePreferencesStore((state) => state.theme);
-  const setTheme = usePreferencesStore((state) => state.setTheme);
   const language = usePreferencesStore((state) => state.language);
   const setLanguage = usePreferencesStore((state) => state.setLanguage);
 
@@ -57,6 +57,7 @@ function App() {
   });
 
   const fontSize = usePreferencesStore((state) => state.fontSize);
+  const componentScale = usePreferencesStore((state) => state.componentScale);
   const componentSpacing = usePreferencesStore((state) => state.componentSpacing);
 
   useEffect(() => {
@@ -66,6 +67,10 @@ function App() {
   useEffect(() => {
     applyThemeToDocument(theme);
   }, [theme]);
+
+  useEffect(() => {
+    syncUiScaleBaseVariables(document.documentElement, componentScale);
+  }, [theme, componentScale]);
 
   useEffect(() => {
     document.documentElement.lang = language;
@@ -103,7 +108,13 @@ function App() {
       <style>{`
         :root {
           font-size: ${fontSize}px !important;
+          --component-scale: ${componentScale} !important;
           --component-gap: ${componentSpacing}px !important;
+          --radius-selector: calc(var(--ui-radius-selector-base, 0.5rem) * var(--component-scale)) !important;
+          --radius-field: calc(var(--ui-radius-field-base, 0.25rem) * var(--component-scale)) !important;
+          --radius-box: calc(var(--ui-radius-box-base, 0.5rem) * var(--component-scale)) !important;
+          --size-selector: calc(var(--ui-size-selector-base, 0.25rem) * var(--component-scale)) !important;
+          --size-field: calc(var(--ui-size-field-base, 0.25rem) * var(--component-scale)) !important;
         }
         /* Apply dynamic gap to specific layout elements */
         .flex { gap: var(--component-gap, inherit); }

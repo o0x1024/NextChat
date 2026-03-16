@@ -134,7 +134,7 @@ export function ChatRightPanel({
   return (
     <>
       <div
-        className={`-ml-2 hidden w-2 shrink-0 cursor-col-resize border-l border-transparent bg-transparent transition-colors hover:border-primary/20 hover:bg-primary/20 xl:block ${
+        className={`-ml-2 hidden w-2 shrink-0 cursor-col-resize border-l border-transparent bg-transparent transition-colors hover:border-primary/20 hover:bg-primary/20 lg:block ${
           resizingRightPanel ? "border-primary/30 bg-primary/30" : ""
         }`}
         onPointerDown={onRightPanelResizeStart}
@@ -142,7 +142,7 @@ export function ChatRightPanel({
         onPointerUp={onRightPanelResizeEnd}
         onPointerCancel={onRightPanelResizeEnd}
       />
-      <aside className="flex min-h-0 w-full shrink-0 flex-col gap-3 overflow-y-auto xl:w-[var(--chat-right-panel-width,360px)]">
+      <aside className="flex min-h-0 w-full shrink-0 flex-col gap-3 overflow-y-auto lg:w-[var(--chat-right-panel-width,360px)]">
         {sidePanelMode === "execution" && (
           <AgentExecutionDetailsPanel
             language={language}
@@ -165,6 +165,7 @@ export function ChatRightPanel({
         {sidePanelMode === "running" && (
           <ChatRunningPanel
             language={language}
+            currentWorkGroupId={currentGroup?.id ?? null}
             activeTasks={activeTasks}
             currentLeases={currentLeases}
             currentApprovals={currentApprovals}

@@ -1,26 +1,53 @@
 import { useTranslation } from "react-i18next";
+import {
+    COMPONENT_SCALE_MAX,
+    COMPONENT_SCALE_MIN,
+    COMPONENT_SCALE_STEP,
+    COMPONENT_SPACING_MAX,
+    COMPONENT_SPACING_MIN,
+    COMPONENT_SPACING_STEP,
+    FONT_SIZE_MAX,
+    FONT_SIZE_MIN,
+    FONT_SIZE_STEP,
+} from "../../../constants/preferences";
 import { usePreferencesStore } from "../../../store/preferencesStore";
 import { useAppStore } from "../../../store/appStore";
 import { daisyThemes, type ThemeMode } from "../../../constants/themes";
+import { ContinuousRangeControl } from "./ContinuousRangeControl";
 
 export function SystemSettings() {
     const { t } = useTranslation();
-    const { fontSize, setFontSize, componentSpacing, setComponentSpacing, theme, setTheme } = usePreferencesStore();
+    const {
+        fontSize,
+        setFontSize,
+        componentScale,
+        setComponentScale,
+        componentSpacing,
+        setComponentSpacing,
+        theme,
+        setTheme,
+    } = usePreferencesStore();
     const { showToast } = useAppStore();
+
+    const notifySaved = () => {
+        showToast(t("settingsSaved"), 'success');
+    };
 
     const handleFontSizeChange = (value: number) => {
         setFontSize(value);
-        showToast(t("settingsSaved"), 'success');
+    };
+
+    const handleComponentScaleChange = (value: number) => {
+        setComponentScale(value);
     };
 
     const handleSpacingChange = (value: number) => {
         setComponentSpacing(value);
-        showToast(t("settingsSaved"), 'success');
     };
 
     const handleThemeChange = (themeName: ThemeMode) => {
         setTheme(themeName);
-        showToast(t("settingsSaved"), 'success');
+        notifySaved();
     };
 
     return (
@@ -36,51 +63,47 @@ export function SystemSettings() {
                         <div className="text-sm font-semibold opacity-50 uppercase tracking-widest">{t("interfaceSettings")}</div>
                         <div className="card card-border bg-base-100 shadow-sm border-base-content/5">
                             <div className="card-body p-5 gap-6">
-                                <div className="space-y-3">
-                                    <div className="flex items-center justify-between">
-                                        <label className="text-xs font-bold flex items-center gap-2">
-                                            <i className="fas fa-font" />
-                                            {t("fontSize")}
-                                        </label>
-                                        <span className="badge badge-primary badge-sm font-mono">{fontSize}px</span>
-                                    </div>
-                                    <div className="flex items-center gap-3">
-                                        <span className="text-[10px] opacity-40">A</span>
-                                        <input
-                                            type="range"
-                                            min="12"
-                                            max="20"
-                                            step="1"
-                                            className="range range-primary range-xs flex-1"
-                                            value={fontSize}
-                                            onChange={(e) => handleFontSizeChange(parseInt(e.target.value))}
-                                        />
-                                        <span className="text-sm opacity-40">A</span>
-                                    </div>
-                                </div>
+                                <ContinuousRangeControl
+                                    iconClass="fas fa-font"
+                                    label={t("fontSize")}
+                                    value={fontSize}
+                                    min={FONT_SIZE_MIN}
+                                    max={FONT_SIZE_MAX}
+                                    step={FONT_SIZE_STEP}
+                                    badge={`${fontSize}px`}
+                                    minIndicator="A"
+                                    maxIndicator="A"
+                                    onChange={handleFontSizeChange}
+                                    onCommit={notifySaved}
+                                />
 
-                                <div className="space-y-3">
-                                    <div className="flex items-center justify-between">
-                                        <label className="text-xs font-bold flex items-center gap-2">
-                                            <i className="fas fa-arrows-left-right-to-line" />
-                                            {t("componentSpacing")}
-                                        </label>
-                                        <span className="badge badge-primary badge-sm font-mono">{componentSpacing}px</span>
-                                    </div>
-                                    <div className="flex items-center gap-3 text-primary">
-                                        <i className="fas fa-compress text-[10px] opacity-40" />
-                                        <input
-                                            type="range"
-                                            min="0"
-                                            max="12"
-                                            step="1"
-                                            className="range range-primary range-xs flex-1"
-                                            value={componentSpacing}
-                                            onChange={(e) => handleSpacingChange(parseInt(e.target.value))}
-                                        />
-                                        <i className="fas fa-expand text-sm opacity-40" />
-                                    </div>
-                                </div>
+                                <ContinuousRangeControl
+                                    iconClass="fas fa-expand"
+                                    label={t("componentSize")}
+                                    value={componentScale}
+                                    min={COMPONENT_SCALE_MIN}
+                                    max={COMPONENT_SCALE_MAX}
+                                    step={COMPONENT_SCALE_STEP}
+                                    badge={`${Math.round(componentScale * 100)}%`}
+                                    minIndicator={<i className="fas fa-minimize text-[10px]" />}
+                                    maxIndicator={<i className="fas fa-maximize" />}
+                                    onChange={handleComponentScaleChange}
+                                    onCommit={notifySaved}
+                                />
+
+                                <ContinuousRangeControl
+                                    iconClass="fas fa-arrows-left-right-to-line"
+                                    label={t("componentSpacing")}
+                                    value={componentSpacing}
+                                    min={COMPONENT_SPACING_MIN}
+                                    max={COMPONENT_SPACING_MAX}
+                                    step={COMPONENT_SPACING_STEP}
+                                    badge={`${componentSpacing}px`}
+                                    minIndicator={<i className="fas fa-compress text-[10px]" />}
+                                    maxIndicator={<i className="fas fa-expand" />}
+                                    onChange={handleSpacingChange}
+                                    onCommit={notifySaved}
+                                />
                             </div>
                         </div>
                     </div>
